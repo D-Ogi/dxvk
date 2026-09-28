@@ -59,7 +59,8 @@ namespace dxvk {
   VkPrimitiveTopology determinePipelineTopology(
     const DxvkGraphicsPipelineShaders&      shaders,
     const DxvkGraphicsPipelineStateInfo&    state) {
-    if (shaders.gs)
+    // A pass-through GS emits the primitives it receives
+    if (shaders.gs && !shaders.gs->metadata().flags.test(DxvkShaderFlag::PassthroughGs))
       return shaders.gs->metadata().outputTopology;
 
     return determinePreGsTopology(shaders, state);

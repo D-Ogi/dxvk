@@ -53,7 +53,9 @@ namespace dxvk {
       auto dstIsGs = m_key.stage() == VK_SHADER_STAGE_GEOMETRY_BIT;
       auto srcIsGs = shaderInfo.getType() == dxbc_spv::dxbc::ShaderType::eGeometry;
 
-      if (dstIsGs && !srcIsGs) {
+      m_passthroughGs = dstIsGs && !srcIsGs;
+
+      if (m_passthroughGs) {
         if (!converter.createPassthroughGs(builder))
           throw DxvkError(str::format("Failed to create pass-through geometry shader: ", m_key.toString()));
       } else {
@@ -62,6 +64,10 @@ namespace dxvk {
 
         lowerBuiltIns(builder);
       }
+    }
+
+    bool isPassthroughGs() const {
+      return m_passthroughGs;
     }
 
     uint32_t determineResourceIndex(
@@ -102,6 +108,7 @@ namespace dxvk {
     DxvkIrShaderCreateInfo  m_info;
 
     bool                    m_lowerIcb = false;
+    bool                    m_passthroughGs = false;
 
     struct BuiltInInfo {
       dxbc_spv::ir::BuiltIn builtIn;

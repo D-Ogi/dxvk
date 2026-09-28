@@ -2035,8 +2035,15 @@ namespace dxvk {
         if (m_metadata.stage == VK_SHADER_STAGE_FRAGMENT_BIT && linkage->fsFlatShading && m_metadata.flatShadingInputs)
           ioPass.enableFlatInterpolation(m_metadata.flatShadingInputs);
 
-        if (m_metadata.stage == VK_SHADER_STAGE_GEOMETRY_BIT && linkage->inputTopology != m_metadata.inputTopology)
-          ioPass.changeGsInputPrimitiveType(convertPrimitiveType(linkage->inputTopology));
+        if (m_metadata.stage == VK_SHADER_STAGE_GEOMETRY_BIT && linkage->inputTopology != m_metadata.inputTopology) {
+          auto primitiveType = convertPrimitiveType(linkage->inputTopology);
+
+          // A pass-through GS emits the primitive it receives, so its output follows
+          // its input. It declares points, so adjacency never gets here.
+          if (!m_metadata.flags.test(DxvkShaderFlag::PassthroughGs)
+           || !ioPass.changeGsPassthroughPrimitiveType(primitiveType))
+            ioPass.changeGsInputPrimitiveType(primitiveType);
+        }
 
         if (m_metadata.stage == VK_SHADER_STAGE_FRAGMENT_BIT && linkage->fsDualSrcBlend) {
           dxbc_spv::ir::IoMap io = { };
@@ -2268,6 +2275,10 @@ namespace dxvk {
     lowerBindingModelPass.run();
 
     m_metadata = lowerBindingModelPass.getMetadata();
+
+    if (m_baseIr->isPassthroughGs())
+      m_metadata.flags.set(DxvkShaderFlag::PassthroughGs);
+
     m_layout = lowerBindingModelPass.getLayout();
     m_layout.addSpecDataBuffer(DxvkShaderBinding(m_metadata.stage, SpecDataSet, 0u));
 

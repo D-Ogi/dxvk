@@ -67,6 +67,17 @@ namespace dxvk {
             dxbc_spv::ir::Builder&    builder) = 0;
 
     /**
+     * \brief Checks whether the converted shader is a pass-through GS
+     *
+     * Such a shader forwards the primitives of the previous stage,
+     * e.g. for stream output. Only valid after \c convertShader.
+     * \returns \c true for a pass-through geometry shader
+     */
+    virtual bool isPassthroughGs() const {
+      return false;
+    }
+
+    /**
      * \brief Maps IR binding to internal resource index
      *
      * \param [in] stage Shader stage
