@@ -3,8 +3,14 @@
  * bc250_dxvk_engine.h - boundary between the BC-250 system D3D10/11 user-mode driver ("shell", the
  * UserModeDriverName DLL) and its DXVK engine ("engine", bc250dxvk.dll, DXVK fork branch amdgpu-wddm/ddi-engine).
  *
- * Revision r1, ABI 1.0. This file in the DXVK fork is the only copy; the shell includes it from the DXVK
+ * Revision r2, ABI 1.1. This file in the DXVK fork is the only copy; the shell includes it from the DXVK
  * source checkout it builds against, like its other DXVK-facing headers.
+ *
+ * Versions. A minor version adds and never changes: an engine of minor n serves a shell built for any minor
+ * up to n. What a minor version adds sits behind a new interface (QueryInterface on the engine device) or a
+ * new function, so a shell that needs it gets E_NOINTERFACE from an older engine rather than a wrong result.
+ *   1.0  r1: IBc250DxvkDevice.
+ *   1.1  r2: IBc250DxvkDevice1 (Blt1, DXGI Blt with a source rectangle).
  *
  * WDK-free by construction. DXVK's util_gdi.h declares private extern-C D3DKMT prototypes that collide with
  * the WDK's in one translation unit, so nothing here needs d3d10umddi.h or a DXVK header: windows.h, the SDK's
@@ -78,7 +84,7 @@
 #include <vulkan/vulkan.h>
 
 #define BC250_DXVK_ENGINE_ABI_MAJOR 1u
-#define BC250_DXVK_ENGINE_ABI_MINOR 0u
+#define BC250_DXVK_ENGINE_ABI_MINOR 1u
 #define BC250_DXVK_ENGINE_ABI_VERSION ((BC250_DXVK_ENGINE_ABI_MAJOR << 16) | BC250_DXVK_ENGINE_ABI_MINOR)
 
 /* The Vulkan objects the shell owns (E1). */
@@ -233,6 +239,18 @@ struct BC250_DXVK_BLT {
     UINT Rotation;                                 /* DXGI_DDI_MODE_ROTATION */
 };
 
+/* DXGI_DDI_ARG_BLT1 without the WDK handles (ABI 1.1). */
+struct BC250_DXVK_BLT1 {
+    ID3D11Resource *Destination;
+    UINT DestinationSubresource;
+    RECT DestinationRect;                          /* DstLeft, DstTop, DstRight, DstBottom */
+    ID3D11Resource *Source;
+    UINT SourceSubresource;
+    RECT SourceRect;                               /* SrcLeft, SrcTop, SrcRight, SrcBottom */
+    UINT Flags;                                    /* BC250_DXVK_BLT_* */
+    UINT Rotation;                                 /* DXGI_DDI_MODE_ROTATION */
+};
+
 /* The engine device. Obtained from CreateDevice; its final Release destroys the D3D11 device (E4). */
 MIDL_INTERFACE("cd06519b-e51d-4551-9aff-285ec5c7b7b8")
 IBc250DxvkDevice : public IUnknown {
@@ -297,6 +315,16 @@ IBc250DxvkDevice : public IUnknown {
      * BC250_DXVK_BLT_PRESENT the engine submits before returning and compiles deferred pipelines, as
      * SubmitForPresent does (E3). */
     virtual HRESULT STDMETHODCALLTYPE Blt(const BC250_DXVK_BLT *blt) = 0;
+};
+
+/* ABI 1.1. The same object as IBc250DxvkDevice; QueryInterface on it, E_NOINTERFACE from a 1.0 engine. */
+MIDL_INTERFACE("dc4086a8-6806-4577-89c7-c764c75e0635")
+IBc250DxvkDevice1 : public IBc250DxvkDevice {
+    /* DXGI Blt1: SourceRect of the source subresource onto DestinationRect, otherwise as Blt. Both rectangles
+     * are in the coordinates of their own subresource, must be non-empty and lie inside it (E_INVALIDARG
+     * otherwise); sizes that differ stretch. ROTATE180 turns the content within DestinationRect; the shell
+     * passes DestinationRect as the runtime gives it. */
+    virtual HRESULT STDMETHODCALLTYPE Blt1(const BC250_DXVK_BLT1 *blt) = 0;
 };
 
 struct BC250_DXVK_ENGINE_FUNCS {

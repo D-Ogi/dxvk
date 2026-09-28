@@ -43,7 +43,7 @@ namespace dxvk::ddi {
   };
 
 
-  class Bc250DxvkDevice : public ComObject<IBc250DxvkDevice> {
+  class Bc250DxvkDevice : public ComObject<IBc250DxvkDevice1> {
 
   public:
 
@@ -110,6 +110,9 @@ namespace dxvk::ddi {
     HRESULT STDMETHODCALLTYPE Blt(
       const BC250_DXVK_BLT*                   pBlt) final;
 
+    HRESULT STDMETHODCALLTYPE Blt1(
+      const BC250_DXVK_BLT1*                  pBlt) final;
+
   private:
 
     // View format lists handed out through GetImageCreateInfo's pNext; they live as long as the device.
@@ -131,6 +134,17 @@ namespace dxvk::ddi {
     HRESULT CheckDeviceStatus() const;
 
     void SubmitFrame();
+
+    // Blt and Blt1; the whole source subresource without pSourceRect
+    HRESULT BltRegion(
+            ID3D11Resource*                   pDestination,
+            UINT                              DestinationSubresource,
+      const RECT&                             DestinationRect,
+            ID3D11Resource*                   pSource,
+            UINT                              SourceSubresource,
+      const RECT*                             pSourceRect,
+            UINT                              Flags,
+            UINT                              Rotation);
 
     bool CheckImageSupport(
       const VkImageCreateInfo&                info,

@@ -64,7 +64,8 @@ namespace dxvk::ddi {
     *ppvObject = nullptr;
 
     if (riid == __uuidof(IUnknown)
-     || riid == __uuidof(IBc250DxvkDevice)) {
+     || riid == __uuidof(IBc250DxvkDevice)
+     || riid == __uuidof(IBc250DxvkDevice1)) {
       *ppvObject = ref(this);
       return S_OK;
     }
@@ -631,13 +632,49 @@ namespace dxvk::ddi {
   }
 
 
+  // A rectangle that is non-empty and inside a subresource of the given extent
+  static bool IsBltRect(
+    const RECT&                             Rect,
+    const VkExtent3D&                       Extent) {
+    return Rect.left >= 0 && Rect.top >= 0 && Rect.left < Rect.right && Rect.top < Rect.bottom
+        && UINT(Rect.right) <= Extent.width && UINT(Rect.bottom) <= Extent.height;
+  }
+
+
   HRESULT STDMETHODCALLTYPE Bc250DxvkDevice::Blt(
     const BC250_DXVK_BLT*                   pBlt) {
-    if (!pBlt || !pBlt->Destination || !pBlt->Source)
+    if (!pBlt)
       return E_INVALIDARG;
 
-    D3D11CommonTexture* dstTexture = GetBltTexture(pBlt->Destination, pBlt->DestinationSubresource);
-    D3D11CommonTexture* srcTexture = GetBltTexture(pBlt->Source, pBlt->SourceSubresource);
+    return BltRegion(pBlt->Destination, pBlt->DestinationSubresource, pBlt->DestinationRect,
+      pBlt->Source, pBlt->SourceSubresource, nullptr, pBlt->Flags, pBlt->Rotation);
+  }
+
+
+  HRESULT STDMETHODCALLTYPE Bc250DxvkDevice::Blt1(
+    const BC250_DXVK_BLT1*                  pBlt) {
+    if (!pBlt)
+      return E_INVALIDARG;
+
+    return BltRegion(pBlt->Destination, pBlt->DestinationSubresource, pBlt->DestinationRect,
+      pBlt->Source, pBlt->SourceSubresource, &pBlt->SourceRect, pBlt->Flags, pBlt->Rotation);
+  }
+
+
+  HRESULT Bc250DxvkDevice::BltRegion(
+          ID3D11Resource*                   pDestination,
+          UINT                              DestinationSubresource,
+    const RECT&                             DestinationRect,
+          ID3D11Resource*                   pSource,
+          UINT                              SourceSubresource,
+    const RECT*                             pSourceRect,
+          UINT                              Flags,
+          UINT                              Rotation) {
+    if (!pDestination || !pSource)
+      return E_INVALIDARG;
+
+    D3D11CommonTexture* dstTexture = GetBltTexture(pDestination, DestinationSubresource);
+    D3D11CommonTexture* srcTexture = GetBltTexture(pSource, SourceSubresource);
 
     if (!dstTexture || !srcTexture)
       return E_INVALIDARG;
@@ -646,9 +683,9 @@ namespace dxvk::ddi {
     Rc<DxvkImage> src = srcTexture->GetImage();
 
     VkImageSubresource dstSubresource = dstTexture->GetSubresourceFromIndex(
-      VK_IMAGE_ASPECT_COLOR_BIT, pBlt->DestinationSubresource);
+      VK_IMAGE_ASPECT_COLOR_BIT, DestinationSubresource);
     VkImageSubresource srcSubresource = srcTexture->GetSubresourceFromIndex(
-      VK_IMAGE_ASPECT_COLOR_BIT, pBlt->SourceSubresource);
+      VK_IMAGE_ASPECT_COLOR_BIT, SourceSubresource);
 
     if (dst == src && dstSubresource.mipLevel == srcSubresource.mipLevel
      && dstSubresource.arrayLayer == srcSubresource.arrayLayer)
@@ -658,13 +695,14 @@ namespace dxvk::ddi {
     if (dst->info().sampleCount != VK_SAMPLE_COUNT_1_BIT)
       return BltNotImplemented("multisampled destination");
 
-    // The source is always the whole subresource; the runtime cannot express a source rectangle
+    // Blt takes the whole source subresource, Blt1 a source rectangle
     VkExtent3D dstExtent = dst->mipLevelExtent(dstSubresource.mipLevel);
     VkExtent3D srcExtent = src->mipLevelExtent(srcSubresource.mipLevel);
-    const RECT& rect = pBlt->DestinationRect;
 
-    if (rect.left < 0 || rect.top < 0 || rect.left >= rect.right || rect.top >= rect.bottom
-     || UINT(rect.right) > dstExtent.width || UINT(rect.bottom) > dstExtent.height)
+    const RECT& rect = DestinationRect;
+    const RECT srcRect = pSourceRect ? *pSourceRect : RECT { 0, 0, LONG(srcExtent.width), LONG(srcExtent.height) };
+
+    if (!IsBltRect(rect, dstExtent) || !IsBltRect(srcRect, srcExtent))
       return E_INVALIDARG;
 
     std::array<VkOffset3D, 2> dstOffsets = {{
@@ -672,12 +710,12 @@ namespace dxvk::ddi {
       { rect.right, rect.bottom, 1 } }};
 
     std::array<VkOffset3D, 2> srcOffsets = {{
-      { 0, 0, 0 },
-      { int32_t(srcExtent.width), int32_t(srcExtent.height), 1 } }};
+      { srcRect.left,  srcRect.top,    0 },
+      { srcRect.right, srcRect.bottom, 1 } }};
 
     // DXGI_DDI_MODE_ROTATION has the values of DXGI_MODE_ROTATION. Rotating by 180 degrees mirrors both
     // axes, which a blit expresses with swapped corners; 90 and 270 degrees would need a transposing pass.
-    switch (pBlt->Rotation) {
+    switch (Rotation) {
       case DXGI_MODE_ROTATION_UNSPECIFIED:
       case DXGI_MODE_ROTATION_IDENTITY:
         break;
@@ -740,8 +778,8 @@ namespace dxvk::ddi {
     VkFormatFeatureFlags2 srcFeatures = getFeatures(srcFormat, src->info().tiling);
     VkFormatFeatureFlags2 dstFeatures = getFeatures(dstFormat, dst->info().tiling);
 
-    bool isStretch = uint32_t(rect.right - rect.left) != srcExtent.width
-                  || uint32_t(rect.bottom - rect.top) != srcExtent.height;
+    bool isStretch = rect.right - rect.left != srcRect.right - srcRect.left
+                  || rect.bottom - rect.top != srcRect.bottom - srcRect.top;
 
     VkFilter filter = isStretch && !srcIsInteger && (srcFeatures & VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_LINEAR_BIT)
       ? VK_FILTER_LINEAR
@@ -767,7 +805,7 @@ namespace dxvk::ddi {
       CreateBltView(src, srcSubresource, srcFormat, VK_IMAGE_USAGE_SAMPLED_BIT), srcOffsets.data(), filter);
 
     // A presenting Blt writes the surface the compositor reads: submit it, as for a present (E3)
-    if (pBlt->Flags & BC250_DXVK_BLT_PRESENT)
+    if (Flags & BC250_DXVK_BLT_PRESENT)
       SubmitFrame();
 
     return CheckDeviceStatus();
