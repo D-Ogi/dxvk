@@ -2294,9 +2294,8 @@ namespace dxvk {
 
     xfbHasher.update(pBufferStrides, sizeof(*pBufferStrides) * NumStrides);
     xfbHasher.update(&RasterizedStream, sizeof(RasterizedStream));
-    xfbHasher.finalize();
 
-    auto xfbHash = xfbHasher.getDigest();
+    auto xfbHash = xfbHasher.finalize();
 
     return DxvkShaderHash(Stage, BytecodeLength,
       binHash.data.data(), binHash.data.size(),
