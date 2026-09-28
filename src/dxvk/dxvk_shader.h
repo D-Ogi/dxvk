@@ -164,6 +164,7 @@ namespace dxvk {
     UsesSparseResidency,
     TessellationPoints,
     SemanticIo,
+    PassthroughGs,
   };
 
   using DxvkShaderFlags = Flags<DxvkShaderFlag>;
