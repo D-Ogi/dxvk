@@ -3,7 +3,7 @@ option('enable_d3d8',  type : 'boolean', value : true, description: 'Build D3D8'
 option('enable_d3d9',  type : 'boolean', value : true, description: 'Build D3D9')
 option('enable_d3d10', type : 'boolean', value : true, description: 'Build D3D10')
 option('enable_d3d11', type : 'boolean', value : true, description: 'Build D3D11')
-option('enable_ddi_engine', type : 'boolean', value : false, description: 'Build bc250dxvk.dll, the engine behind the BC-250 system D3D11 user-mode driver')
+option('enable_ddi_engine', type : 'boolean', value : false, description: 'Build amdgpu_wddm_dxvk.dll, the engine behind the BC-250 system D3D11 user-mode driver')
 option('build_id',     type : 'boolean', value : false)
 option('native_glfw',  type : 'feature', value : 'auto', description: 'Enable GLFW WSI for DXVK Native')
 option('native_sdl2',  type : 'feature', value : 'auto', description: 'Enable SDL2 WSI for DXVK Native')

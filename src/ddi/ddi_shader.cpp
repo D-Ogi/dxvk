@@ -144,7 +144,7 @@ namespace dxvk::ddi {
         SysvalInfo sv = LookupSysval(e.SystemValue);
 
         if (!sv.name) {
-          Logger::err(str::format("bc250dxvk: Unsupported system value ", e.SystemValue, " in signature"));
+          Logger::err(str::format("amdgpu_wddm_dxvk: Unsupported system value ", e.SystemValue, " in signature"));
           return false;
         }
 
@@ -381,7 +381,8 @@ namespace dxvk::ddi {
           });
 
           if (match == outputNames.end()) {
-            Logger::err(str::format("bc250dxvk: Stream output register ", e.RegisterIndex, " not in output signature"));
+            Logger::err(str::format("amdgpu_wddm_dxvk: Stream output register ", e.RegisterIndex,
+              " not in output signature"));
             return E_INVALIDARG;
           }
 

@@ -822,7 +822,7 @@ namespace dxvk {
     m_injectOutOfMemory = env::getEnvVar("BC250DXVK_TEST_OOM") == "1";
 
     if (m_injectOutOfMemory)
-      Logger::warn("bc250dxvk: BC250DXVK_TEST_OOM=1: out-of-memory injection armed");
+      Logger::warn("amdgpu_wddm_dxvk: BC250DXVK_TEST_OOM=1: out-of-memory injection armed");
 
     if (device->features().core.features.sparseBinding)
       m_sparseMemoryTypes = determineSparseMemoryTypes(device);

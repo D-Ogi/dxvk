@@ -115,7 +115,7 @@ namespace dxvk {
     /**
      * \brief Ends the frame and submits all recorded work
      *
-     * Used by a user-mode driver engine (bc250dxvk) before the
+     * Used by a user-mode driver engine (amdgpu_wddm_dxvk) before the
      * runtime presents a surface. With inline execution, the
      * submission has happened when this returns.
      */
@@ -124,7 +124,7 @@ namespace dxvk {
     /**
      * \brief Waits for or checks GPU use of a resource
      *
-     * Used by a user-mode driver engine (bc250dxvk). Flushes
+     * Used by a user-mode driver engine (amdgpu_wddm_dxvk). Flushes
      * pending work that uses the resource if it has to wait.
      * \param [in] Resource DXVK resource
      * \param [in] DoNotWait Only check, never wait
@@ -137,7 +137,7 @@ namespace dxvk {
     /**
      * \brief Rotates the storage of images
      *
-     * Used by a user-mode driver engine (bc250dxvk) for DXGI
+     * Used by a user-mode driver engine (amdgpu_wddm_dxvk) for DXGI
      * RotateResourceIdentities, in command order: image i takes
      * the storage of image i + 1, the last one that of the first.
      * \param [in] pImages Images, all with the same properties
@@ -150,7 +150,7 @@ namespace dxvk {
     /**
      * \brief Blits one image view onto another
      *
-     * Used by a user-mode driver engine (bc250dxvk) for DXGI Blt:
+     * Used by a user-mode driver engine (amdgpu_wddm_dxvk) for DXGI Blt:
      * DxvkContext::blitImageView stretches, converts formats,
      * resolves and mirrors as the offsets and views require.
      * \param [in] DstView Destination view

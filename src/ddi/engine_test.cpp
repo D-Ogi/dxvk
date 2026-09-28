@@ -1,4 +1,4 @@
-// Offline positive control for bc250dxvk.dll (engine ABI 1.3) on any Vulkan 1.3 GPU. No window; exits.
+// Offline positive control for amdgpu_wddm_dxvk.dll (engine ABI 1.4) on any Vulkan 1.3 GPU. No window; exits.
 //
 // Plays the UMD shell: owns the VkInstance and VkDevice (E1), creates the device from the engine's
 // requirements, allocates the render target image itself (E5), and feeds shaders in DDI form: the token
@@ -6,8 +6,8 @@
 // clear and one draw, storage rotation, DXGI Blt onto an imported image, and that the engine's queue submissions, waits, allocations and
 // object creation all ran on the calling thread (E2), by wrapping the Vulkan entry points it is given.
 //
-// Usage: bc250dxvk_engine_test.exe <path to bc250dxvk.dll> [adapter substring] [--icd <path>] [--bench]
-//        [--bench-tiling]
+// Usage: amdgpu_wddm_dxvk_engine_test.exe <path to amdgpu_wddm_dxvk.dll> [adapter substring] [--icd <path>]
+//        [--bench] [--bench-tiling]
 // Exit code 0 = all checks passed. --bench adds a CPU-bound draw benchmark that prints timings (see RunBench).
 // --bench-tiling adds a GPU benchmark of LINEAR against OPTIMAL render targets (see RunTilingBench).
 // --icd loads that Vulkan driver DLL directly, as the UMD shell loads its bc250radv.dll, instead of going
@@ -123,7 +123,8 @@ namespace {
       std::printf("engine[%u]: %s\n", level, message);
   }
 
-  // The engine's log file for this executable, as DXVK names it: <DXVK_LOG_PATH>/<exe base name>_bc250dxvk.log
+  // The engine's log file for this executable, as DXVK names it (Logger::getFileName, with the logger name of
+  // ddi_engine.cpp): <DXVK_LOG_PATH>/<exe base name>_amdgpu_wddm_dxvk.log
   std::string EngineLogFile() {
     char dir[MAX_PATH] = { };
     char exe[MAX_PATH] = { };
@@ -134,7 +135,7 @@ namespace {
     std::string name = exe;
     name = name.substr(name.find_last_of("\\/") + 1u);
     name = name.substr(0u, name.rfind('.'));
-    return std::string(dir) + "/" + name + "_bc250dxvk.log";
+    return std::string(dir) + "/" + name + "_amdgpu_wddm_dxvk.log";
   }
 
   std::string ReadFileText(const std::string& path) {
@@ -1051,7 +1052,8 @@ namespace {
 
 int main(int argc, char** argv) {
   if (argc < 2) {
-    std::printf("usage: bc250dxvk_engine_test <bc250dxvk.dll> [adapter substring] [--icd <path>] [--bench] [--bench-tiling]\n");
+    std::printf("usage: amdgpu_wddm_dxvk_engine_test <amdgpu_wddm_dxvk.dll> [adapter substring] [--icd <path>]"
+                " [--bench] [--bench-tiling]\n");
     return 2;
   }
 
@@ -1114,7 +1116,7 @@ int main(int argc, char** argv) {
   LoadInstance(vk, nullptr, &vk.createInstance, "vkCreateInstance");
 
   VkApplicationInfo app = { VK_STRUCTURE_TYPE_APPLICATION_INFO };
-  app.pApplicationName = "bc250dxvk-engine-test";
+  app.pApplicationName = "amdgpu-wddm-dxvk-engine-test";
   app.apiVersion       = VK_API_VERSION_1_3;
 
   VkInstanceCreateInfo ici = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
@@ -2927,14 +2929,14 @@ int main(int argc, char** argv) {
     std::string module = ModuleOf(ThreadStartAddress(tid));
     std::printf("      new thread %lu starts in %s\n", static_cast<unsigned long>(tid), module.c_str());
 
-    if (_stricmp(module.c_str(), "bc250dxvk.dll") == 0)
+    if (_stricmp(module.c_str(), "amdgpu_wddm_dxvk.dll") == 0)
       engineThreads++;
   }
 
   std::printf("      queue lock calls %u, from other threads %u\n", shell.lockCalls.load(), shell.foreignCalls.load());
   Check(shell.lockCalls.load() > 0u, "the engine brackets queue submissions with QueueLock");
   Check(shell.foreignCalls.load() == 0u, "every QueueLock call came from the calling thread (E2)");
-  Check(engineThreads == 0u, "no new thread starts in bc250dxvk.dll");
+  Check(engineThreads == 0u, "no new thread starts in amdgpu_wddm_dxvk.dll");
 
   // ---- teardown (E4, E5) ----
   rtv.Reset();

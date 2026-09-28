@@ -858,7 +858,7 @@ namespace dxvk {
      * Image i takes the storage of image i + 1, the last one
      * that of the first. Unlike swap chain rotation, any of the
      * storage objects may already be in use in the current
-     * command list. Used by the bc250dxvk engine.
+     * command list. Used by the amdgpu_wddm_dxvk engine.
      * \param [in] images Images, all with the same properties
      * \param [in] count Number of images, at least 2
      */

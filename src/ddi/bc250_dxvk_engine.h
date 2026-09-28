@@ -1,9 +1,10 @@
 /* SPDX-License-Identifier: MIT
  *
  * bc250_dxvk_engine.h - boundary between the BC-250 system D3D10/11 user-mode driver ("shell", the
- * UserModeDriverName DLL) and its DXVK engine ("engine", bc250dxvk.dll, DXVK fork branch amdgpu-wddm/ddi-engine).
+ * UserModeDriverName DLL) and its DXVK engine ("engine", amdgpu_wddm_dxvk.dll, DXVK fork branch
+ * amdgpu-wddm/ddi-engine).
  *
- * Revision r6, ABI 1.4. This file in the DXVK fork is the only copy; the shell includes it from the DXVK
+ * Revision r7, ABI 1.4. This file in the DXVK fork is the only copy; the shell includes it from the DXVK
  * source checkout it builds against, like its other DXVK-facing headers.
  *
  * Versions. A minor version adds and never changes: an engine of minor n serves a shell built for any minor
@@ -21,6 +22,8 @@
  *   1.4  r6: IBc250DxvkDevice4 (TrimMemory; TakeDeferredError for the errors of calls that return nothing).
  *        Running out of memory is no longer fatal: creation methods and Map return E_OUTOFMEMORY (E6). Before
  *        1.4 an allocation that found no memory ended the process.
+ *   1.4  r7: no interface change. The engine DLL is amdgpu_wddm_dxvk.dll (was bc250dxvk.dll); AbiVersion and
+ *        the Map error mapping are stated precisely (E6, BC250_DXVK_DEVICE_CREATE_INFO).
  *
  * WDK-free by construction. DXVK's util_gdi.h declares private extern-C D3DKMT prototypes that collide with
  * the WDK's in one translation unit, so nothing here needs d3d10umddi.h or a DXVK header: windows.h, the SDK's
@@ -74,12 +77,15 @@
  *       allocation that finds no memory fails the creation method or Map that needed it with E_OUTOFMEMORY and
  *       leaves no object and no mapping behind. Calls that return nothing (void D3D11 methods, and recorded work
  *       the engine executes inside a later call) record their first error for IBc250DxvkDevice4::
- *       TakeDeferredError; before 1.4 they reported nothing. Engine results are D3D11/DXGI API codes, not DDI codes: the shell maps them to
- *       the set the DDI entry allows before pfnSetErrorCb (any other code is critical, and the runtime then
- *       removes the device): DXGI_ERROR_WAS_STILL_DRAWING becomes DXGI_DDI_ERR_WASSTILLDRAWING (Map with
- *       DONOTWAIT, query data), and device loss becomes D3DDDIERR_DEVICEREMOVED where the entry allows it. After
- *       Flush, SubmitForPresent and any failed call, ID3D11Device::GetDeviceRemovedReason tells device loss
- *       apart (any failure code; DXVK reports DXGI_ERROR_DEVICE_RESET for every lost-device status).
+ *       TakeDeferredError; before 1.4 they reported nothing. Engine results are D3D11/DXGI API codes, not DDI codes:
+ *       the shell maps them to the set the DDI entry allows before pfnSetErrorCb (any other code is critical, and
+ *       the runtime then removes the device): DXGI_ERROR_WAS_STILL_DRAWING becomes DXGI_DDI_ERR_WASSTILLDRAWING (Map
+ *       with DONOTWAIT, query data), and device loss becomes D3DDDIERR_DEVICEREMOVED where the entry allows it. Map
+ *       is an AllowMapErrors entry (only DXGI_DDI_ERR_WASSTILLDRAWING with DONOTWAIT, and D3DDDIERR_DEVICEREMOVED):
+ *       it has no code for E_OUTOFMEMORY, so the shell reports an E_OUTOFMEMORY from Map as D3DDDIERR_DEVICEREMOVED
+ *       and answers as a removed device from then on. Creation entries are AllowOutOfMemory and pass E_OUTOFMEMORY
+ *       through. After Flush, SubmitForPresent and any failed call, ID3D11Device::GetDeviceRemovedReason tells
+ *       device loss apart (any failure code; DXVK reports DXGI_ERROR_DEVICE_RESET for every lost-device status).
  *       Engine waits are bounded by hosted RADV's own fence wait rules; the engine adds no infinite spin.
  *
  * Layout mirrors. The structures marked "layout = X" have the size and member order of the WDK structure X so
@@ -151,7 +157,11 @@ struct BC250_DXVK_SHELL_SERVICES {
 
 struct BC250_DXVK_DEVICE_CREATE_INFO {
     UINT32 Size;
-    UINT32 AbiVersion;                             /* BC250_DXVK_ENGINE_ABI_VERSION the shell was built with */
+    /* The version the shell requires, encoded as BC250_DXVK_ENGINE_ABI_VERSION: the engine's major with the
+     * lowest minor whose additions the shell calls. It is not the version of the header the shell compiled
+     * against. The engine checks only the major; the additions of a minor are reached through QueryInterface,
+     * which returns E_NOINTERFACE on an older engine. */
+    UINT32 AbiVersion;
     const BC250_DXVK_VULKAN_INSTANCE *Instance;
     const BC250_DXVK_VULKAN_DEVICE *Device;
     const BC250_DXVK_SHELL_SERVICES *Services;
@@ -410,6 +420,7 @@ struct BC250_DXVK_ENGINE_FUNCS {
     HRESULT (APIENTRY *CreateDevice)(const BC250_DXVK_DEVICE_CREATE_INFO *info, IBc250DxvkDevice **device);
 };
 
-/* The one export of bc250dxvk.dll. E_NOINTERFACE on an ABI major mismatch. */
+/* The one export of amdgpu_wddm_dxvk.dll. abiVersion as BC250_DXVK_DEVICE_CREATE_INFO::AbiVersion; E_NOINTERFACE
+ * on an ABI major mismatch. */
 typedef HRESULT (APIENTRY *PFN_BC250_DXVK_ENGINE_GET_FUNCS)(UINT32 abiVersion, BC250_DXVK_ENGINE_FUNCS *funcs);
 #define BC250_DXVK_ENGINE_GET_FUNCS_NAME "Bc250DxvkEngineGetFuncs"

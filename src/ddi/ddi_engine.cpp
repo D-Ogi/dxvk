@@ -1,4 +1,4 @@
-// bc250dxvk.dll entry point: the engine functions of bc250_dxvk_engine.h.
+// amdgpu_wddm_dxvk.dll entry point: the engine functions of bc250_dxvk_engine.h.
 
 #include <cstring>
 #include <vector>
@@ -11,7 +11,7 @@
 namespace dxvk {
   // A system driver lives in every process that opens the adapter: no log file unless DXVK_LOG_PATH names
   // a directory.
-  Logger Logger::s_instance("bc250dxvk.log", true);
+  Logger Logger::s_instance("amdgpu_wddm_dxvk.log", true);
 }
 
 namespace dxvk::ddi {
@@ -74,7 +74,7 @@ namespace dxvk::ddi {
         char error[256] = { };
 
         if (!caps.isSuitable(sizeof(error), error))
-          Logger::warn(str::format("bc250dxvk: DXVK suitability check: ", error));
+          Logger::warn(str::format("amdgpu_wddm_dxvk: DXVK suitability check: ", error));
 
         auto req = std::make_unique<Requirements>();
 
@@ -101,7 +101,7 @@ namespace dxvk::ddi {
           ptrdiff_t offset = reinterpret_cast<const char*>(link->pNext) - base;
 
           if (offset <= 0 || size_t(offset) + sizeof(VkBaseOutStructure) > blobSize)
-            throw DxvkError("bc250dxvk: Feature chain leaves DXVK's feature structure");
+            throw DxvkError("amdgpu_wddm_dxvk: Feature chain leaves DXVK's feature structure");
 
           link->pNext = reinterpret_cast<VkBaseOutStructure*>(req->featureBlob.data() + offset);
           link = link->pNext;
@@ -118,7 +118,7 @@ namespace dxvk::ddi {
         out->Owner          = req.release();
         return S_OK;
       } catch (const DxvkError& e) {
-        Logger::err(str::format("bc250dxvk: QueryDeviceRequirements: ", e.message()));
+        Logger::err(str::format("amdgpu_wddm_dxvk: QueryDeviceRequirements: ", e.message()));
         return E_FAIL;
       }
     }
@@ -164,7 +164,7 @@ namespace dxvk::ddi {
         info->MaxFeatureLevel = level;
         return S_OK;
       } catch (const DxvkError& e) {
-        Logger::err(str::format("bc250dxvk: GetAdapterInfo: ", e.message()));
+        Logger::err(str::format("amdgpu_wddm_dxvk: GetAdapterInfo: ", e.message()));
         return E_FAIL;
       }
     }
@@ -200,7 +200,7 @@ namespace dxvk::ddi {
         Rc<DxvkAdapter> adapter = FindAdapter(instance, info->Instance->PhysicalDevice);
 
         if (adapter == nullptr) {
-          Logger::err("bc250dxvk: CreateDevice: Physical device not in the imported instance");
+          Logger::err("amdgpu_wddm_dxvk: CreateDevice: Physical device not in the imported instance");
           return E_INVALIDARG;
         }
 
@@ -218,7 +218,8 @@ namespace dxvk::ddi {
         bool workerThreads = env::getEnvVar("BC250DXVK_MEASURE_WORKER_THREADS") == "1";
 
         if (workerThreads)
-          Logger::err("bc250dxvk: BC250DXVK_MEASURE_WORKER_THREADS=1: DXVK worker threads call Vulkan, E2 is broken");
+          Logger::err("amdgpu_wddm_dxvk: BC250DXVK_MEASURE_WORKER_THREADS=1: DXVK worker threads call Vulkan, "
+                      "E2 is broken");
 
         deviceInfo.hostOptions.inlineExecution    = !workerThreads;
         deviceInfo.hostOptions.disableKmt         = true;
@@ -238,7 +239,7 @@ namespace dxvk::ddi {
         D3D_FEATURE_LEVEL maxLevel = D3D11Device::GetMaxFeatureLevel(*device);
 
         if (info->FeatureLevel > maxLevel) {
-          Logger::err(str::format("bc250dxvk: Feature level ", info->FeatureLevel,
+          Logger::err(str::format("amdgpu_wddm_dxvk: Feature level ", info->FeatureLevel,
             " requested, device supports ", maxLevel));
           return DXGI_ERROR_UNSUPPORTED;
         }
@@ -251,7 +252,7 @@ namespace dxvk::ddi {
         *result = ref(new Bc250DxvkDevice(container.ptr(), *info->Services, std::move(logSink)));
         return S_OK;
       } catch (const DxvkError& e) {
-        Logger::err(str::format("bc250dxvk: CreateDevice: ", e.message()));
+        Logger::err(str::format("amdgpu_wddm_dxvk: CreateDevice: ", e.message()));
         return GetErrorResult(e, E_FAIL);
       }
     }

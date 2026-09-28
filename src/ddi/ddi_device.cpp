@@ -92,7 +92,7 @@ namespace dxvk::ddi {
       m_context->Flush();
       m_dxvkDevice->waitForIdle();
     } catch (const DxvkError& e) {
-      Logger::err(str::format("bc250dxvk: final release: ", e.message()));
+      Logger::err(str::format("amdgpu_wddm_dxvk: final release: ", e.message()));
     }
 
     m_device  = nullptr;
@@ -104,7 +104,7 @@ namespace dxvk::ddi {
     leaked = container->Release();
 
     if (leaked)
-      Logger::err(str::format("bc250dxvk: D3D11 device still has ", leaked, " references at final release"));
+      Logger::err(str::format("amdgpu_wddm_dxvk: D3D11 device still has ", leaked, " references at final release"));
 
     // The shell's Log service may go away with its device
     m_logSink = nullptr;
@@ -706,7 +706,7 @@ namespace dxvk::ddi {
 
 
   static HRESULT BltNotImplemented(const char* What) {
-    Logger::err(str::format("bc250dxvk: Blt: ", What, " not implemented"));
+    Logger::err(str::format("amdgpu_wddm_dxvk: Blt: ", What, " not implemented"));
     return E_NOTIMPL;
   }
 
@@ -863,7 +863,7 @@ namespace dxvk::ddi {
         srcFormat = srcPair.second;
         dstFormat = dstPair.second;
       } else {
-        Logger::err(str::format("bc250dxvk: Blt: no common encoding for ", srcFormat, " and ", dstFormat));
+        Logger::err(str::format("amdgpu_wddm_dxvk: Blt: no common encoding for ", srcFormat, " and ", dstFormat));
         return E_INVALIDARG;
       }
     }
@@ -933,9 +933,10 @@ namespace dxvk::ddi {
       m_dxvkDevice->trimMemory();
       VkDeviceSize after = allocated();
 
-      Logger::info(str::format("bc250dxvk: TrimMemory: device memory ", before >> 20u, " MiB -> ", after >> 20u, " MiB"));
+      Logger::info(str::format("amdgpu_wddm_dxvk: TrimMemory: device memory ", before >> 20u, " MiB -> ",
+        after >> 20u, " MiB"));
     } catch (const DxvkError& e) {
-      Logger::err(str::format("bc250dxvk: TrimMemory: ", e.message()));
+      Logger::err(str::format("amdgpu_wddm_dxvk: TrimMemory: ", e.message()));
       return GetErrorResult(e, E_FAIL);
     }
 
