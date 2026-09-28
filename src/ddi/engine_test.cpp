@@ -366,6 +366,7 @@ namespace {
     const UINT*                             tokens = nullptr;
     std::vector<BC250_DXVK_SIGNATURE_ENTRY> input;
     std::vector<BC250_DXVK_SIGNATURE_ENTRY> output;
+    std::vector<UINT>                       outputStreams;  // from reflection; the DDI entries carry 0
   };
 
   const UINT* FindProgramChunk(const void* dxbc, size_t size) {
@@ -388,13 +389,13 @@ namespace {
   }
 
   // D3D_NAME values below D3D_NAME_TARGET equal D3D10_SB_NAME; targets, depth and coverage have no
-  // D3D10_SB_NAME, so the runtime passes UNDEFINED (targets) or no register (depth, coverage).
+  // D3D10_SB_NAME, so the runtime passes UNDEFINED (targets) or no register (depth, coverage). Stream stays 0,
+  // as in the D3D11_1DDIARG_SIGNATURE_ENTRY the shell receives.
   BC250_DXVK_SIGNATURE_ENTRY ToDdi(const D3D11_SIGNATURE_PARAMETER_DESC& p) {
     BC250_DXVK_SIGNATURE_ENTRY e = { };
     e.SystemValue   = p.SystemValueType < D3D_NAME_TARGET ? UINT(p.SystemValueType) : 0u;
     e.Register      = p.Register;
     e.Mask          = p.Mask;
-    e.Stream        = BYTE(p.Stream);
     e.ComponentType = UINT(p.ComponentType);
     e.MinPrecision  = UINT(p.MinPrecision);
     return e;
@@ -431,6 +432,7 @@ namespace {
       D3D11_SIGNATURE_PARAMETER_DESC p = { };
       reflection->GetOutputParameterDesc(i, &p);
       out->output.push_back(ToDdi(p));
+      out->outputStreams.push_back(p.Stream);
     }
 
     return true;
@@ -463,6 +465,27 @@ namespace {
 
     float4 ps(VsOut i) : SV_Target {
       return float4(i.col, 1.0f);
+    }
+  )";
+
+  // Two output streams. fxc allocates output registers per stream, so the value on stream 1 reuses o0.
+  const char* g_streamsHlsl = R"(
+    struct VsOut {
+      float4 pos : SV_Position;
+      float3 col : QUUX7;
+    };
+
+    struct Second {
+      float4 value : BLARG2;
+    };
+
+    [maxvertexcount(2)]
+    void gs(point VsOut i[1], inout PointStream<VsOut> first, inout PointStream<Second> second) {
+      first.Append(i[0]);
+
+      Second o;
+      o.value = float4(i[0].col * 2.0f + 1.0f, i[0].pos.x + 5.0f);
+      second.Append(o);
     }
   )";
 
@@ -2373,6 +2396,140 @@ int main(int argc, char** argv) {
         Check(resultOf(overflowed.Get()) == TRUE && resultOf(fitted.Get()) == FALSE,
           "GetData reports overflow for the strip and none for the list");
       }
+    }
+  }
+
+  // ---- stream output on two streams of a gs_5_0 program ----
+  // The signature entries carry Stream 0, as the shell receives them, so the engine has to take the streams
+  // from the program's dcl_stream blocks. Stream 1 reuses a register of stream 0.
+  {
+    DdiShader gsDdi;
+    bool ready = CompileDdi(g_streamsHlsl, "gs", "gs_5_0", &gsDdi);
+    UINT pos0 = ~0u, col0 = ~0u, value1 = ~0u;
+
+    for (size_t i = 0u; ready && i < gsDdi.output.size(); i++) {
+      const auto& e = gsDdi.output[i];
+      const UINT stream = gsDdi.outputStreams[i];
+      std::printf("      gs output %zu: register %u mask 0x%x system value %u, stream %u (DDI entry: %u)\n",
+        i, e.Register, unsigned(e.Mask), e.SystemValue, stream, unsigned(e.Stream));
+
+      if (stream == 0u)
+        (e.SystemValue == 1u ? pos0 : col0) = e.Register;
+      else if (stream == 1u)
+        value1 = e.Register;
+    }
+
+    const bool reused = pos0 != ~0u && col0 != ~0u && (value1 == pos0 || value1 == col0);
+    Check(reused, "precondition: stream 1 of the gs_5_0 program reuses an output register of stream 0");
+    ready = ready && reused;
+
+    const BC250_DXVK_SO_ENTRY entries[] = {
+      { 0u, 0u, pos0,   0xfu },
+      { 0u, 0u, col0,   0x7u },
+      { 1u, 1u, value1, 0xfu },
+    };
+
+    const UINT strides[] = { 7u * sizeof(float), 4u * sizeof(float) };
+    const BC250_DXVK_STREAM_OUTPUT decl = { entries, 3u, strides, 2u, D3D11_SO_NO_RASTERIZED_STREAM };
+
+    Microsoft::WRL::ComPtr<ID3D11GeometryShader> gs;
+
+    if (ready) {
+      BC250_DXVK_SHADER_DESC desc = MakeDesc(gsDdi);
+      desc.StreamOutput = &decl;
+      ready = CheckHr(engine->CreateShader(&desc, IID_PPV_ARGS(&gs)),
+        "CreateShader (gs_5_0 stream output on streams 0 and 1, signature streams 0)");
+    }
+
+    Microsoft::WRL::ComPtr<ID3D11Buffer> targets[2], reads[2];
+
+    for (UINT s = 0u; ready && s < 2u; s++) {
+      D3D11_BUFFER_DESC bd = { 3u * strides[s], D3D11_USAGE_DEFAULT, D3D11_BIND_STREAM_OUTPUT };
+      D3D11_BUFFER_DESC rd = { 3u * strides[s], D3D11_USAGE_STAGING, 0u, D3D11_CPU_ACCESS_READ };
+      std::vector<float> holes(3u * strides[s] / sizeof(float), -7.0f);
+      D3D11_SUBRESOURCE_DATA init = { holes.data() };
+      ready = CheckHr(d3d->CreateBuffer(&bd, &init, &targets[s]), "CreateBuffer (stream target)")
+           && CheckHr(d3d->CreateBuffer(&rd, nullptr, &reads[s]), "CreateBuffer (stream readback)");
+    }
+
+    // Draws the three points through the given geometry shader into both targets and compares the records
+    auto captureStreams = [&] (ID3D11GeometryShader* program, const char* what) {
+      ID3D11Buffer* soTargets[] = { targets[0].Get(), targets[1].Get() };
+      const UINT soOffsets[] = { 0u, 0u };
+
+      for (UINT s = 0u; s < 2u; s++) {
+        std::vector<float> holes(3u * strides[s] / sizeof(float), -7.0f);
+        ctx->UpdateSubresource(targets[s].Get(), 0u, nullptr, holes.data(), 0u, 0u);
+      }
+
+      ctx->IASetInputLayout(layout.Get());
+      ctx->IASetVertexBuffers(0u, 1u, vbs, &stride, &offset);
+      ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_POINTLIST);
+      ctx->VSSetShader(vs.Get(), nullptr, 0u);
+      ctx->GSSetShader(program, nullptr, 0u);
+      ctx->SOSetTargets(2u, soTargets, soOffsets);
+      ctx->Draw(3u, 0u);
+      ctx->SOSetTargets(0u, nullptr, nullptr);
+      ctx->GSSetShader(nullptr, nullptr, 0u);
+      ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+      std::array<bool, 2u> match = { true, true };
+
+      for (UINT s = 0u; s < 2u; s++) {
+        D3D11_MAPPED_SUBRESOURCE m = { };
+        ctx->CopyResource(reads[s].Get(), targets[s].Get());
+
+        if (!CheckHr(ctx->Map(reads[s].Get(), 0u, D3D11_MAP_READ, 0u, &m), "Map (stream readback)")) {
+          match[s] = false;
+          continue;
+        }
+
+        const float* r = static_cast<const float*>(m.pData);
+        const UINT floats = UINT(strides[s] / sizeof(float));
+
+        for (UINT v = 0u; v < 3u; v++) {
+          const float* in = &vertices[5u * v];
+          const float first[] = { in[0], in[1], 0.0f, 1.0f, in[2], in[3], in[4] };
+          const float second[] = { 2.0f * in[2] + 1.0f, 2.0f * in[3] + 1.0f, 2.0f * in[4] + 1.0f, in[0] + 5.0f };
+          const float* expect = s ? second : first;
+          std::string line;
+
+          for (UINT i = 0u; i < floats; i++) {
+            char value[16];
+            std::snprintf(value, sizeof(value), " %.1f", r[v * floats + i]);
+            line += value;
+            match[s] = match[s] && r[v * floats + i] == expect[i];
+          }
+
+          std::printf("      %s: stream %u record %u:%s\n", what, s, v, line.c_str());
+        }
+
+        ctx->Unmap(reads[s].Get(), 0u);
+      }
+
+      return match;
+    };
+
+    // Control: the same program as fxc built it, with its own OSG5, through DXVK's D3D11 entry point
+    const D3D11_SO_DECLARATION_ENTRY apiEntries[] = {
+      { 0u, "SV_Position", 0u, 0u, 4u, 0u },
+      { 0u, "QUUX",        7u, 0u, 3u, 0u },
+      { 1u, "BLARG",       2u, 0u, 4u, 1u },
+    };
+
+    Microsoft::WRL::ComPtr<ID3D11GeometryShader> control;
+
+    if (ready && CheckHr(d3d->CreateGeometryShaderWithStreamOutput(gsDdi.blob->GetBufferPointer(),
+        gsDdi.blob->GetBufferSize(), apiEntries, 3u, strides, 2u, D3D11_SO_NO_RASTERIZED_STREAM, nullptr, &control),
+        "CreateGeometryShaderWithStreamOutput (control, fxc container)")) {
+      auto match = captureStreams(control.Get(), "control");
+      Check(match[0] && match[1], "control: both streams of the fxc container capture their records");
+    }
+
+    if (ready) {
+      auto match = captureStreams(gs.Get(), "DDI");
+      Check(match[0], "stream 0 of the gs_5_0 program captures the position and colour of each point");
+      Check(match[1], "stream 1 captures its own value from the reused register");
     }
   }
 
