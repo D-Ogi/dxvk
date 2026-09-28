@@ -425,6 +425,32 @@ namespace dxvk {
   }
   
   
+  void DxvkContext::clearBufferAttachment(
+    const DxvkAttachment&       attachment,
+          uint32_t              offset,
+          uint32_t              length,
+          VkClearValue          value) {
+    if (attachment.shadow->info().format) {
+      value.color = util::swizzleClearColor(value.color,
+        util::invertComponentMapping(attachment.view->info().unpackSwizzle()));
+
+      clearBufferView(attachment.shadow, offset, length, value.color);
+      return;
+    }
+
+    // Copying the image back writes every element, so the image
+    // must hold the current buffer contents before a partial clear
+    acquireShadowAttachment(attachment);
+
+    clearImageView(attachment.view,
+      VkOffset3D { int32_t(offset), 0, 0 },
+      VkExtent3D { length, 1u, 1u },
+      VK_IMAGE_ASPECT_COLOR_BIT, value);
+
+    releaseShadowAttachment(attachment);
+  }
+  
+  
   void DxvkContext::clearImageView(
     const Rc<DxvkImageView>&    imageView,
           VkOffset3D            offset,

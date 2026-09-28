@@ -454,6 +454,25 @@ namespace dxvk {
             VkClearColorValue     value);
     
     /**
+     * \brief Clears elements of a buffer render target
+     *
+     * Outside of render passes the buffer holds the contents of
+     * a buffer attachment, the image is only a proxy to render to.
+     * A typed buffer view is cleared directly. Otherwise the image
+     * is refreshed from the buffer, cleared and copied back, so
+     * that the other elements keep their contents.
+     * \param [in] attachment Buffer attachment with its shadow view
+     * \param [in] offset First element to clear
+     * \param [in] length Number of elements to clear
+     * \param [in] value The clear value
+     */
+    void clearBufferAttachment(
+      const DxvkAttachment&       attachment,
+            uint32_t              offset,
+            uint32_t              length,
+            VkClearValue          value);
+
+    /**
      * \brief Clears an active render target
      * 
      * \param [in] attachment Render target to clear

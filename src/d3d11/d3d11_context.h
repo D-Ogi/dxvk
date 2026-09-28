@@ -934,6 +934,12 @@ namespace dxvk {
       const D3D11_RECT*                       pRects,
             UINT                              NumRects);
 
+    void ClearBufferRenderTarget(
+            D3D11RenderTargetView*            pView,
+      const FLOAT                             Color[4],
+      const D3D11_RECT*                       pRects,
+            UINT                              NumRects);
+
     VkClearValue ConvertColorValue(
       const FLOAT                             Color[4],
       const DxvkFormatInfo*                   pFormatInfo);

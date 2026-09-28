@@ -740,14 +740,10 @@ namespace dxvk {
         ClearImageView(std::move(imgView), Color, pRect, NumRects);
     } else if (rtv) {
       Rc<DxvkImageView> imgView = rtv->GetImageView();
-      Rc<DxvkBufferView> bufView = rtv->GetBufferView();
 
-      if (bufView) {
-        Logger::err("D3D11: ClearView on buffer RTV not supported.");
-        return;
-      }
-
-      if (imgView)
+      if (rtv->GetBufferView())
+        ClearBufferRenderTarget(rtv, Color, pRect, NumRects);
+      else if (imgView)
         ClearImageView(std::move(imgView), Color, pRect, NumRects);
     } else if (uav) {
       Rc<DxvkImageView> imgView = uav->GetImageView();
@@ -4124,6 +4120,46 @@ namespace dxvk {
           ctx->clearBufferView(cView,
             rects[i].offset.x, rects[i].extent.width,
             cClearValue.color);
+        }
+      }
+    });
+
+    if (NumRects) {
+      for (uint32_t i = 0; i < NumRects; i++)
+        new (m_csData->at(i)) VkRect2D(ConvertRect(pRects[i], extent2D));
+    } else {
+      auto vkRect = new (m_csData->first()) VkRect2D();
+      vkRect->offset = VkOffset2D { 0, 0 };
+      vkRect->extent = extent2D;
+    }
+  }
+
+
+  template<typename ContextType>
+  void D3D11CommonContext<ContextType>::ClearBufferRenderTarget(
+          D3D11RenderTargetView*            pView,
+    const FLOAT                             Color[4],
+    const D3D11_RECT*                       pRects,
+          UINT                              NumRects) {
+    DxvkAttachment attachment = { };
+    attachment.view = pView->GetImageView();
+    attachment.shadow = pView->GetBufferView();
+
+    auto clearValue = ConvertColorValue(Color, attachment.view->formatInfo());
+
+    // Rectangles on buffers are (left, 0, right, 1), with left
+    // and right selecting the range of elements to clear
+    VkExtent2D extent2D = { attachment.view->mipLevelExtent(0u).width, 1u };
+
+    EmitCsCmd<VkRect2D>(D3D11CmdType::None, std::max(NumRects, 1u), [
+      cAttachment = std::move(attachment),
+      cClearValue = clearValue
+    ] (DxvkContext* ctx, const VkRect2D* rects, size_t count) {
+      for (size_t i = 0; i < count; i++) {
+        if (rects[i].extent.width) {
+          ctx->clearBufferAttachment(cAttachment,
+            rects[i].offset.x, rects[i].extent.width,
+            cClearValue);
         }
       }
     });
