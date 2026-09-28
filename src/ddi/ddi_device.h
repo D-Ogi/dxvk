@@ -43,7 +43,7 @@ namespace dxvk::ddi {
   };
 
 
-  class Bc250DxvkDevice : public ComObject<IBc250DxvkDevice3> {
+  class Bc250DxvkDevice : public ComObject<IBc250DxvkDevice4> {
 
   public:
 
@@ -124,6 +124,10 @@ namespace dxvk::ddi {
             D3D11_FEATURE                     Feature,
             void*                             pFeatureData,
             UINT                              FeatureDataSize) final;
+
+    HRESULT STDMETHODCALLTYPE TrimMemory() final;
+
+    HRESULT STDMETHODCALLTYPE TakeDeferredError() final;
 
   private:
 

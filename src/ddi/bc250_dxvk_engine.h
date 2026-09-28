@@ -3,7 +3,7 @@
  * bc250_dxvk_engine.h - boundary between the BC-250 system D3D10/11 user-mode driver ("shell", the
  * UserModeDriverName DLL) and its DXVK engine ("engine", bc250dxvk.dll, DXVK fork branch amdgpu-wddm/ddi-engine).
  *
- * Revision r5, ABI 1.3. This file in the DXVK fork is the only copy; the shell includes it from the DXVK
+ * Revision r6, ABI 1.4. This file in the DXVK fork is the only copy; the shell includes it from the DXVK
  * source checkout it builds against, like its other DXVK-facing headers.
  *
  * Versions. A minor version adds and never changes: an engine of minor n serves a shell built for any minor
@@ -18,6 +18,9 @@
  *        dcl_stream blocks, so stream output on streams 1-3 works with the Stream = 0 the shell passes.
  *   1.3  r5: IBc250DxvkDevice3 (CheckFeatureSupportAtLevel, the engine's feature answers at any level it
  *        accepts, for the shell's check of its adapter-level GetCaps answers).
+ *   1.4  r6: IBc250DxvkDevice4 (TrimMemory; TakeDeferredError for the errors of calls that return nothing).
+ *        Running out of memory is no longer fatal: creation methods and Map return E_OUTOFMEMORY (E6). Before
+ *        1.4 an allocation that found no memory ended the process.
  *
  * WDK-free by construction. DXVK's util_gdi.h declares private extern-C D3DKMT prototypes that collide with
  * the WDK's in one translation unit, so nothing here needs d3d10umddi.h or a DXVK header: windows.h, the SDK's
@@ -67,8 +70,11 @@
  *       WaitForResourceIdle, releases the texture (views are released first by the runtime), then destroys
  *       the image, frees the memory and deallocates (primaries immediately, others possibly deferred to Flush).
  *       After WaitForResourceIdle and the last release the engine never references that VkImage again.
- *   E6  Errors. Methods that return HRESULT return it; void D3D11 methods report nothing. E_OUTOFMEMORY is
- *       returned, never thrown. Engine results are D3D11/DXGI API codes, not DDI codes: the shell maps them to
+ *   E6  Errors. Methods that return HRESULT return it. E_OUTOFMEMORY is returned, never thrown: an engine
+ *       allocation that finds no memory fails the creation method or Map that needed it with E_OUTOFMEMORY and
+ *       leaves no object and no mapping behind. Calls that return nothing (void D3D11 methods, and recorded work
+ *       the engine executes inside a later call) record their first error for IBc250DxvkDevice4::
+ *       TakeDeferredError; before 1.4 they reported nothing. Engine results are D3D11/DXGI API codes, not DDI codes: the shell maps them to
  *       the set the DDI entry allows before pfnSetErrorCb (any other code is critical, and the runtime then
  *       removes the device): DXGI_ERROR_WAS_STILL_DRAWING becomes DXGI_DDI_ERR_WASSTILLDRAWING (Map with
  *       DONOTWAIT, query data), and device loss becomes D3DDDIERR_DEVICEREMOVED where the entry allows it. After
@@ -91,7 +97,7 @@
 #include <vulkan/vulkan.h>
 
 #define BC250_DXVK_ENGINE_ABI_MAJOR 1u
-#define BC250_DXVK_ENGINE_ABI_MINOR 3u
+#define BC250_DXVK_ENGINE_ABI_MINOR 4u
 #define BC250_DXVK_ENGINE_ABI_VERSION ((BC250_DXVK_ENGINE_ABI_MAJOR << 16) | BC250_DXVK_ENGINE_ABI_MINOR)
 
 /* The Vulkan objects the shell owns (E1). */
@@ -368,6 +374,27 @@ IBc250DxvkDevice3 : public IBc250DxvkDevice2 {
     virtual HRESULT STDMETHODCALLTYPE CheckFeatureSupportAtLevel(D3D_FEATURE_LEVEL featureLevel,
                                                                  D3D11_FEATURE feature, void *data,
                                                                  UINT dataSize) = 0;
+};
+
+/* ABI 1.4. The same object as IBc250DxvkDevice; QueryInterface on it, E_NOINTERFACE from an older engine. */
+MIDL_INTERFACE("2a66afa1-95be-4a4d-8f37-ef4754cf5e6d")
+IBc250DxvkDevice4 : public IBc250DxvkDevice3 {
+    /* Gives back memory the engine holds without need: submits pending work as Flush does (E3), waits until
+     * the GPU finished all of it, then frees the storage that discarded and released resources kept, the
+     * engine's cached allocations and every Vulkan memory block left empty (vkFreeMemory through hosted RADV).
+     * Live resources keep their memory; the immediate context keeps a local cache of small discard
+     * allocations (a few MiB at most). For IDXGIDevice3::Trim and memory pressure; it stalls like a GPU idle
+     * wait, so not per frame. S_OK, or a device-loss code as in E6. */
+    virtual HRESULT STDMETHODCALLTYPE TrimMemory() = 0;
+
+    /* Returns and clears the first error recorded since the previous call by engine work that could not
+     * return it (E6). S_OK when there is none. E_OUTOFMEMORY: an allocation found no memory and the call's
+     * work was dropped whole before it changed anything (an UpdateSubresource that did not happen). E_FAIL:
+     * any other failure, including recorded commands that stopped part way when the engine executed them
+     * (out of memory or not; the engine log says which); results from then on are undefined and the shell
+     * should treat it as device loss. Device loss itself is reported by GetDeviceRemovedReason (E6), not here.
+     * An atomic exchange: the shell may call it after every DDI entry that returns nothing. */
+    virtual HRESULT STDMETHODCALLTYPE TakeDeferredError() = 0;
 };
 
 struct BC250_DXVK_ENGINE_FUNCS {

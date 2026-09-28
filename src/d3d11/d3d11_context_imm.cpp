@@ -297,13 +297,24 @@ namespace dxvk {
     D3D11_RESOURCE_DIMENSION resourceDim = D3D11_RESOURCE_DIMENSION_UNKNOWN;
     pResource->GetType(&resourceDim);
 
-    if (likely(resourceDim == D3D11_RESOURCE_DIMENSION_BUFFER)) {
-      return MapBuffer(
-        static_cast<D3D11Buffer*>(pResource),
-        MapType, MapFlags, pMappedResource);
-    } else {
-      return MapImage(GetCommonTexture(pResource),
-        Subresource, MapType, MapFlags, pMappedResource);
+    try {
+      if (likely(resourceDim == D3D11_RESOURCE_DIMENSION_BUFFER)) {
+        return MapBuffer(
+          static_cast<D3D11Buffer*>(pResource),
+          MapType, MapFlags, pMappedResource);
+      } else {
+        return MapImage(GetCommonTexture(pResource),
+          Subresource, MapType, MapFlags, pMappedResource);
+      }
+    } catch (const DxvkError& e) {
+      // New storage could not be allocated. The allocation precedes
+      // every state change, so the resource is not mapped (bc250).
+      Logger::err(e.message());
+
+      if (pMappedResource)
+        pMappedResource->pData = nullptr;
+
+      return GetErrorResult(e, E_FAIL);
     }
   }
   

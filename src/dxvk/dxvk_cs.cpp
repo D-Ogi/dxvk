@@ -164,6 +164,7 @@ namespace dxvk {
       Logger::err("Exception executing CS chunk inline!");
       Logger::err(e.message());
       m_inlineDeferred.clear();
+      m_device->setDeferredError(DxvkDeferredError::Failed);
     }
 
     m_inlineBusy = false;
@@ -342,6 +343,7 @@ namespace dxvk {
     } catch (const DxvkError& e) {
       Logger::err("Exception on CS thread!");
       Logger::err(e.message());
+      m_device->setDeferredError(DxvkDeferredError::Failed);
     }
   }
   

@@ -252,7 +252,7 @@ namespace dxvk::ddi {
         return S_OK;
       } catch (const DxvkError& e) {
         Logger::err(str::format("bc250dxvk: CreateDevice: ", e.message()));
-        return E_FAIL;
+        return GetErrorResult(e, E_FAIL);
       }
     }
 

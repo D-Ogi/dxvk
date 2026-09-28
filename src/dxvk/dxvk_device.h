@@ -70,7 +70,20 @@ namespace dxvk {
     DxvkDeviceQueue transfer;
     DxvkDeviceQueue sparse;
   };
-  
+
+  /**
+   * \brief Error recorded for work that could not return it (bc250)
+   *
+   * \c OutOfMemory means the work was dropped whole before it
+   * changed any state; \c Failed means anything else, including
+   * work that stopped part way, so its results are undefined.
+   */
+  enum class DxvkDeferredError : uint32_t {
+    None        = 0u,
+    OutOfMemory = 1u,
+    Failed      = 2u,
+  };
+
   /**
    * \brief DXVK device
    * 
@@ -119,7 +132,37 @@ namespace dxvk {
     size_t compileDeferredPipelines(std::chrono::microseconds budget) {
       return m_objects.pipelineManager().compileDeferredPipelines(budget);
     }
-    
+
+    /**
+     * \brief Records an error that had no caller to report it to
+     *
+     * Work that cannot return an error (inline CS chunks, void
+     * API calls) records what it caught here. The first error
+     * is kept until \ref takeDeferredError (bc250).
+     * \param [in] error What happened to the work
+     */
+    void setDeferredError(DxvkDeferredError error) {
+      uint32_t expected = uint32_t(DxvkDeferredError::None);
+      m_deferredError.compare_exchange_strong(expected, uint32_t(error));
+    }
+
+    /**
+     * \brief Returns and clears the recorded error
+     * \returns First error recorded since the last call
+     */
+    DxvkDeferredError takeDeferredError() {
+      return DxvkDeferredError(m_deferredError.exchange(uint32_t(DxvkDeferredError::None)));
+    }
+
+    /**
+     * \brief Frees unused device memory now
+     *
+     * See \ref DxvkMemoryAllocator::trimUnusedMemory. Call
+     * \ref waitForIdle first so that completed command lists
+     * have released the storage of retired resources (bc250).
+     */
+    void trimMemory();
+
     /**
      * \brief Vulkan device functions
      * \returns Vulkan device functions
@@ -797,6 +840,8 @@ namespace dxvk {
 
     sync::Spinlock              m_statLock;
     DxvkStatCounters            m_statCounters;
+
+    std::atomic<uint32_t>       m_deferredError = { 0u };
 
     DxvkRecycler<DxvkCommandList, 16> m_recycledCommandLists;
 

@@ -48,6 +48,17 @@ namespace dxvk {
 
     void NotifyContextFlush();
 
+    /**
+     * \brief Submits pending initialization now
+     *
+     * Context flushes pass the initializer's commands on only when the
+     * context itself recorded something; until then they keep their
+     * resources alive. An explicit trim needs them gone (bc250).
+     */
+    void Submit() {
+      ExecuteFlush();
+    }
+
     void InitBuffer(
             D3D11Buffer*                pBuffer,
       const D3D11_SUBRESOURCE_DATA*     pInitialData);

@@ -423,6 +423,10 @@ namespace dxvk {
       m_initializer->FlushCsChunk();
     }
 
+    void SubmitInitCommands() {
+      m_initializer->Submit();
+    }
+
     void NotifyContextFlush() {
       m_initializer->NotifyContextFlush();
     }

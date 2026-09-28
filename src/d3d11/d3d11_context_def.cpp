@@ -221,9 +221,16 @@ namespace dxvk {
       D3D11_RESOURCE_DIMENSION resourceDim;
       pResource->GetType(&resourceDim);
 
-      return likely(resourceDim == D3D11_RESOURCE_DIMENSION_BUFFER)
-        ? MapBuffer(pResource, pMappedResource)
-        : MapImage(pResource, Subresource, pMappedResource);
+      try {
+        return likely(resourceDim == D3D11_RESOURCE_DIMENSION_BUFFER)
+          ? MapBuffer(pResource, pMappedResource)
+          : MapImage(pResource, Subresource, pMappedResource);
+      } catch (const DxvkError& e) {
+        // New storage could not be allocated; nothing was recorded (bc250)
+        Logger::err(e.message());
+        pMappedResource->pData = nullptr;
+        return GetErrorResult(e, E_FAIL);
+      }
     } else if (likely(MapType == D3D11_MAP_WRITE_NO_OVERWRITE)) {
       // The resource must be mapped with D3D11_MAP_WRITE_DISCARD
       // before it can be mapped with D3D11_MAP_WRITE_NO_OVERWRITE.

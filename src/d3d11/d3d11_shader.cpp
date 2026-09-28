@@ -357,7 +357,7 @@ namespace dxvk {
         ModuleInfo, pShaderBytecode, BytecodeLength, Icb, BindingMask);
     } catch (const DxvkError& e) {
       Logger::err(e.message());
-      return E_INVALIDARG;
+      return GetErrorResult(e, E_INVALIDARG);
     }
 
     m_modules.insert({ ShaderKey, module });

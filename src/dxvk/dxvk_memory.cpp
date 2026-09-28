@@ -10,6 +10,16 @@
 
 namespace dxvk {
 
+  // bc250: a Vulkan out-of-memory result becomes DxvkOutOfMemoryError, so that
+  // API entry points return E_OUTOFMEMORY for it.
+  [[noreturn]] static void throwVkError(VkResult vr, std::string&& message) {
+    if (vr == VK_ERROR_OUT_OF_HOST_MEMORY || vr == VK_ERROR_OUT_OF_DEVICE_MEMORY)
+      throw DxvkOutOfMemoryError(std::move(message));
+
+    throw DxvkError(std::move(message));
+  }
+
+
   void DxvkMemoryChunk::addAllocation(DxvkResourceAllocation* allocation) {
     allocation->m_nextInChunk = allocationList;
 
@@ -665,6 +675,38 @@ namespace dxvk {
   }
 
 
+  void DxvkSharedAllocationCache::freeAllFromLockedAllocator() {
+    { std::unique_lock freeLock(m_freeMutex);
+
+      for (auto& list : m_freeLists) {
+        m_allocator->freeCachedAllocationsLocked(std::exchange(list.head, nullptr));
+        list.size = 0u;
+      }
+    }
+
+    std::unique_lock poolLock(m_poolMutex);
+
+    for (auto& pool : m_pools) {
+      while (pool.listIndex >= 0) {
+        int32_t listIndex = pool.listIndex;
+        m_allocator->freeCachedAllocationsLocked(m_lists[listIndex].head);
+
+        pool.listIndex = m_lists[listIndex].next;
+        pool.listCount -= 1u;
+
+        m_lists[listIndex].head = nullptr;
+        m_lists[listIndex].next = m_nextList;
+
+        m_nextList = listIndex;
+
+        m_cacheSize -= PoolCapacityInBytes;
+      }
+
+      pool.drainTime = high_resolution_clock::now();
+    }
+  }
+
+
 
 
   DxvkRelocationList::DxvkRelocationList() {
@@ -774,6 +816,13 @@ namespace dxvk {
     }
 
     determineMemoryTypesWithPropertyFlags();
+
+    // bc250: test switch outside the engine ABI. With BC250DXVK_TEST_OOM=1 at device creation, plain
+    // allocations fail as out of memory while BC250DXVK_TEST_OOM_NOW=1 is set in the process.
+    m_injectOutOfMemory = env::getEnvVar("BC250DXVK_TEST_OOM") == "1";
+
+    if (m_injectOutOfMemory)
+      Logger::warn("bc250dxvk: BC250DXVK_TEST_OOM=1: out-of-memory injection armed");
 
     if (device->features().core.features.sparseBinding)
       m_sparseMemoryTypes = determineSparseMemoryTypes(device);
@@ -942,6 +991,9 @@ namespace dxvk {
           DxvkLocalAllocationCache*   allocationCache) {
     Rc<DxvkResourceAllocation> allocation;
 
+    if (unlikely(m_injectOutOfMemory) && allocationInfo.mode.isClear() && isOutOfMemoryInjected())
+      throw DxvkOutOfMemoryError(str::format("Injected out of memory for buffer: ", createInfo.size, " bytes"));
+
     if (likely(!createInfo.flags)) {
       VkMemoryRequirements memoryRequirements = { };
       memoryRequirements.size = createInfo.size;
@@ -1003,6 +1055,9 @@ namespace dxvk {
             if (allocationInfo.mode.isClear()) {
               logMemoryError(memoryRequirements);
               logMemoryStats();
+              // bc250: callers of a plain allocation dereference the result,
+              // so report the failure instead of returning null.
+              throw DxvkOutOfMemoryError(str::format("Out of memory for buffer: ", createInfo.size, " bytes"));
             }
 
             return nullptr;
@@ -1027,7 +1082,7 @@ namespace dxvk {
       &createInfo, nullptr, &buffer);
 
     if (vr != VK_SUCCESS) {
-      throw DxvkError(str::format("Failed to create buffer: ", vr,
+      throwVkError(vr, str::format("Failed to create buffer: ", vr,
         "\n  size:    ", createInfo.size,
         "\n  usage:   ", std::hex, createInfo.usage,
         "\n  flags:   ", createInfo.flags));
@@ -1081,6 +1136,11 @@ namespace dxvk {
 
     if (!allocation) {
       vk->vkDestroyBuffer(vk->device(), buffer, nullptr);
+
+      // bc250: see above, a plain allocation must not return null
+      if (allocationInfo.mode.isClear())
+        throw DxvkOutOfMemoryError(str::format("Out of memory for buffer: ", createInfo.size, " bytes"));
+
       return nullptr;
     }
 
@@ -1097,7 +1157,7 @@ namespace dxvk {
         allocation->m_memory, allocation->m_address & DxvkPageAllocator::ChunkAddressMask);
 
       if (vr != VK_SUCCESS) {
-        throw DxvkError(str::format("Failed to bind buffer memory: ", vr,
+        throwVkError(vr, str::format("Failed to bind buffer memory: ", vr,
           "\n  size:    ", createInfo.size,
           "\n  usage:   ", std::hex, createInfo.usage,
           "\n  flags:   ", createInfo.flags));
@@ -1118,11 +1178,16 @@ namespace dxvk {
     const void*                       next) {
     auto vk = m_device->vkd();
 
+    if (unlikely(m_injectOutOfMemory) && allocationInfo.mode.isClear() && isOutOfMemoryInjected()) {
+      throw DxvkOutOfMemoryError(str::format("Injected out of memory for image: ",
+        createInfo.extent.width, "x", createInfo.extent.height, "x", createInfo.extent.depth));
+    }
+
     VkImage image = VK_NULL_HANDLE;
     VkResult vr = vk->vkCreateImage(vk->device(), &createInfo, nullptr, &image);
 
     if (vr != VK_SUCCESS) {
-      throw DxvkError(str::format("Failed to create image: ", vr,
+      throwVkError(vr, str::format("Failed to create image: ", vr,
         "\n  type:    ", createInfo.imageType,
         "\n  format:  ", createInfo.format,
         "\n  extent:  ", createInfo.extent.width, "x", createInfo.extent.height, "x", createInfo.extent.depth,
@@ -1233,6 +1298,11 @@ namespace dxvk {
       if (allocationInfo.mode.isClear()) {
         logMemoryError(requirements.memoryRequirements);
         logMemoryStats();
+        // bc250: callers of a plain allocation dereference the result,
+        // so report the failure instead of returning null.
+        throw DxvkOutOfMemoryError(str::format("Out of memory for image: ",
+          createInfo.extent.width, "x", createInfo.extent.height, "x", createInfo.extent.depth,
+          ", ", createInfo.mipLevels, " mips, ", createInfo.arrayLayers, " layers"));
       }
 
       return nullptr;
@@ -1247,7 +1317,7 @@ namespace dxvk {
         allocation->m_address & DxvkPageAllocator::ChunkAddressMask);
 
       if (vr != VK_SUCCESS) {
-        throw DxvkError(str::format("Failed to bind image memory: ", vr,
+        throwVkError(vr, str::format("Failed to bind image memory: ", vr,
           "\n  type:    ", createInfo.imageType,
           "\n  format:  ", createInfo.format,
           "\n  extent:  ", createInfo.extent.width, "x", createInfo.extent.height, "x", createInfo.extent.depth,
@@ -1836,7 +1906,7 @@ namespace dxvk {
         memory.memory, 0, memory.size, 0, &memory.mapPtr);
 
       if (vr != VK_SUCCESS) {
-        throw DxvkError(str::format("Failed to map Vulkan memory: ", vr,
+        throwVkError(vr, str::format("Failed to map Vulkan memory: ", vr,
           "\n  size: ", memory.size, " bytes"));
       }
 
@@ -2725,6 +2795,27 @@ namespace dxvk {
         }
       }
     }
+  }
+
+
+  bool DxvkMemoryAllocator::isOutOfMemoryInjected() const {
+    return env::getEnvVar("BC250DXVK_TEST_OOM_NOW") == "1";
+  }
+
+
+  void DxvkMemoryAllocator::trimUnusedMemory() {
+    std::unique_lock lock(m_mutex);
+
+    // Return cached allocations to their chunks first, so that
+    // chunks holding only cached allocations become empty.
+    for (uint32_t i = 0; i < m_memTypeCount; i++) {
+      if (m_memTypes[i].sharedCache)
+        m_memTypes[i].sharedCache->freeAllFromLockedAllocator();
+    }
+
+    // An allocation size above any budget frees every empty chunk.
+    for (uint32_t i = 0; i < m_memHeapCount; i++)
+      freeEmptyChunksInHeap(m_memHeaps[i], VkDeviceSize(-1), high_resolution_clock::time_point());
   }
 
 

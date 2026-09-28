@@ -7,6 +7,16 @@
 namespace dxvk {
 
   /**
+   * \brief HRESULT for a caught DXVK error
+   *
+   * E_OUTOFMEMORY when the error is an out-of-memory error,
+   * otherwise the code the handler used to return (bc250).
+   */
+  inline HRESULT GetErrorResult(const DxvkError& e, HRESULT otherwise) {
+    return e.isOutOfMemory() ? E_OUTOFMEMORY : otherwise;
+  }
+
+  /**
    * \brief Shader binding mask
    *
    * Stores a bit masks of resource bindings

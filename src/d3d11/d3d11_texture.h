@@ -217,10 +217,11 @@ namespace dxvk {
      */
     void NotifyMap(UINT Subresource, D3D11_MAP MapType) {
       if (likely(Subresource < m_mapInfo.size())) {
-        m_mapInfo[Subresource].mapType = uint32_t(MapType);
-
+        // Buffer first: if its allocation throws, the subresource stays unmapped (bc250)
         if (m_mapMode == D3D11_COMMON_TEXTURE_MAP_MODE_DYNAMIC)
           CreateMappedBuffer(Subresource);
+
+        m_mapInfo[Subresource].mapType = uint32_t(MapType);
       }
     }
 

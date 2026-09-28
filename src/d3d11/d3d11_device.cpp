@@ -113,7 +113,7 @@ namespace dxvk {
       return S_OK;
     } catch (const DxvkError& e) {
       Logger::err(e.message());
-      return E_INVALIDARG;
+      return GetErrorResult(e, E_INVALIDARG);
     }
   }
   
@@ -159,7 +159,7 @@ namespace dxvk {
       return S_OK;
     } catch (const DxvkError& e) {
       Logger::err(e.message());
-      return E_INVALIDARG;
+      return GetErrorResult(e, E_INVALIDARG);
     }
   }
   
@@ -247,7 +247,7 @@ namespace dxvk {
       return S_OK;
     } catch (const DxvkError& e) {
       Logger::err(e.message());
-      return E_INVALIDARG;
+      return GetErrorResult(e, E_INVALIDARG);
     }
   }
 
@@ -334,7 +334,7 @@ namespace dxvk {
       return S_OK;
     } catch (const DxvkError& e) {
       Logger::err(e.message());
-      return E_INVALIDARG;
+      return GetErrorResult(e, E_INVALIDARG);
     }
   }
   
@@ -422,7 +422,7 @@ namespace dxvk {
       return S_OK;
     } catch (const DxvkError& e) {
       Logger::err(e.message());
-      return E_INVALIDARG;
+      return GetErrorResult(e, E_INVALIDARG);
     }
   }
   
@@ -512,7 +512,7 @@ namespace dxvk {
       return S_OK;
     } catch (const DxvkError& e) {
       Logger::err(e.message());
-      return E_INVALIDARG;
+      return GetErrorResult(e, E_INVALIDARG);
     }
   }
   
@@ -606,7 +606,7 @@ namespace dxvk {
       return S_OK;
     } catch (const DxvkError& e) {
       Logger::err(e.message());
-      return E_INVALIDARG;
+      return GetErrorResult(e, E_INVALIDARG);
     }
   }
   
@@ -654,7 +654,7 @@ namespace dxvk {
       return S_OK;
     } catch (const DxvkError& e) {
       Logger::err(e.message());
-      return E_INVALIDARG;
+      return GetErrorResult(e, E_INVALIDARG);
     }
   }
   
@@ -779,7 +779,7 @@ namespace dxvk {
       return S_OK;
     } catch (const DxvkError& e) {
       Logger::err(e.message());
-      return E_INVALIDARG;
+      return GetErrorResult(e, E_INVALIDARG);
     }
   }
   
@@ -1177,7 +1177,7 @@ namespace dxvk {
       return S_OK;
     } catch (const DxvkError& e) {
       Logger::err(e.message());
-      return E_INVALIDARG;
+      return GetErrorResult(e, E_INVALIDARG);
     }
   }
   
@@ -1234,7 +1234,7 @@ namespace dxvk {
       return S_OK;
     } catch (const DxvkError& e) {
       Logger::err(e.message());
-      return E_INVALIDARG;
+      return GetErrorResult(e, E_INVALIDARG);
     }
   }
 
@@ -1266,7 +1266,7 @@ namespace dxvk {
       return S_OK;
     } catch (const DxvkError& e) {
       Logger::err(e.message());
-      return E_INVALIDARG;
+      return GetErrorResult(e, E_INVALIDARG);
     }
   }
   
@@ -1372,7 +1372,7 @@ namespace dxvk {
       return fence->QueryInterface(riid, ppFence);
     } catch (const DxvkError& e) {
       Logger::err(e.message());
-      return E_FAIL;
+      return GetErrorResult(e, E_FAIL);
     }
   }
 
@@ -1512,7 +1512,7 @@ namespace dxvk {
         }
         catch (const DxvkError& e) {
           Logger::err(e.message());
-          return E_INVALIDARG;
+          return GetErrorResult(e, E_INVALIDARG);
         }
       }
     }
@@ -1610,7 +1610,7 @@ namespace dxvk {
         }
         catch (const DxvkError& e) {
           Logger::err(e.message());
-          return E_INVALIDARG;
+          return GetErrorResult(e, E_INVALIDARG);
         }
       }
     }
@@ -1647,7 +1647,7 @@ namespace dxvk {
       return fence->QueryInterface(ReturnedInterface, ppFence);
     } catch (const DxvkError& e) {
       Logger::err(e.message());
-      return E_FAIL;
+      return GetErrorResult(e, E_FAIL);
     }
   }
 
@@ -2617,7 +2617,7 @@ namespace dxvk {
     }
     catch (const DxvkError& e) {
       Logger::err(e.message());
-      return E_INVALIDARG;
+      return GetErrorResult(e, E_INVALIDARG);
     }
 #else
     Logger::warn("D3D11Device::OpenSharedResourceGeneric: Not supported on this platform.");
@@ -3309,7 +3309,7 @@ namespace dxvk {
       return S_OK;
     } catch (const DxvkError& e) {
       Logger::err(e.message());
-      return E_FAIL;
+      return GetErrorResult(e, E_FAIL);
     }
   }
 
@@ -3355,7 +3355,7 @@ namespace dxvk {
       return S_OK;
     } catch (const DxvkError& e) {
       Logger::err(e.message());
-      return E_FAIL;
+      return GetErrorResult(e, E_FAIL);
     }
   }
 
@@ -3370,7 +3370,7 @@ namespace dxvk {
       return S_OK;
     } catch (const DxvkError& e) {
       Logger::err(e.message());
-      return E_FAIL;
+      return GetErrorResult(e, E_FAIL);
     }
   }
 
@@ -3383,7 +3383,7 @@ namespace dxvk {
       return S_OK;
     } catch (const DxvkError& e) {
       Logger::err(e.message());
-      return E_FAIL;
+      return GetErrorResult(e, E_FAIL);
     }
   }
 
@@ -3728,7 +3728,7 @@ namespace dxvk {
       return S_OK;
     } catch (const DxvkError& e) {
       Logger::err(e.message());
-      return E_FAIL;
+      return GetErrorResult(e, E_FAIL);
     }
   }
 

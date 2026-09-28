@@ -953,6 +953,14 @@ namespace dxvk {
     void cleanupUnusedFromLockedAllocator(
             high_resolution_clock::time_point time);
 
+    /**
+     * \brief Frees every cached allocation
+     *
+     * Empties the free lists and all pools regardless of
+     * their age, for an explicit trim (bc250).
+     */
+    void freeAllFromLockedAllocator();
+
   private:
 
     struct FreeList {
@@ -1310,6 +1318,16 @@ namespace dxvk {
     DxvkSharedAllocationCacheStats getAllocationCacheStats() const;
 
     /**
+     * \brief Frees unused memory now
+     *
+     * Drains the shared allocation caches and frees every empty
+     * memory chunk, without the timeouts of the periodic cleanup.
+     * Storage that retired resources keep until their command
+     * lists complete is not affected (bc250).
+     */
+    void trimUnusedMemory();
+
+    /**
      * \brief Queries buffer memory requirements
      *
      * Can be used to get memory requirements without having
@@ -1408,6 +1426,9 @@ namespace dxvk {
 
     std::array<uint32_t, 16> m_memTypesByPropertyFlags = { };
 
+    // bc250: out-of-memory injection for the engine test, see the constructor
+    bool                m_injectOutOfMemory = false;
+
     DxvkResourceAllocationPool  m_allocationPool;
 
     uint64_t            m_nextCookie = 0u;
@@ -1457,6 +1478,8 @@ namespace dxvk {
 
     uint32_t countEmptyChunksInPool(
       const DxvkMemoryPool&       pool) const;
+
+    bool isOutOfMemoryInjected() const;
 
     void freeEmptyChunksInHeap(
       const DxvkMemoryHeap&       heap,

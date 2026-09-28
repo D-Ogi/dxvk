@@ -67,7 +67,8 @@ namespace dxvk::ddi {
      || riid == __uuidof(IBc250DxvkDevice)
      || riid == __uuidof(IBc250DxvkDevice1)
      || riid == __uuidof(IBc250DxvkDevice2)
-     || riid == __uuidof(IBc250DxvkDevice3)) {
+     || riid == __uuidof(IBc250DxvkDevice3)
+     || riid == __uuidof(IBc250DxvkDevice4)) {
       *ppvObject = ref(this);
       return S_OK;
     }
@@ -257,7 +258,7 @@ namespace dxvk::ddi {
       return S_OK;
     } catch (const DxvkError& e) {
       Logger::err(e.message());
-      return E_INVALIDARG;
+      return GetErrorResult(e, E_INVALIDARG);
     }
   }
 
@@ -540,7 +541,7 @@ namespace dxvk::ddi {
       return S_OK;
     } catch (const DxvkError& e) {
       Logger::err(e.message());
-      return E_INVALIDARG;
+      return GetErrorResult(e, E_INVALIDARG);
     }
   }
 
@@ -906,6 +907,48 @@ namespace dxvk::ddi {
       SubmitFrame();
 
     return CheckDeviceStatus();
+  }
+
+
+  HRESULT STDMETHODCALLTYPE Bc250DxvkDevice::TrimMemory() {
+    auto allocated = [this] {
+      VkDeviceSize sum = 0u;
+      uint32_t heaps = m_dxvkDevice->adapter()->memoryProperties().memoryHeapCount;
+
+      for (uint32_t i = 0u; i < heaps; i++)
+        sum += m_dxvkDevice->getMemoryStats(i).memoryAllocated;
+
+      return sum;
+    };
+
+    try {
+      // Completed command lists release the storage their retired resources kept; only then can the
+      // allocator find those chunks empty. Pending initialization (zeroing new resources) holds its
+      // resources too, and a context flush with nothing recorded does not submit it.
+      m_device->SubmitInitCommands();
+      m_context->Flush();
+      m_dxvkDevice->waitForIdle();
+
+      VkDeviceSize before = allocated();
+      m_dxvkDevice->trimMemory();
+      VkDeviceSize after = allocated();
+
+      Logger::info(str::format("bc250dxvk: TrimMemory: device memory ", before >> 20u, " MiB -> ", after >> 20u, " MiB"));
+    } catch (const DxvkError& e) {
+      Logger::err(str::format("bc250dxvk: TrimMemory: ", e.message()));
+      return GetErrorResult(e, E_FAIL);
+    }
+
+    return CheckDeviceStatus();
+  }
+
+
+  HRESULT STDMETHODCALLTYPE Bc250DxvkDevice::TakeDeferredError() {
+    switch (m_dxvkDevice->takeDeferredError()) {
+      case DxvkDeferredError::None:        return S_OK;
+      case DxvkDeferredError::OutOfMemory: return E_OUTOFMEMORY;
+      default:                             return E_FAIL;
+    }
   }
 
 

@@ -571,6 +571,11 @@ namespace dxvk {
   }
 
 
+  void DxvkDevice::trimMemory() {
+    m_objects.memoryManager().trimUnusedMemory();
+  }
+
+
   uint32_t DxvkDevice::getCurrentFrameId() const {
     return m_statCounters.getCtr(DxvkStatCounter::QueuePresentCount);
   }

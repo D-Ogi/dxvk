@@ -5842,7 +5842,7 @@ namespace dxvk {
     const void*                             pSrcData,
           UINT                              SrcRowPitch,
           UINT                              SrcDepthPitch,
-          UINT                              CopyFlags) {
+          UINT                              CopyFlags) try {
     auto context = static_cast<ContextType*>(this);
     D3D10DeviceLock lock = context->LockContext();
 
@@ -5895,6 +5895,14 @@ namespace dxvk {
       context->UpdateTexture(textureResource,
         DstSubresource, pDstBox, pSrcData, SrcRowPitch, SrcDepthPitch);
     }
+  } catch (const DxvkError& e) {
+    // UpdateSubresource cannot fail. Its staging or discard allocation
+    // precedes the recorded copy, so the update is dropped whole and
+    // the error waits for the engine's TakeDeferredError (bc250).
+    Logger::err(e.message());
+    m_device->setDeferredError(e.isOutOfMemory()
+      ? DxvkDeferredError::OutOfMemory
+      : DxvkDeferredError::Failed);
   }
 
 
