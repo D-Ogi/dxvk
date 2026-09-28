@@ -4,6 +4,8 @@
 #include "../d3d11/d3d11_input_layout.h"
 #include "../d3d11/d3d11_texture.h"
 
+#include <algorithm>
+
 namespace dxvk::ddi {
 
   Bc250DxvkDevice::Bc250DxvkDevice(
@@ -497,12 +499,48 @@ namespace dxvk::ddi {
   HRESULT STDMETHODCALLTYPE Bc250DxvkDevice::RotateResourceIdentities(
           ID3D11Resource* const*            ppResources,
           UINT                              Count) {
-    static bool s_errorShown = false;
+    if (!ppResources || !Count)
+      return E_INVALIDARG;
 
-    if (!std::exchange(s_errorShown, true))
-      Logger::err("bc250dxvk: RotateResourceIdentities not implemented");
+    if (Count == 1u)
+      return S_OK;
 
-    return E_NOTIMPL;
+    // DXGI rotates the buffers of one swap chain, which are identical; storage can only move between images
+    // that agree on everything Vulkan views and copies depend on.
+    small_vector<Rc<DxvkImage>, 4> images;
+
+    for (UINT i = 0u; i < Count; i++) {
+      D3D11CommonTexture* texture = ppResources[i] ? GetCommonTexture(ppResources[i]) : nullptr;
+
+      if (!texture || texture->GetMapMode() != D3D11_COMMON_TEXTURE_MAP_MODE_NONE)
+        return E_INVALIDARG;
+
+      Rc<DxvkImage> image = texture->GetImage();
+
+      if (i) {
+        const DxvkImageCreateInfo& a = images[0]->info();
+        const DxvkImageCreateInfo& b = image->info();
+
+        // Usage is compared as it is now: the context may have widened it on one image and not the others
+        if (a.type != b.type || a.format != b.format || a.flags != b.flags || a.usage != b.usage
+         || a.sampleCount != b.sampleCount || a.extent.width != b.extent.width
+         || a.extent.height != b.extent.height || a.extent.depth != b.extent.depth
+         || a.numLayers != b.numLayers || a.mipLevels != b.mipLevels || a.tiling != b.tiling
+         || a.layout != b.layout || a.viewFormatCount != b.viewFormatCount
+         || !std::equal(a.viewFormats, a.viewFormats + a.viewFormatCount, b.viewFormats))
+          return E_INVALIDARG;
+
+        for (const auto& other : images) {
+          if (other == image)
+            return E_INVALIDARG;
+        }
+      }
+
+      images.push_back(std::move(image));
+    }
+
+    m_context->RotateImageStorage(images.data(), images.size());
+    return S_OK;
   }
 
 

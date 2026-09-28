@@ -267,7 +267,10 @@ IBc250DxvkDevice : public IUnknown {
     virtual HRESULT STDMETHODCALLTYPE SubmitForPresent(ID3D11Resource *source, UINT subresource) = 0;
 
     /* DXGI RotateResourceIdentities: resource i takes the storage of resource i + 1, the last one that of the
-     * first. The shell rotates its own allocation handles the same way. */
+     * first, in command order: work recorded before the call keeps the old storage, views created before it
+     * see the new one. The shell rotates its own allocation handles the same way; E5 then applies to the
+     * VkImage a resource holds after the rotation. Resources must be distinct GPU-only textures with
+     * identical properties, otherwise E_INVALIDARG and nothing moves. */
     virtual HRESULT STDMETHODCALLTYPE RotateResourceIdentities(ID3D11Resource *const *resources, UINT count) = 0;
 
     /* DXGI Blt. */

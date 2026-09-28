@@ -834,6 +834,20 @@ namespace dxvk {
             VkImageLayout             layout);
 
     /**
+     * \brief Rotates the storage of images
+     *
+     * Image i takes the storage of image i + 1, the last one
+     * that of the first. Unlike swap chain rotation, any of the
+     * storage objects may already be in use in the current
+     * command list. Used by the bc250dxvk engine.
+     * \param [in] images Images, all with the same properties
+     * \param [in] count Number of images, at least 2
+     */
+    void rotateImageStorage(
+      const Rc<DxvkImage>*            images,
+            size_t                    count);
+
+    /**
      * \brief Generates mip maps
      * 
      * Uses blitting to generate lower mip levels from

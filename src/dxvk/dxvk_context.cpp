@@ -1283,6 +1283,30 @@ namespace dxvk {
   }
 
 
+  void DxvkContext::rotateImageStorage(
+    const Rc<DxvkImage>*            images,
+          size_t                    count) {
+    // invalidateImage only settles the image it is called for, after the
+    // previous one has already taken its storage. Apply deferred clears and
+    // return every image to its default layout before moving anything.
+    for (size_t i = 0u; i < count; i++)
+      releaseExternalResource(Rc<DxvkPagedResource>(images[i]), images[i]->info().layout);
+
+    Rc<DxvkResourceAllocation> first = images[0u]->storage();
+
+    for (size_t i = 0u; i + 1u < count; i++)
+      invalidateImage(images[i], images[i + 1u]->storage(), images[i + 1u]->info().layout);
+
+    invalidateImage(images[count - 1u], std::move(first), images[0u]->info().layout);
+
+    // invalidateImage assumes fresh storage and resets tracking, which would
+    // let later layout transitions move to the init command buffer, ahead of
+    // earlier work in this command list on the same storage.
+    for (size_t i = 0u; i < count; i++)
+      m_cmd->track(images[i], DxvkAccess::Write);
+  }
+
+
 
   void DxvkContext::generateMipmaps(
     const Rc<DxvkImageView>&        imageView,

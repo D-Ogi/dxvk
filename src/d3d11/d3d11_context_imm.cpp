@@ -904,6 +904,24 @@ namespace dxvk {
   }
 
 
+  void D3D11ImmediateContext::RotateImageStorage(
+    const Rc<DxvkImage>*                    pImages,
+          size_t                            Count) {
+    D3D10DeviceLock lock = LockContext();
+
+    small_vector<Rc<DxvkImage>, 4> images;
+
+    for (size_t i = 0u; i < Count; i++)
+      images.push_back(pImages[i]);
+
+    EmitCs([
+      cImages = std::move(images)
+    ] (DxvkContext* ctx) {
+      ctx->rotateImageStorage(cImages.data(), cImages.size());
+    });
+  }
+
+
   bool D3D11ImmediateContext::WaitForResource(
     const DxvkPagedResource&                Resource,
           uint64_t                          SequenceNumber,

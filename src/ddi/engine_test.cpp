@@ -3,7 +3,8 @@
 // Plays the UMD shell: owns the VkInstance and VkDevice (E1), creates the device from the engine's
 // requirements, allocates the render target image itself (E5), and feeds shaders in DDI form: the token
 // stream plus register-only signatures, with every semantic name thrown away. Checks the pixels of one
-// clear and one draw, and that every queue submission ran on the calling thread (E2).
+// clear and one draw, storage rotation, and that the engine's queue submissions, waits, allocations and
+// object creation all ran on the calling thread (E2), by wrapping the Vulkan entry points it is given.
 //
 // Usage: bc250dxvk_engine_test.exe <path to bc250dxvk.dll> [adapter substring]
 // Exit code 0 = all checks passed.
@@ -81,6 +82,126 @@ namespace {
   void APIENTRY Log(void* shell, UINT32 level, const char* message) {
     static_cast<Shell*>(shell)->logLines++;
     std::printf("engine[%u]: %s\n", level, message);
+  }
+
+  // ---- Vulkan call census -------------------------------------------------------------------------
+
+  // The engine resolves every Vulkan entry point through the vkGetInstanceProcAddr the shell hands it,
+  // so the test can wrap the calls that E2 is about and record which thread makes them. Only the
+  // engine's calls go through the wrappers; the test's own calls use the loader's pointers directly.
+  DWORD g_callerThread = 0u;
+
+  struct VkCallStats {
+    std::atomic<uint32_t> calls   { 0u };
+    std::atomic<uint32_t> foreign { 0u };
+  };
+
+  template<int Id, typename Fn>
+  struct VkHook;
+
+  template<int Id, typename R, typename... A>
+  struct VkHook<Id, R (VKAPI_PTR*)(A...)> {
+    static inline VkCallStats stats;
+    static inline R (VKAPI_PTR* real)(A...) = nullptr;
+
+    static R VKAPI_CALL Call(A... args) {
+      stats.calls++;
+
+      if (GetCurrentThreadId() != g_callerThread)
+        stats.foreign++;
+
+      return real(args...);
+    }
+
+    // Instance and device queries may both return the function; either pointer is valid for our one device
+    static PFN_vkVoidFunction Install(PFN_vkVoidFunction fn) {
+      real = reinterpret_cast<R (VKAPI_PTR*)(A...)>(fn);
+      return reinterpret_cast<PFN_vkVoidFunction>(&Call);
+    }
+  };
+
+  struct VkHookEntry {
+    const char*           name;
+    PFN_vkVoidFunction  (*install)(PFN_vkVoidFunction);
+    const VkCallStats*    stats;
+  };
+
+  // One entry per line: the line number keeps aliases with the same type apart
+#define BC250_VK_HOOK(fn) { #fn, &VkHook<__LINE__, PFN_##fn>::Install, &VkHook<__LINE__, PFN_##fn>::stats }
+
+  const VkHookEntry g_vkHooks[] = {
+    BC250_VK_HOOK(vkQueueSubmit),
+    BC250_VK_HOOK(vkQueueSubmit2),
+    BC250_VK_HOOK(vkQueueSubmit2KHR),
+    BC250_VK_HOOK(vkQueueWaitIdle),
+    BC250_VK_HOOK(vkDeviceWaitIdle),
+    BC250_VK_HOOK(vkWaitSemaphores),
+    BC250_VK_HOOK(vkWaitSemaphoresKHR),
+    BC250_VK_HOOK(vkGetSemaphoreCounterValue),
+    BC250_VK_HOOK(vkGetSemaphoreCounterValueKHR),
+    BC250_VK_HOOK(vkWaitForFences),
+    BC250_VK_HOOK(vkGetFenceStatus),
+    BC250_VK_HOOK(vkAllocateMemory),
+    BC250_VK_HOOK(vkFreeMemory),
+    BC250_VK_HOOK(vkMapMemory),
+    BC250_VK_HOOK(vkCreateBuffer),
+    BC250_VK_HOOK(vkDestroyBuffer),
+    BC250_VK_HOOK(vkCreateImage),
+    BC250_VK_HOOK(vkDestroyImage),
+    BC250_VK_HOOK(vkCreateImageView),
+    BC250_VK_HOOK(vkCreateShaderModule),
+    BC250_VK_HOOK(vkCreateGraphicsPipelines),
+    BC250_VK_HOOK(vkCreateComputePipelines),
+    BC250_VK_HOOK(vkAllocateCommandBuffers),
+    BC250_VK_HOOK(vkBeginCommandBuffer),
+    BC250_VK_HOOK(vkEndCommandBuffer),
+    BC250_VK_HOOK(vkResetCommandPool),
+  };
+
+#undef BC250_VK_HOOK
+
+  PFN_vkGetInstanceProcAddr g_realGetInstanceProcAddr = nullptr;
+  PFN_vkGetDeviceProcAddr   g_realGetDeviceProcAddr   = nullptr;
+
+  PFN_vkVoidFunction HookVk(const char* name, PFN_vkVoidFunction fn) {
+    if (fn && name) {
+      for (const auto& e : g_vkHooks) {
+        if (!std::strcmp(e.name, name))
+          return e.install(fn);
+      }
+    }
+
+    return fn;
+  }
+
+  PFN_vkVoidFunction VKAPI_CALL HookedGetDeviceProcAddr(VkDevice device, const char* name) {
+    return HookVk(name, g_realGetDeviceProcAddr(device, name));
+  }
+
+  PFN_vkVoidFunction VKAPI_CALL HookedGetInstanceProcAddr(VkInstance instance, const char* name) {
+    PFN_vkVoidFunction fn = g_realGetInstanceProcAddr(instance, name);
+
+    if (!fn || !name)
+      return fn;
+
+    if (!std::strcmp(name, "vkGetInstanceProcAddr"))
+      return reinterpret_cast<PFN_vkVoidFunction>(&HookedGetInstanceProcAddr);
+
+    if (!std::strcmp(name, "vkGetDeviceProcAddr")) {
+      g_realGetDeviceProcAddr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(fn);
+      return reinterpret_cast<PFN_vkVoidFunction>(&HookedGetDeviceProcAddr);
+    }
+
+    return HookVk(name, fn);
+  }
+
+  const VkCallStats& HookStats(const char* name) {
+    for (const auto& e : g_vkHooks) {
+      if (!std::strcmp(e.name, name))
+        return *e.stats;
+    }
+
+    std::abort();
   }
 
   // ---- threads ----------------------------------------------------------------------------------
@@ -351,8 +472,11 @@ int main(int argc, char** argv) {
   if (!getFuncs || !CheckHr(getFuncs(BC250_DXVK_ENGINE_ABI_VERSION, &funcs), "Bc250DxvkEngineGetFuncs"))
     return 1;
 
+  g_callerThread = GetCurrentThreadId();
+  g_realGetInstanceProcAddr = vk.getInstanceProcAddr;
+
   BC250_DXVK_VULKAN_INSTANCE vkInstance = { sizeof(vkInstance) };
-  vkInstance.GetInstanceProcAddr = vk.getInstanceProcAddr;
+  vkInstance.GetInstanceProcAddr = &HookedGetInstanceProcAddr;
   vkInstance.Instance            = instance;
   vkInstance.ApiVersion          = app.apiVersion;
   vkInstance.PhysicalDevice      = physDev;
@@ -678,7 +802,79 @@ int main(int argc, char** argv) {
     ctx->Unmap(staging.Get(), 0u);
   }
 
+  // ---- RotateResourceIdentities: storage moves, views follow ----
+  constexpr UINT RotCount = 3u;
+  VkImage rotImages[RotCount] = { };
+  VkDeviceMemory rotMemory[RotCount] = { };
+  Microsoft::WRL::ComPtr<ID3D11Texture2D> rotTex[RotCount];
+  Microsoft::WRL::ComPtr<ID3D11RenderTargetView> rotRtv[RotCount];
+  const float rotColors[RotCount][4] = { { 1.0f, 0.0f, 0.0f, 1.0f }, { 0.0f, 1.0f, 0.0f, 1.0f }, { 0.0f, 0.0f, 1.0f, 1.0f } };
+  bool rotReady = true;
+
+  for (UINT i = 0u; i < RotCount; i++) {
+    VkMemoryRequirements rotReq = { };
+    bool ok = vk.createImage(device, &imageInfo, nullptr, &rotImages[i]) == VK_SUCCESS;
+
+    if (ok) {
+      vk.getImageMemoryRequirements(device, rotImages[i], &rotReq);
+
+      VkMemoryAllocateInfo rotAlloc = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+      rotAlloc.allocationSize  = rotReq.size;
+      rotAlloc.memoryTypeIndex = memType;
+
+      ok = vk.allocateMemory(device, &rotAlloc, nullptr, &rotMemory[i]) == VK_SUCCESS
+        && vk.bindImageMemory(device, rotImages[i], rotMemory[i], 0u) == VK_SUCCESS
+        && SUCCEEDED(engine->CreateTexture2DFromImage(&rtDesc, rotImages[i], &rotTex[i]))
+        && SUCCEEDED(d3d->CreateRenderTargetView(rotTex[i].Get(), &rtvDesc, &rotRtv[i]));
+    }
+
+    if (ok)
+      ctx->ClearRenderTargetView(rotRtv[i].Get(), rotColors[i]);
+
+    rotReady = rotReady && ok;
+  }
+
+  Check(rotReady, "rotation set: three shell images, textures and RTVs, cleared red, green, blue");
+
+  auto readPixel = [&] (ID3D11Texture2D* texture) {
+    std::array<int, 4> result = { -1, -1, -1, -1 };
+    D3D11_MAPPED_SUBRESOURCE m = { };
+    ctx->CopyResource(staging.Get(), texture);
+
+    if (SUCCEEDED(ctx->Map(staging.Get(), 0u, D3D11_MAP_READ, 0u, &m))) {
+      const uint8_t* p = static_cast<const uint8_t*>(m.pData) + 5u * m.RowPitch + 5u * 4u;
+      result = { p[0], p[1], p[2], p[3] };
+      ctx->Unmap(staging.Get(), 0u);
+    }
+
+    return result;
+  };
+
+  if (rotReady) {
+    ID3D11Resource* rotation[RotCount] = { rotTex[0].Get(), rotTex[1].Get(), rotTex[2].Get() };
+    CheckHr(engine->RotateResourceIdentities(rotation, RotCount), "RotateResourceIdentities (3 textures)");
+
+    auto r0 = readPixel(rotTex[0].Get()), r1 = readPixel(rotTex[1].Get()), r2 = readPixel(rotTex[2].Get());
+    std::printf("      after rotation: %d,%d,%d  %d,%d,%d  %d,%d,%d\n",
+      r0[0], r0[1], r0[2], r1[0], r1[1], r1[2], r2[0], r2[1], r2[2]);
+    Check(similar(r0, 0, 255, 0, 1) && similar(r1, 0, 0, 255, 1) && similar(r2, 255, 0, 0, 1),
+      "texture i shows the former storage of texture i + 1, the last one that of the first");
+
+    const float white[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+    ctx->ClearRenderTargetView(rotRtv[0].Get(), white);
+    Check(similar(readPixel(rotTex[0].Get()), 255, 255, 255, 1) && similar(readPixel(rotTex[1].Get()), 0, 0, 255, 1),
+      "an RTV created before the rotation writes the new storage only");
+
+    ID3D11Resource* mixed[2] = { rotTex[0].Get(), staging.Get() };
+    Check(engine->RotateResourceIdentities(mixed, 2u) == E_INVALIDARG, "rotation rejects a staging texture");
+
+    ID3D11Resource* twice[2] = { rotTex[1].Get(), rotTex[1].Get() };
+    Check(engine->RotateResourceIdentities(twice, 2u) == E_INVALIDARG, "rotation rejects the same texture twice");
+  }
+
   // ---- threads and submissions ----
+  // A start module only ever proves a thread is the engine's: a std::thread starts in ucrtbase.dll, and
+  // loaders and layers start their own. The Vulkan call census after teardown is the E2 criterion.
   std::set<DWORD> threadsAfter = ProcessThreads();
   uint32_t engineThreads = 0u;
 
@@ -696,7 +892,7 @@ int main(int argc, char** argv) {
   std::printf("      queue lock calls %u, from other threads %u\n", shell.lockCalls.load(), shell.foreignCalls.load());
   Check(shell.lockCalls.load() > 0u, "the engine brackets queue submissions with QueueLock");
   Check(shell.foreignCalls.load() == 0u, "every QueueLock call came from the calling thread (E2)");
-  Check(engineThreads == 0u, "no thread started inside bc250dxvk.dll (E2)");
+  Check(engineThreads == 0u, "no new thread starts in bc250dxvk.dll");
 
   // ---- teardown (E4, E5) ----
   rtv.Reset();
@@ -707,14 +903,56 @@ int main(int argc, char** argv) {
   staging.Reset();
   CheckHr(engine->WaitForResourceIdle(rt.Get()), "WaitForResourceIdle before releasing the imported image");
   rt.Reset();
+
+  // Storage moved within the rotation set, so its images go only after all of its textures
+  for (UINT i = 0u; i < RotCount; i++) {
+    rotRtv[i].Reset();
+
+    if (rotTex[i])
+      engine->WaitForResourceIdle(rotTex[i].Get());
+
+    rotTex[i].Reset();
+  }
+
   ctx.Reset();
   d3d.Reset();
 
   ULONG remaining = engine->Release();
   Check(remaining == 0u, "final engine Release reports no leaked D3D11 references (E4)");
 
+  // ---- Vulkan call census, including teardown (E2) ----
+  uint32_t hookedCalls = 0u, foreignCalls = 0u;
+
+  for (const auto& e : g_vkHooks) {
+    uint32_t calls = e.stats->calls.load(), foreign = e.stats->foreign.load();
+
+    if (calls)
+      std::printf("      %-32s %6u calls, %u from other threads\n", e.name, calls, foreign);
+
+    hookedCalls  += calls;
+    foreignCalls += foreign;
+  }
+
+  std::printf("      %u hooked Vulkan calls, %u from other threads\n", hookedCalls, foreignCalls);
+
+  uint32_t submits = HookStats("vkQueueSubmit").calls + HookStats("vkQueueSubmit2").calls
+                   + HookStats("vkQueueSubmit2KHR").calls;
+
+  Check(submits > 0u && HookStats("vkAllocateMemory").calls > 0u && HookStats("vkCreateGraphicsPipelines").calls > 0u,
+    "the census sees the engine's submissions, allocations and pipelines (control for the hooks)");
+  Check(foreignCalls == 0u, "every hooked Vulkan call of the engine ran on the calling thread (E2)");
+
   vk.destroyImage(device, image, nullptr);
   vk.freeMemory(device, memory, nullptr);
+
+  for (UINT i = 0u; i < RotCount; i++) {
+    if (rotImages[i])
+      vk.destroyImage(device, rotImages[i], nullptr);
+
+    if (rotMemory[i])
+      vk.freeMemory(device, rotMemory[i], nullptr);
+  }
+
   vk.destroyDevice(device, nullptr);
   funcs.FreeDeviceRequirements(&req);
   vk.destroyInstance(instance, nullptr);

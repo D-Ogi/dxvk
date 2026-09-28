@@ -134,6 +134,19 @@ namespace dxvk {
       const DxvkPagedResource&          Resource,
             bool                        DoNotWait);
 
+    /**
+     * \brief Rotates the storage of images
+     *
+     * Used by a user-mode driver engine (bc250dxvk) for DXGI
+     * RotateResourceIdentities, in command order: image i takes
+     * the storage of image i + 1, the last one that of the first.
+     * \param [in] pImages Images, all with the same properties
+     * \param [in] Count Number of images, at least 2
+     */
+    void RotateImageStorage(
+      const Rc<DxvkImage>*              pImages,
+            size_t                      Count);
+
   private:
 
     DxvkCsThread            m_csThread;
