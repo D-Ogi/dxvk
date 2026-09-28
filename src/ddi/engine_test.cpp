@@ -1210,6 +1210,111 @@ int main(int argc, char** argv) {
 
   Check(d3d->GetFeatureLevel() == adapterInfo.MaxFeatureLevel, "device feature level as requested");
 
+  // ---- ABI 1.3: feature answers at other levels, for the shell's GetCaps check ----
+  {
+    Microsoft::WRL::ComPtr<IBc250DxvkDevice3> engine3;
+
+    if (CheckHr(engine->QueryInterface(IID_PPV_ARGS(&engine3)), "QueryInterface IBc250DxvkDevice3")) {
+      struct FeatureCase { D3D11_FEATURE feature; UINT size; };
+      static const FeatureCase s_features[] = {
+        { D3D11_FEATURE_THREADING,                      sizeof(D3D11_FEATURE_DATA_THREADING) },
+        { D3D11_FEATURE_DOUBLES,                        sizeof(D3D11_FEATURE_DATA_DOUBLES) },
+        { D3D11_FEATURE_D3D10_X_HARDWARE_OPTIONS,       sizeof(D3D11_FEATURE_DATA_D3D10_X_HARDWARE_OPTIONS) },
+        { D3D11_FEATURE_D3D11_OPTIONS,                  sizeof(D3D11_FEATURE_DATA_D3D11_OPTIONS) },
+        { D3D11_FEATURE_ARCHITECTURE_INFO,              sizeof(D3D11_FEATURE_DATA_ARCHITECTURE_INFO) },
+        { D3D11_FEATURE_D3D9_OPTIONS,                   sizeof(D3D11_FEATURE_DATA_D3D9_OPTIONS) },
+        { D3D11_FEATURE_SHADER_MIN_PRECISION_SUPPORT,   sizeof(D3D11_FEATURE_DATA_SHADER_MIN_PRECISION_SUPPORT) },
+        { D3D11_FEATURE_D3D9_SHADOW_SUPPORT,            sizeof(D3D11_FEATURE_DATA_D3D9_SHADOW_SUPPORT) },
+        { D3D11_FEATURE_D3D11_OPTIONS1,                 sizeof(D3D11_FEATURE_DATA_D3D11_OPTIONS1) },
+        { D3D11_FEATURE_D3D9_SIMPLE_INSTANCING_SUPPORT, sizeof(D3D11_FEATURE_DATA_D3D9_SIMPLE_INSTANCING_SUPPORT) },
+        { D3D11_FEATURE_MARKER_SUPPORT,                 sizeof(D3D11_FEATURE_DATA_MARKER_SUPPORT) },
+        { D3D11_FEATURE_D3D9_OPTIONS1,                  sizeof(D3D11_FEATURE_DATA_D3D9_OPTIONS1) },
+        { D3D11_FEATURE_D3D11_OPTIONS2,                 sizeof(D3D11_FEATURE_DATA_D3D11_OPTIONS2) },
+        { D3D11_FEATURE_D3D11_OPTIONS3,                 sizeof(D3D11_FEATURE_DATA_D3D11_OPTIONS3) },
+        { D3D11_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT,    sizeof(D3D11_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT) },
+        { D3D11_FEATURE_D3D11_OPTIONS4,                 sizeof(D3D11_FEATURE_DATA_D3D11_OPTIONS4) },
+        { D3D11_FEATURE_SHADER_CACHE,                   sizeof(D3D11_FEATURE_DATA_SHADER_CACHE) },
+        { D3D11_FEATURE_D3D11_OPTIONS5,                 sizeof(D3D11_FEATURE_DATA_D3D11_OPTIONS5) },
+      };
+
+      // Positive control: at the device's own level every answer is the device's, byte for byte
+      bool same = true;
+
+      for (const auto& f : s_features) {
+        std::array<BYTE, 128> atLevel = { }, fromDevice = { };
+
+        HRESULT hrLevel = f.size <= atLevel.size()
+          ? engine3->CheckFeatureSupportAtLevel(d3d->GetFeatureLevel(), f.feature, atLevel.data(), f.size)
+          : E_FAIL;
+        HRESULT hrDevice = f.size <= fromDevice.size()
+          ? d3d->CheckFeatureSupport(f.feature, fromDevice.data(), f.size)
+          : E_FAIL;
+
+        if (hrLevel != S_OK || hrDevice != S_OK || std::memcmp(atLevel.data(), fromDevice.data(), f.size)) {
+          std::printf("      feature %d: hr 0x%08lX, device hr 0x%08lX, data %s\n", f.feature,
+            static_cast<unsigned long>(hrLevel), static_cast<unsigned long>(hrDevice),
+            std::memcmp(atLevel.data(), fromDevice.data(), f.size) ? "differ" : "same");
+          same = false;
+        }
+      }
+
+      Check(same, "CheckFeatureSupportAtLevel at the device's level: 18 features as the device answers them");
+
+      // The record a static GetCaps table must agree with: the answers at MaxFeatureLevel of GetAdapterInfo
+      D3D_FEATURE_LEVEL max = adapterInfo.MaxFeatureLevel;
+      D3D11_FEATURE_DATA_DOUBLES doubles = { };
+      D3D11_FEATURE_DATA_D3D10_X_HARDWARE_OPTIONS d3d10 = { };
+      D3D11_FEATURE_DATA_D3D11_OPTIONS options = { };
+      D3D11_FEATURE_DATA_ARCHITECTURE_INFO arch = { };
+      D3D11_FEATURE_DATA_SHADER_MIN_PRECISION_SUPPORT precision = { };
+      D3D11_FEATURE_DATA_D3D11_OPTIONS1 options1 = { };
+      D3D11_FEATURE_DATA_D3D11_OPTIONS2 options2 = { };
+      D3D11_FEATURE_DATA_D3D11_OPTIONS3 options3 = { };
+      D3D11_FEATURE_DATA_D3D11_OPTIONS5 options5 = { };
+
+      bool record = SUCCEEDED(engine3->CheckFeatureSupportAtLevel(max, D3D11_FEATURE_DOUBLES, &doubles, sizeof(doubles)))
+        && SUCCEEDED(engine3->CheckFeatureSupportAtLevel(max, D3D11_FEATURE_D3D10_X_HARDWARE_OPTIONS, &d3d10, sizeof(d3d10)))
+        && SUCCEEDED(engine3->CheckFeatureSupportAtLevel(max, D3D11_FEATURE_D3D11_OPTIONS, &options, sizeof(options)))
+        && SUCCEEDED(engine3->CheckFeatureSupportAtLevel(max, D3D11_FEATURE_ARCHITECTURE_INFO, &arch, sizeof(arch)))
+        && SUCCEEDED(engine3->CheckFeatureSupportAtLevel(max, D3D11_FEATURE_SHADER_MIN_PRECISION_SUPPORT, &precision, sizeof(precision)))
+        && SUCCEEDED(engine3->CheckFeatureSupportAtLevel(max, D3D11_FEATURE_D3D11_OPTIONS1, &options1, sizeof(options1)))
+        && SUCCEEDED(engine3->CheckFeatureSupportAtLevel(max, D3D11_FEATURE_D3D11_OPTIONS2, &options2, sizeof(options2)))
+        && SUCCEEDED(engine3->CheckFeatureSupportAtLevel(max, D3D11_FEATURE_D3D11_OPTIONS3, &options3, sizeof(options3)))
+        && SUCCEEDED(engine3->CheckFeatureSupportAtLevel(max, D3D11_FEATURE_D3D11_OPTIONS5, &options5, sizeof(options5)));
+
+      Check(record, "CheckFeatureSupportAtLevel at MaxFeatureLevel: the GetCaps record");
+
+      if (record) {
+        std::printf("      caps at 0x%x: doubles %d, compute+raw %d, logic op %d, extended doubles %d, "
+          "min precision %u/%u, TBDR %d\n", max, doubles.DoublePrecisionFloatShaderOps,
+          d3d10.ComputeShaders_Plus_RawAndStructuredBuffers_Via_Shader_4_x, options.OutputMergerLogicOp,
+          options.ExtendedDoublesShaderInstructions, unsigned(precision.PixelShaderMinPrecision),
+          unsigned(precision.AllOtherShaderStagesMinPrecision), arch.TileBasedDeferredRenderer);
+        std::printf("      typed UAV loads %d, ROVs %d, stencil ref %d, tiled tier %d, min/max filtering %d, "
+          "conservative tier %d, VP/RT index anywhere %d, shared tier %d\n",
+          options2.TypedUAVLoadAdditionalFormats, options2.ROVsSupported, options2.PSSpecifiedStencilRefSupported,
+          int(options2.TiledResourcesTier), options1.MinMaxFiltering, int(options2.ConservativeRasterizationTier),
+          options3.VPAndRTArrayIndexFromAnyShaderFeedingRasterizer, int(options5.SharedResourceTier));
+      }
+
+      // The level applies: doubles need 11_0 in DXVK, whatever the hardware has
+      D3D11_FEATURE_DATA_DOUBLES doubles10 = { TRUE };
+      Check(engine3->CheckFeatureSupportAtLevel(D3D_FEATURE_LEVEL_10_0, D3D11_FEATURE_DOUBLES, &doubles10,
+          sizeof(doubles10)) == S_OK && !doubles10.DoublePrecisionFloatShaderOps,
+        "CheckFeatureSupportAtLevel 10_0: no doubles below 11_0");
+
+      D3D11_FEATURE_DATA_FORMAT_SUPPORT format = { DXGI_FORMAT_R8G8B8A8_UNORM };
+      Check(engine3->CheckFeatureSupportAtLevel(D3D_FEATURE_LEVEL(0xf000), D3D11_FEATURE_DOUBLES, &doubles,
+          sizeof(doubles)) == E_INVALIDARG
+        && engine3->CheckFeatureSupportAtLevel(D3D_FEATURE_LEVEL(0x1000), D3D11_FEATURE_DOUBLES, &doubles,
+          sizeof(doubles)) == E_INVALIDARG
+        && engine3->CheckFeatureSupportAtLevel(max, D3D11_FEATURE_FORMAT_SUPPORT, &format, sizeof(format)) == E_INVALIDARG
+        && engine3->CheckFeatureSupportAtLevel(max, D3D11_FEATURE_DOUBLES, nullptr, sizeof(doubles)) == E_INVALIDARG
+        && engine3->CheckFeatureSupportAtLevel(max, D3D11_FEATURE_DOUBLES, &options, sizeof(options)) == E_INVALIDARG,
+        "CheckFeatureSupportAtLevel rejects levels out of range, format queries, NULL data and a wrong size");
+    }
+  }
+
   // ---- shaders in DDI form ----
   DdiShader vsDdi, psDdi;
   Check(CompileDdi(g_hlsl, "vs", "vs_5_0", &vsDdi), "compile VS, strip to tokens and register signatures");
