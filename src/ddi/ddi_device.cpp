@@ -276,6 +276,12 @@ namespace dxvk::ddi {
     if (!info || !(info->aspectMask & VK_IMAGE_ASPECT_COLOR_BIT))
       return E_INVALIDARG;
 
+    // A vertex format: the device reads it from vertex buffers, and it fits the 7-bit format field of
+    // DXVK's packed attribute state (DxvkIlAttribute).
+    if (!(m_dxvkDevice->getFormatFeatures(format).buffer & VK_FORMAT_FEATURE_2_VERTEX_BUFFER_BIT)
+     || uint32_t(format) >= (1u << 7))
+      return E_INVALIDARG;
+
     *pVkFormat = format;
     *pElementSize = UINT(info->elementSize);
     return S_OK;

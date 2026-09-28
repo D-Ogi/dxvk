@@ -947,6 +947,12 @@ int main(int argc, char** argv) {
   CheckHr(engine->GetVertexFormat(DXGI_FORMAT_R32G32B32_FLOAT, &colFormat, &colSize), "GetVertexFormat R32G32B32_FLOAT");
   Check(posSize == 8u && colSize == 12u, "vertex element sizes 8 and 12");
 
+  VkFormat notVertex = VK_FORMAT_UNDEFINED;
+  UINT notVertexSize = 0u;
+  Check(engine->GetVertexFormat(DXGI_FORMAT_BC1_UNORM, &notVertex, &notVertexSize) == E_INVALIDARG
+     && engine->GetVertexFormat(DXGI_FORMAT_D32_FLOAT, &notVertex, &notVertexSize) == E_INVALIDARG,
+    "GetVertexFormat rejects formats that are not vertex formats (BC1, D32)");
+
   BC250_DXVK_VERTEX_ATTRIBUTE attrs[2] = {
     { vsDdi.input.at(0).Register, 0u, posFormat, 0u },
     { vsDdi.input.at(1).Register, 0u, colFormat, posSize },

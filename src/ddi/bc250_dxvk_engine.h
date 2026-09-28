@@ -54,9 +54,13 @@
  *       WaitForResourceIdle, releases the texture (views are released first by the runtime), then destroys
  *       the image, frees the memory and deallocates (primaries immediately, others possibly deferred to Flush).
  *       After WaitForResourceIdle and the last release the engine never references that VkImage again.
- *   E6  Errors. Methods that return HRESULT return it; void D3D11 methods report nothing. After Flush,
- *       SubmitForPresent and any failed call the shell may read ID3D11Device::GetDeviceRemovedReason and report
- *       DXGI_ERROR_DEVICE_REMOVED/HUNG/RESET through pfnSetErrorCb. E_OUTOFMEMORY is returned, never thrown.
+ *   E6  Errors. Methods that return HRESULT return it; void D3D11 methods report nothing. E_OUTOFMEMORY is
+ *       returned, never thrown. Engine results are D3D11/DXGI API codes, not DDI codes: the shell maps them to
+ *       the set the DDI entry allows before pfnSetErrorCb (any other code is critical, and the runtime then
+ *       removes the device): DXGI_ERROR_WAS_STILL_DRAWING becomes DXGI_DDI_ERR_WASSTILLDRAWING (Map with
+ *       DONOTWAIT, query data), and device loss becomes D3DDDIERR_DEVICEREMOVED where the entry allows it. After
+ *       Flush, SubmitForPresent and any failed call, ID3D11Device::GetDeviceRemovedReason tells device loss
+ *       apart (any failure code; DXVK reports DXGI_ERROR_DEVICE_RESET for every lost-device status).
  *       Engine waits are bounded by hosted RADV's own fence wait rules; the engine adds no infinite spin.
  *
  * Layout mirrors. The structures marked "layout = X" have the size and member order of the WDK structure X so
