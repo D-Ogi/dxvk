@@ -1487,6 +1487,58 @@ int main(int argc, char** argv) {
           "an unscaled Blt writes its destination rectangle and nothing else");
       }
 
+      // Blt1 (ABI 1.1): source rectangles. Checked pixels stay two texels inside each source quadrant, so
+      // that linear filtering at a rectangle's edge cannot blend in a neighbouring quadrant.
+      Microsoft::WRL::ComPtr<IBc250DxvkDevice1> engine1;
+
+      if (CheckHr(engine->QueryInterface(IID_PPV_ARGS(&engine1)), "QueryInterface IBc250DxvkDevice1")) {
+        ctx->ClearRenderTargetView(rtv.Get(), black);
+
+        BC250_DXVK_BLT1 blt1 = { };
+        blt1.Destination     = rt.Get();
+        blt1.Source          = src.Get();
+        blt1.SourceRect      = { 16, 0, 32, 16 };
+        blt1.DestinationRect = { 0, 0, 32, 32 };
+        blt1.Flags           = BC250_DXVK_BLT_STRETCH | BC250_DXVK_BLT_CONVERT;
+        blt1.Rotation        = DXGI_MODE_ROTATION_IDENTITY;
+
+        if (CheckHr(engine1->Blt1(&blt1), "Blt1: the green source quadrant stretched onto 32x32")) {
+          Check(same(readAt(staging.Get(), rt.Get(), 4u, 4u), q[1]) && same(readAt(staging.Get(), rt.Get(), 27u, 27u), q[1])
+             && similar(readAt(staging.Get(), rt.Get(), 40u, 20u), 0, 0, 0, 0),
+            "Blt1 stretches its source rectangle onto its destination rectangle and writes nothing else");
+        }
+
+        blt1.SourceRect      = { 0, 16, 32, 32 };
+        blt1.DestinationRect = { 16, 40, 48, 56 };
+        blt1.Flags           = BC250_DXVK_BLT_CONVERT;
+
+        if (CheckHr(engine1->Blt1(&blt1), "Blt1: the lower half of the source, unscaled")) {
+          Check(same(readAt(staging.Get(), rt.Get(), 20u, 48u), q[2]) && same(readAt(staging.Get(), rt.Get(), 44u, 48u), q[3])
+             && similar(readAt(staging.Get(), rt.Get(), 8u, 48u), 0, 0, 0, 0) && similar(readAt(staging.Get(), rt.Get(), 20u, 36u), 0, 0, 0, 0),
+            "an unscaled Blt1 moves its source rectangle to its destination rectangle");
+        }
+
+        blt1.SourceRect      = { 0, 0, 32, 16 };
+        blt1.DestinationRect = { 32, 0, 64, 16 };
+        blt1.Rotation        = DXGI_MODE_ROTATION_ROTATE180;
+
+        if (CheckHr(engine1->Blt1(&blt1), "Blt1: the upper half of the source, rotated by 180 degrees")) {
+          Check(same(readAt(staging.Get(), rt.Get(), 36u, 8u), q[1]) && same(readAt(staging.Get(), rt.Get(), 60u, 8u), q[0]),
+            "180 degrees: the content turns within the destination rectangle");
+        }
+
+        BC250_DXVK_BLT1 bad1 = blt1;
+        bad1.Rotation   = DXGI_MODE_ROTATION_IDENTITY;
+        bad1.SourceRect = { 0, 0, 33, 16 };
+        Check(engine1->Blt1(&bad1) == E_INVALIDARG, "Blt1 rejects a source rectangle outside the source");
+
+        bad1.SourceRect = { 4, 4, 4, 8 };
+        Check(engine1->Blt1(&bad1) == E_INVALIDARG, "Blt1 rejects an empty source rectangle");
+
+        bad1.SourceRect = { -1, 0, 8, 8 };
+        Check(engine1->Blt1(&bad1) == E_INVALIDARG, "Blt1 rejects a source rectangle with a negative corner");
+      }
+
       // Resolve: a 4x engine render target onto the shell image at the same size
       UINT msQuality = 0u;
       d3d->CheckMultisampleQualityLevels(DXGI_FORMAT_R8G8B8A8_UNORM, 4u, &msQuality);
