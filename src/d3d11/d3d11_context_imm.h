@@ -231,6 +231,10 @@ namespace dxvk {
 
     void SynchronizeDevice();
 
+    bool EvaluatePredicate(
+            D3D11Query*                 pPredicate,
+            BOOL                        Value);
+
     void EndFrame(
             Rc<DxvkLatencyTracker>      LatencyTracker);
     

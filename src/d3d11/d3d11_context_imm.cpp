@@ -864,6 +864,40 @@ namespace dxvk {
   void D3D11ImmediateContext::SynchronizeDevice() {
     m_device->waitForIdle();
   }
+
+
+  bool D3D11ImmediateContext::EvaluatePredicate(
+          D3D11Query*                 pPredicate,
+          BOOL                        Value) {
+    BOOL result = FALSE;
+    HRESULT hr = pPredicate->GetData(&result, 0u);
+
+    if (hr == S_FALSE) {
+      // A hint may let the operation proceed (D3D11 spec 20.2)
+      if (pPredicate->IsPredicateHint())
+        return false;
+
+      // Otherwise submit the work that produces the result and wait for
+      // the GPU: without conditional rendering this is the price of
+      // honouring the predicate.
+      static bool s_infoShown = false;
+
+      if (!std::exchange(s_infoShown, true))
+        Logger::info("D3D11: Predicated operations wait for their predicate");
+
+      if (unlikely(m_device->debugFlags().test(DxvkDebugFlag::Capture)))
+        m_flushReason = "Predicate read-back";
+
+      ExecuteFlush(GpuFlushType::ImplicitSynchronization, nullptr, false);
+      SynchronizeCsThread(DxvkCsThread::SynchronizeAll);
+      SynchronizeDevice();
+
+      hr = pPredicate->GetData(&result, 0u);
+    }
+
+    // A predicate that was never ended predicates nothing
+    return hr == S_OK && result == Value;
+  }
   
   
   void D3D11ImmediateContext::EndFrame(

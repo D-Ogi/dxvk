@@ -281,7 +281,7 @@ namespace dxvk {
           UINT                              CopyFlags) {
     D3D10DeviceLock lock = LockContext();
 
-    if (!pDstResource || !pSrcResource)
+    if (!pDstResource || !pSrcResource || IsPredicatedOff())
       return;
 
     if (pSrcBox
@@ -353,7 +353,7 @@ namespace dxvk {
           ID3D11Resource*                   pSrcResource) {
     D3D10DeviceLock lock = LockContext();
 
-    if (!pDstResource || !pSrcResource || (pDstResource == pSrcResource))
+    if (!pDstResource || !pSrcResource || (pDstResource == pSrcResource) || IsPredicatedOff())
       return;
 
     D3D11_RESOURCE_DIMENSION dstResourceDim = D3D11_RESOURCE_DIMENSION_UNKNOWN;
@@ -411,7 +411,7 @@ namespace dxvk {
     auto buf = static_cast<D3D11Buffer*>(pDstBuffer);
     auto uav = static_cast<D3D11UnorderedAccessView*>(pSrcView);
 
-    if (!buf || !uav)
+    if (!buf || !uav || IsPredicatedOff())
       return;
 
     auto counterView = uav->GetCounterView();
@@ -446,7 +446,7 @@ namespace dxvk {
 
     auto rtv = static_cast<D3D11RenderTargetView*>(pRenderTargetView);
 
-    if (!rtv)
+    if (!rtv || IsPredicatedOff())
       return;
 
     AddCost(GpuCostEstimate::Transfer);
@@ -471,7 +471,7 @@ namespace dxvk {
     const UINT                              Values[4]) {
     D3D10DeviceLock lock = LockContext();
 
-    if (!pUnorderedAccessView)
+    if (!pUnorderedAccessView || IsPredicatedOff())
       return;
 
     Com<ID3D11UnorderedAccessView> qiUav;
@@ -618,7 +618,7 @@ namespace dxvk {
 
     auto uav = static_cast<D3D11UnorderedAccessView*>(pUnorderedAccessView);
 
-    if (!uav)
+    if (!uav || IsPredicatedOff())
       return;
 
     auto imgView = uav->GetImageView();
@@ -674,7 +674,7 @@ namespace dxvk {
 
     auto dsv = static_cast<D3D11DepthStencilView*>(pDepthStencilView);
 
-    if (!dsv)
+    if (!dsv || IsPredicatedOff())
       return;
 
     // Figure out which aspects to clear based on
@@ -720,7 +720,7 @@ namespace dxvk {
           UINT                              NumRects) {
     D3D10DeviceLock lock = LockContext();
 
-    if (NumRects && !pRect)
+    if ((NumRects && !pRect) || IsPredicatedOff())
       return;
 
     AddCost(GpuCostEstimate::Transfer);
@@ -804,7 +804,7 @@ namespace dxvk {
 
     auto view = static_cast<D3D11ShaderResourceView*>(pShaderResourceView);
 
-    if (!view || view->GetResourceType() == D3D11_RESOURCE_DIMENSION_BUFFER)
+    if (!view || view->GetResourceType() == D3D11_RESOURCE_DIMENSION_BUFFER || IsPredicatedOff())
       return;
 
     D3D11_COMMON_RESOURCE_DESC resourceDesc = view->GetResourceDesc();
@@ -833,7 +833,7 @@ namespace dxvk {
     bool isSameSubresource = pDstResource   == pSrcResource
                           && DstSubresource == SrcSubresource;
 
-    if (!pDstResource || !pSrcResource || isSameSubresource)
+    if (!pDstResource || !pSrcResource || isSameSubresource || IsPredicatedOff())
       return;
 
     D3D11_RESOURCE_DIMENSION dstResourceType;
@@ -997,7 +997,7 @@ namespace dxvk {
 
     D3D11Buffer* buffer = m_state.ia.vertexBuffers[0].buffer.ptr();
 
-    if (!buffer)
+    if (!buffer || IsPredicatedOff())
       return;
 
     DxvkBufferSlice vtxBuf = buffer->GetBufferSlice();
@@ -1035,7 +1035,7 @@ namespace dxvk {
           UINT            StartVertexLocation) {
     D3D10DeviceLock lock = LockContext();
 
-    if (unlikely(!VertexCount))
+    if (unlikely(!VertexCount) || IsPredicatedOff())
       return;
 
     VkDrawIndirectCommand draw = { };
@@ -1055,7 +1055,7 @@ namespace dxvk {
           INT             BaseVertexLocation) {
     D3D10DeviceLock lock = LockContext();
 
-    if (unlikely(!IndexCount))
+    if (unlikely(!IndexCount) || IsPredicatedOff())
       return;
 
     VkDrawIndexedIndirectCommand draw = { };
@@ -1077,7 +1077,7 @@ namespace dxvk {
           UINT            StartInstanceLocation) {
     D3D10DeviceLock lock = LockContext();
 
-    if (unlikely(!VertexCountPerInstance || !InstanceCount))
+    if (unlikely(!VertexCountPerInstance || !InstanceCount) || IsPredicatedOff())
       return;
 
     VkDrawIndirectCommand draw = { };
@@ -1099,7 +1099,7 @@ namespace dxvk {
           UINT            StartInstanceLocation) {
     D3D10DeviceLock lock = LockContext();
 
-    if (unlikely(!IndexCountPerInstance || !InstanceCount))
+    if (unlikely(!IndexCountPerInstance || !InstanceCount) || IsPredicatedOff())
       return;
 
     VkDrawIndexedIndirectCommand draw = { };
@@ -1118,6 +1118,10 @@ namespace dxvk {
           ID3D11Buffer*   pBufferForArgs,
           UINT            AlignedByteOffsetForArgs) {
     D3D10DeviceLock lock = LockContext();
+
+    if (IsPredicatedOff())
+      return;
+
     SetDrawBuffers(pBufferForArgs, nullptr);
 
     if (unlikely(HasDirtyGraphicsBindings()))
@@ -1153,6 +1157,10 @@ namespace dxvk {
           ID3D11Buffer*   pBufferForArgs,
           UINT            AlignedByteOffsetForArgs) {
     D3D10DeviceLock lock = LockContext();
+
+    if (IsPredicatedOff())
+      return;
+
     SetDrawBuffers(pBufferForArgs, nullptr);
 
     if (unlikely(HasDirtyGraphicsBindings()))
@@ -1190,7 +1198,7 @@ namespace dxvk {
           UINT            ThreadGroupCountZ) {
     D3D10DeviceLock lock = LockContext();
 
-    if (unlikely(!ThreadGroupCountX || !ThreadGroupCountY || !ThreadGroupCountZ))
+    if (unlikely(!ThreadGroupCountX || !ThreadGroupCountY || !ThreadGroupCountZ) || IsPredicatedOff())
       return;
 
     AddCost(GpuCostEstimate::Dispatch);
@@ -1212,6 +1220,10 @@ namespace dxvk {
           ID3D11Buffer*   pBufferForArgs,
           UINT            AlignedByteOffsetForArgs) {
     D3D10DeviceLock lock = LockContext();
+
+    if (IsPredicatedOff())
+      return;
+
     SetDrawBuffers(pBufferForArgs, nullptr);
 
     AddCost(GpuCostEstimate::DispatchIndirect);
@@ -2670,10 +2682,15 @@ namespace dxvk {
     m_state.pr.predicateObject = predicate;
     m_state.pr.predicateValue  = PredicateValue;
 
-    static bool s_errorShown = false;
+    // The immediate context evaluates the predicate when a predicated
+    // operation needs it, see IsPredicatedOff. A deferred context cannot
+    // wait for a result while recording and records everything.
+    if constexpr (IsDeferred) {
+      static bool s_errorShown = false;
 
-    if (pPredicate && !std::exchange(s_errorShown, true))
-      Logger::err("D3D11DeviceContext::SetPredication: Stub");
+      if (pPredicate && !std::exchange(s_errorShown, true))
+        Logger::err("D3D11DeviceContext::SetPredication: Stub on deferred contexts");
+    }
   }
 
 
@@ -4171,6 +4188,23 @@ namespace dxvk {
       auto vkRect = new (m_csData->first()) VkRect2D();
       vkRect->offset = VkOffset2D { 0, 0 };
       vkRect->extent = extent2D;
+    }
+  }
+
+
+  template<typename ContextType>
+  bool D3D11CommonContext<ContextType>::IsPredicatedOff() {
+    // Called by the operations that honour predication (D3D11 spec 20.2):
+    // Draw*, Dispatch*, clears, copies, CopyStructureCount, updates,
+    // GenerateMips and ResolveSubresource. True if the operation is skipped.
+    if (likely(m_state.pr.predicateObject == nullptr))
+      return false;
+
+    if constexpr (IsDeferred) {
+      return false;
+    } else {
+      return GetTypedContext()->EvaluatePredicate(
+        m_state.pr.predicateObject.ptr(), m_state.pr.predicateValue);
     }
   }
 
@@ -5812,7 +5846,7 @@ namespace dxvk {
     auto context = static_cast<ContextType*>(this);
     D3D10DeviceLock lock = context->LockContext();
 
-    if (!pDstResource)
+    if (!pDstResource || IsPredicatedOff())
       return;
 
     // We need a different code path for buffers

@@ -1252,7 +1252,7 @@ namespace dxvk {
     desc.MiscFlags   = pPredicateDesc->MiscFlags;
     desc.ContextType = D3D11_CONTEXT_TYPE_ALL;
 
-    if (desc.Query != D3D11_QUERY_OCCLUSION_PREDICATE) {
+    if (!D3D11Query::IsPredicateType(desc.Query)) {
       Logger::warn(str::format("D3D11: Unhandled predicate type: ", pPredicateDesc->Query));
       return E_INVALIDARG;
     }

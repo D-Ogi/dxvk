@@ -940,6 +940,8 @@ namespace dxvk {
       const D3D11_RECT*                       pRects,
             UINT                              NumRects);
 
+    bool IsPredicatedOff();
+
     VkClearValue ConvertColorValue(
       const FLOAT                             Color[4],
       const DxvkFormatInfo*                   pFormatInfo);

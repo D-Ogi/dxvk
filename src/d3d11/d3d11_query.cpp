@@ -48,13 +48,17 @@ namespace dxvk {
       
       case D3D11_QUERY_SO_STATISTICS:
       case D3D11_QUERY_SO_STATISTICS_STREAM0:
-      case D3D11_QUERY_SO_OVERFLOW_PREDICATE:
       case D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM0:
-        // FIXME it is technically incorrect to map
-        // SO_OVERFLOW_PREDICATE to the first stream,
-        // but this is good enough for D3D10 behaviour
         m_query[0] = dxvkDevice->createGpuQuery(
           VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT, 0, 0);
+        break;
+
+      case D3D11_QUERY_SO_OVERFLOW_PREDICATE:
+        // True if any of the four streams overflowed
+        for (uint32_t i = 0; i < 4; i++) {
+          m_query[i] = dxvkDevice->createGpuQuery(
+            VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT, 0, i);
+        }
         break;
       
       case D3D11_QUERY_SO_STATISTICS_STREAM1:
@@ -109,7 +113,7 @@ namespace dxvk {
       return S_OK;
     }
     
-    if (m_desc.Query == D3D11_QUERY_OCCLUSION_PREDICATE) {
+    if (IsPredicate()) {
       if (riid == __uuidof(ID3D11Predicate)) {
         *ppvObject = AsPredicate(ref(this));
         return S_OK;
@@ -197,7 +201,8 @@ namespace dxvk {
         break;
       
       default:
-        ctx->beginQuery(m_query[0]);
+        for (uint32_t i = 0; i < MaxGpuQueries && m_query[i] != nullptr; i++)
+          ctx->beginQuery(m_query[i]);
     }
   }
   
@@ -214,7 +219,8 @@ namespace dxvk {
         break;
       
       default:
-        ctx->endQuery(m_query[0]);
+        for (uint32_t i = 0; i < MaxGpuQueries && m_query[i] != nullptr; i++)
+          ctx->endQuery(m_query[i]);
     }
 
     m_resetCtr.fetch_sub(1);
@@ -329,8 +335,12 @@ namespace dxvk {
         case D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM2:
         case D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM3: {
           auto data = static_cast<BOOL*>(pData);
-          *data = queryData[0].xfbStream.primitivesNeeded
-                > queryData[0].xfbStream.primitivesWritten;
+          *data = FALSE;
+
+          for (uint32_t i = 0; i < MaxGpuQueries && m_query[i] != nullptr; i++) {
+            *data |= queryData[i].xfbStream.primitivesNeeded
+                   > queryData[i].xfbStream.primitivesWritten;
+          }
         } return S_OK;
 
         default:

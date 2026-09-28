@@ -16,7 +16,7 @@ namespace dxvk {
   };
   
   class D3D11Query : public D3D11DeviceChild<ID3D11Query1> {
-    constexpr static uint32_t MaxGpuQueries = 2;
+    constexpr static uint32_t MaxGpuQueries = 4;
     constexpr static uint32_t MaxGpuEvents  = 1;
   public:
     
@@ -62,6 +62,14 @@ namespace dxvk {
       return m_desc.Query == D3D11_QUERY_EVENT;
     }
 
+    bool IsPredicate() const {
+      return IsPredicateType(m_desc.Query);
+    }
+
+    bool IsPredicateHint() const {
+      return m_desc.MiscFlags & D3D11_QUERY_MISC_PREDICATEHINT;
+    }
+
     bool TrackStalls() const {
       return m_desc.Query == D3D11_QUERY_EVENT
           || m_desc.Query == D3D11_QUERY_TIMESTAMP
@@ -86,6 +94,21 @@ namespace dxvk {
     }
 
     static HRESULT ValidateDesc(const D3D11_QUERY_DESC1* pDesc);
+
+    static bool IsPredicateType(D3D11_QUERY Query) {
+      switch (Query) {
+        case D3D11_QUERY_OCCLUSION_PREDICATE:
+        case D3D11_QUERY_SO_OVERFLOW_PREDICATE:
+        case D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM0:
+        case D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM1:
+        case D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM2:
+        case D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM3:
+          return true;
+
+        default:
+          return false;
+      }
+    }
 
     static ID3D11Predicate* AsPredicate(ID3D11Query* pQuery) {
       // ID3D11Predicate and ID3D11Query have the same vtable. This
