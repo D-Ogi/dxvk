@@ -6,8 +6,8 @@
 // clear and one draw, storage rotation, DXGI Blt onto an imported image, and that the engine's queue submissions, waits, allocations and
 // object creation all ran on the calling thread (E2), by wrapping the Vulkan entry points it is given.
 //
-// Usage: bc250dxvk_engine_test.exe <path to bc250dxvk.dll> [adapter substring]
-// Exit code 0 = all checks passed.
+// Usage: bc250dxvk_engine_test.exe <path to bc250dxvk.dll> [adapter substring] [--bench]
+// Exit code 0 = all checks passed. --bench adds a CPU-bound draw benchmark that prints timings (see RunBench).
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -464,6 +464,213 @@ namespace {
     }
   )";
 
+  // ---- CPU-bound draw benchmark (--bench) ---------------------------------------------------------
+
+  // Many small draws, each with a constant buffer update and a texture switch, as games issue them. Compares
+  // the engine's inline mode (E2) with DXVK's worker threads (BC250DXVK_MEASURE_WORKER_THREADS=1) on one
+  // machine. Prints numbers; not a pass/fail check.
+  const char* g_benchHlsl = R"(
+    cbuffer Draw : register(b0) {
+      float4 offset;
+      float4 tint;
+    };
+
+    Texture2D    tex  : register(t0);
+    SamplerState samp : register(s0);
+
+    struct VsOut {
+      float4 pos : SV_Position;
+      float3 col : QUUX7;
+    };
+
+    VsOut vs(float2 pos : FROB3, float3 col : ZORK1) {
+      VsOut o;
+      o.pos = float4(pos * 0.25f + offset.xy, 0.0f, 1.0f);
+      o.col = col * tint.rgb;
+      return o;
+    }
+
+    float4 ps(VsOut i) : SV_Target {
+      return float4(i.col * tex.Sample(samp, i.pos.xy / 64.0f).rgb, 1.0f);
+    }
+  )";
+
+  double ProcessCpuMs() {
+    FILETIME created, exited, kernel, user;
+    GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user);
+
+    auto ms = [] (const FILETIME& ft) {
+      return double((uint64_t(ft.dwHighDateTime) << 32) | ft.dwLowDateTime) / 1e4;
+    };
+
+    return ms(kernel) + ms(user);
+  }
+
+  void RunBench(IBc250DxvkDevice* engine, ID3D11Device* d3d, ID3D11DeviceContext* ctx, ID3D11Resource* rt,
+      ID3D11RenderTargetView* rtv, ID3D11InputLayout* layout, ID3D11Buffer* vb, UINT stride, UINT size) {
+    using Microsoft::WRL::ComPtr;
+    constexpr UINT DrawsPerFrame = 1000u, WarmupFrames = 30u, Frames = 300u, Latency = 3u;
+
+    DdiShader vsDdi, psDdi;
+    ComPtr<ID3D11VertexShader> vs;
+    ComPtr<ID3D11PixelShader>  ps;
+
+    if (!CompileDdi(g_benchHlsl, "vs", "vs_5_0", &vsDdi) || !CompileDdi(g_benchHlsl, "ps", "ps_5_0", &psDdi)) {
+      Check(false, "bench: compile shaders");
+      return;
+    }
+
+    BC250_DXVK_SHADER_DESC vsDesc = MakeDesc(vsDdi);
+    BC250_DXVK_SHADER_DESC psDesc = MakeDesc(psDdi);
+
+    if (!CheckHr(engine->CreateShader(&vsDesc, IID_PPV_ARGS(&vs)), "bench: CreateShader (VS)")
+     || !CheckHr(engine->CreateShader(&psDesc, IID_PPV_ARGS(&ps)), "bench: CreateShader (PS)"))
+      return;
+
+    D3D11_BUFFER_DESC cbDesc = { 32u, D3D11_USAGE_DYNAMIC, D3D11_BIND_CONSTANT_BUFFER, D3D11_CPU_ACCESS_WRITE };
+    ComPtr<ID3D11Buffer> cb;
+
+    if (!CheckHr(d3d->CreateBuffer(&cbDesc, nullptr, &cb), "bench: CreateBuffer (constants)"))
+      return;
+
+    // Two textures to alternate between
+    ComPtr<ID3D11ShaderResourceView> srv[2];
+
+    for (UINT i = 0u; i < 2u; i++) {
+      uint32_t texels[16];
+
+      for (uint32_t& t : texels)
+        t = i ? 0xff80c0ffu : 0xffffc080u;
+
+      D3D11_TEXTURE2D_DESC td = { 4u, 4u, 1u, 1u, DXGI_FORMAT_R8G8B8A8_UNORM, { 1u, 0u },
+        D3D11_USAGE_IMMUTABLE, D3D11_BIND_SHADER_RESOURCE };
+      D3D11_SUBRESOURCE_DATA data = { texels, 16u };
+      ComPtr<ID3D11Texture2D> tex;
+
+      if (!CheckHr(d3d->CreateTexture2D(&td, &data, &tex), "bench: CreateTexture2D")
+       || !CheckHr(d3d->CreateShaderResourceView(tex.Get(), nullptr, &srv[i]), "bench: CreateShaderResourceView"))
+        return;
+    }
+
+    D3D11_SAMPLER_DESC sd = { };
+    sd.Filter         = D3D11_FILTER_MIN_MAG_MIP_POINT;
+    sd.AddressU       = D3D11_TEXTURE_ADDRESS_WRAP;
+    sd.AddressV       = D3D11_TEXTURE_ADDRESS_WRAP;
+    sd.AddressW       = D3D11_TEXTURE_ADDRESS_WRAP;
+    sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
+    sd.MaxLOD         = D3D11_FLOAT32_MAX;
+    ComPtr<ID3D11SamplerState> sampler;
+
+    if (!CheckHr(d3d->CreateSamplerState(&sd, &sampler), "bench: CreateSamplerState"))
+      return;
+
+    ComPtr<ID3D11Query> events[Latency];
+    D3D11_QUERY_DESC qd = { D3D11_QUERY_EVENT, 0u };
+
+    for (auto& e : events) {
+      if (!CheckHr(d3d->CreateQuery(&qd, &e), "bench: CreateQuery (event)"))
+        return;
+    }
+
+    // The same vertex inputs as the test's first draw, so its layout and vertices fit
+    ctx->ClearState();
+
+    UINT offset = 0u;
+    D3D11_VIEWPORT viewport = { 0.0f, 0.0f, float(size), float(size), 0.0f, 1.0f };
+    ctx->IASetInputLayout(layout);
+    ctx->IASetVertexBuffers(0u, 1u, &vb, &stride, &offset);
+    ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ctx->RSSetViewports(1u, &viewport);
+
+    ID3D11Buffer* cbs[] = { cb.Get() };
+    ID3D11SamplerState* samplers[] = { sampler.Get() };
+    ctx->VSSetShader(vs.Get(), nullptr, 0u);
+    ctx->PSSetShader(ps.Get(), nullptr, 0u);
+    ctx->VSSetConstantBuffers(0u, 1u, cbs);
+    ctx->PSSetSamplers(0u, 1u, samplers);
+    ctx->OMSetRenderTargets(1u, &rtv, nullptr);
+
+    const float clear[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+
+    auto frame = [&] (UINT index) -> HRESULT {
+      // Frame latency limit, like DXGI's maximum frame latency: wait for the frame issued Latency frames ago
+      ID3D11Query* event = events[index % Latency].Get();
+
+      if (index >= Latency) {
+        ULONGLONG deadline = GetTickCount64() + 2000u;
+        HRESULT hr;
+        BOOL done = FALSE;
+
+        while ((hr = ctx->GetData(event, &done, sizeof(done), 0u)) == S_FALSE) {
+          if (GetTickCount64() > deadline)
+            return E_FAIL;
+
+          YieldProcessor();
+        }
+
+        if (FAILED(hr))
+          return hr;
+      }
+
+      ctx->ClearRenderTargetView(rtv, clear);
+
+      for (UINT d = 0u; d < DrawsPerFrame; d++) {
+        D3D11_MAPPED_SUBRESOURCE mapped = { };
+        HRESULT hr = ctx->Map(cb.Get(), 0u, D3D11_MAP_WRITE_DISCARD, 0u, &mapped);
+
+        if (FAILED(hr))
+          return hr;
+
+        const float constants[8] = {
+          float(d % 7u) * 0.25f - 0.75f, float(d % 5u) * 0.25f - 0.5f, 0.0f, 0.0f,
+          1.0f, 1.0f, 1.0f, 1.0f,
+        };
+
+        std::memcpy(mapped.pData, constants, sizeof(constants));
+        ctx->Unmap(cb.Get(), 0u);
+
+        ID3D11ShaderResourceView* view = srv[d & 1u].Get();
+        ctx->PSSetShaderResources(0u, 1u, &view);
+        ctx->Draw(3u, 0u);
+      }
+
+      ctx->End(event);
+      return engine->SubmitForPresent(rt, 0u);
+    };
+
+    HRESULT hr = S_OK;
+
+    for (UINT i = 0u; i < WarmupFrames && SUCCEEDED(hr); i++)
+      hr = frame(i);
+
+    LARGE_INTEGER freq, t0, t1;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&t0);
+    double cpu0 = ProcessCpuMs();
+
+    for (UINT i = WarmupFrames; i < WarmupFrames + Frames && SUCCEEDED(hr); i++)
+      hr = frame(i);
+
+    if (SUCCEEDED(hr))
+      hr = engine->WaitForResourceIdle(rt);
+
+    QueryPerformanceCounter(&t1);
+    double cpu1 = ProcessCpuMs();
+
+    if (!CheckHr(hr, "bench: frames"))
+      return;
+
+    double wallUs = 1e6 * double(t1.QuadPart - t0.QuadPart) / double(freq.QuadPart) / Frames;
+    double cpuUs  = 1e3 * (cpu1 - cpu0) / Frames;
+
+    char mode[8] = { };
+    bool workers = GetEnvironmentVariableA("BC250DXVK_MEASURE_WORKER_THREADS", mode, sizeof(mode)) && mode[0] == '1';
+
+    std::printf("      bench (%s): %u draws per frame, %u frames, latency %u: %.0f us wall, %.0f us process CPU "
+      "per frame; %.2f us wall per draw\n", workers ? "DXVK worker threads" : "inline", DrawsPerFrame, Frames,
+      Latency, wallUs, cpuUs, wallUs / DrawsPerFrame);
+  }
+
   // ---- Vulkan -------------------------------------------------------------------------------------
 
   struct Vk {
@@ -494,12 +701,20 @@ namespace {
 
 int main(int argc, char** argv) {
   if (argc < 2) {
-    std::printf("usage: bc250dxvk_engine_test <bc250dxvk.dll> [adapter substring]\n");
+    std::printf("usage: bc250dxvk_engine_test <bc250dxvk.dll> [adapter substring] [--bench]\n");
     return 2;
   }
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
-  const char* adapterFilter = argc > 2 ? argv[2] : nullptr;
+  const char* adapterFilter = nullptr;
+  bool bench = false;
+
+  for (int i = 2; i < argc; i++) {
+    if (!std::strcmp(argv[i], "--bench"))
+      bench = true;
+    else
+      adapterFilter = argv[i];
+  }
 
   // ---- Vulkan instance and device, owned by the "shell" ----
   HMODULE vulkanDll = LoadLibraryW(L"vulkan-1.dll");
@@ -1327,6 +1542,9 @@ int main(int argc, char** argv) {
         "known limitation: a triangle list without a geometry program streams out its first vertex only");
     }
   }
+
+  if (bench)
+    RunBench(engine, d3d.Get(), ctx.Get(), rt.Get(), rtv.Get(), layout.Get(), vb.Get(), stride, W);
 
   // ---- threads and submissions ----
   // A start module only ever proves a thread is the engine's: a std::thread starts in ucrtbase.dll, and

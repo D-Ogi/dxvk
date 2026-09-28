@@ -213,7 +213,14 @@ namespace dxvk::ddi {
         deviceInfo.features       = info->Device->Features;
 
         // E2, E3: everything on the calling thread; no second kernel device; no cache writer.
-        deviceInfo.hostOptions.inlineExecution    = true;
+        // BC250DXVK_MEASURE_WORKER_THREADS=1 is a measurement switch outside the ABI: DXVK's own worker
+        // threads then call Vulkan, which breaks E2, to price inline execution against upstream threading.
+        bool workerThreads = env::getEnvVar("BC250DXVK_MEASURE_WORKER_THREADS") == "1";
+
+        if (workerThreads)
+          Logger::err("bc250dxvk: BC250DXVK_MEASURE_WORKER_THREADS=1: DXVK worker threads call Vulkan, E2 is broken");
+
+        deviceInfo.hostOptions.inlineExecution    = !workerThreads;
         deviceInfo.hostOptions.disableKmt         = true;
         deviceInfo.hostOptions.disableShaderCache = true;
 
