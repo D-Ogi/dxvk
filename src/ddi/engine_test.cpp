@@ -680,6 +680,7 @@ namespace {
     PFN_vkEnumeratePhysicalDevices              enumeratePhysicalDevices = nullptr;
     PFN_vkGetPhysicalDeviceProperties           getPhysicalDeviceProperties = nullptr;
     PFN_vkGetPhysicalDeviceMemoryProperties     getPhysicalDeviceMemoryProperties = nullptr;
+    PFN_vkGetPhysicalDeviceFormatProperties     getPhysicalDeviceFormatProperties = nullptr;
     PFN_vkCreateDevice                          createDevice = nullptr;
     PFN_vkGetDeviceProcAddr                     getDeviceProcAddr = nullptr;
     PFN_vkDestroyDevice                         destroyDevice = nullptr;
@@ -746,6 +747,7 @@ int main(int argc, char** argv) {
   LoadInstance(vk, instance, &vk.enumeratePhysicalDevices, "vkEnumeratePhysicalDevices");
   LoadInstance(vk, instance, &vk.getPhysicalDeviceProperties, "vkGetPhysicalDeviceProperties");
   LoadInstance(vk, instance, &vk.getPhysicalDeviceMemoryProperties, "vkGetPhysicalDeviceMemoryProperties");
+  LoadInstance(vk, instance, &vk.getPhysicalDeviceFormatProperties, "vkGetPhysicalDeviceFormatProperties");
   LoadInstance(vk, instance, &vk.createDevice, "vkCreateDevice");
   LoadInstance(vk, instance, &vk.getDeviceProcAddr, "vkGetDeviceProcAddr");
 
@@ -1261,6 +1263,126 @@ int main(int argc, char** argv) {
 
     ID3D11Resource* twice[2] = { rotTex[1].Get(), rotTex[1].Get() };
     Check(engine->RotateResourceIdentities(twice, 2u) == E_INVALIDARG, "rotation rejects the same texture twice");
+  }
+
+  // ---- ClearView on buffer RTVs: element ranges, swizzled and packed formats, the rest of the buffer kept ----
+  {
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext1> ctx1;
+    CheckHr(ctx.As(&ctx1), "QueryInterface ID3D11DeviceContext1 (buffer ClearView)");
+
+    // The engine clears a buffer RTV in the buffer when its format has storage texel buffer support, otherwise
+    // through the 1D proxy image it renders to. The test prints which path each format takes on this adapter.
+    struct Case {
+      DXGI_FORMAT           format;
+      VkFormat              vkFormat;
+      UINT                  size;
+      float                 color[4];
+      std::array<int, 4>    cleared;
+      bool                  required;
+      const char*           what;
+    };
+
+    const Case cases[3] = {
+      // Clamped per component: 1, 0, 1 and 0.5 rounded to 128
+      { DXGI_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM, 4u, { 1.0f, -1.0f, 2.0f, 0.5f }, { 255, 0, 255, 128 }, true, "R8G8B8A8_UNORM" },
+      // Stored as R8 with an alpha swizzle: the byte is alpha (255), not red (51)
+      { DXGI_FORMAT_A8_UNORM, VK_FORMAT_R8_UNORM, 1u, { 0.2f, 0.4f, 0.6f, 1.0f }, { 255, 0, 0, 0 }, false, "A8_UNORM" },
+      // Red is bits 11..15 of the little-endian word: 0xF800
+      { DXGI_FORMAT_B5G6R5_UNORM, VK_FORMAT_R5G6B5_UNORM_PACK16, 2u, { 1.0f, 0.0f, 0.0f, 1.0f }, { 0x00, 0xF8, 0, 0 }, false, "B5G6R5_UNORM" },
+    };
+
+    constexpr UINT elements = 64u;
+    constexpr UINT first    = 8u;
+    constexpr UINT count    = 32u;
+
+    for (const auto& c : cases) {
+      UINT support = 0u;
+      d3d->CheckFormatSupport(c.format, &support);
+
+      const UINT needed = D3D11_FORMAT_SUPPORT_BUFFER | D3D11_FORMAT_SUPPORT_RENDER_TARGET;
+
+      if ((support & needed) != needed) {
+        if (c.required)
+          Check(false, "R8G8B8A8_UNORM supports buffer render targets");
+        else
+          std::printf("      buffer ClearView %s: no buffer render target support, skipped\n", c.what);
+        continue;
+      }
+
+      VkFormatProperties vkProps = { };
+      vk.getPhysicalDeviceFormatProperties(physDev, c.vkFormat, &vkProps);
+      bool typed = (vkProps.bufferFeatures & VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT) != 0u;
+      std::printf("      buffer ClearView %s: %s\n", c.what, typed ? "typed buffer view" : "proxy image");
+
+      std::vector<uint8_t> fill(elements * c.size, 0x11u);
+      D3D11_SUBRESOURCE_DATA init = { fill.data(), 0u, 0u };
+
+      D3D11_BUFFER_DESC bufDesc = { };
+      bufDesc.ByteWidth = elements * c.size;
+      bufDesc.Usage     = D3D11_USAGE_DEFAULT;
+      bufDesc.BindFlags = D3D11_BIND_RENDER_TARGET;
+
+      D3D11_BUFFER_DESC readDesc = bufDesc;
+      readDesc.Usage          = D3D11_USAGE_STAGING;
+      readDesc.BindFlags      = 0u;
+      readDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+
+      D3D11_RENDER_TARGET_VIEW_DESC rtvDesc = { };
+      rtvDesc.Format              = c.format;
+      rtvDesc.ViewDimension       = D3D11_RTV_DIMENSION_BUFFER;
+      rtvDesc.Buffer.FirstElement = first;
+      rtvDesc.Buffer.NumElements  = count;
+
+      Microsoft::WRL::ComPtr<ID3D11Buffer> buffer, readBack;
+      Microsoft::WRL::ComPtr<ID3D11RenderTargetView> bufRtv;
+
+      if (!ctx1
+       || !CheckHr(d3d->CreateBuffer(&bufDesc, &init, &buffer), "CreateBuffer (buffer render target)")
+       || !CheckHr(d3d->CreateBuffer(&readDesc, nullptr, &readBack), "CreateBuffer (buffer ClearView read-back)")
+       || !CheckHr(d3d->CreateRenderTargetView(buffer.Get(), &rtvDesc, &bufRtv), "CreateRenderTargetView (buffer, elements 8..40)"))
+        continue;
+
+      // Counts the elements that differ from the expectation: element e holds the cleared value if
+      // inRange(e), else the initial fill
+      auto mismatches = [&] (auto inRange) {
+        D3D11_MAPPED_SUBRESOURCE m = { };
+        ctx->CopyResource(readBack.Get(), buffer.Get());
+
+        if (FAILED(ctx->Map(readBack.Get(), 0u, D3D11_MAP_READ, 0u, &m)))
+          return int(elements);
+
+        int bad = 0;
+        auto bytes = static_cast<const uint8_t*>(m.pData);
+
+        for (UINT e = 0u; e < elements; e++) {
+          bool ok = true;
+
+          for (UINT b = 0u; b < c.size; b++) {
+            int expected = inRange(e) ? c.cleared[b] : 0x11;
+            ok &= std::abs(int(bytes[e * c.size + b]) - expected) <= 1;
+          }
+
+          bad += ok ? 0 : 1;
+        }
+
+        ctx->Unmap(readBack.Get(), 0u);
+        return bad;
+      };
+
+      // View elements 4..12 and 20..24 are buffer elements 12..20 and 28..32; the third rectangle is empty
+      const D3D11_RECT rects[3] = { { 4, 0, 12, 1 }, { 20, 0, 24, 1 }, { 30, 0, 30, 1 } };
+      ctx1->ClearView(bufRtv.Get(), c.color, rects, 3u);
+
+      int bad = mismatches([] (UINT e) { return (e >= 12u && e < 20u) || (e >= 28u && e < 32u); });
+      std::printf("      buffer ClearView %s, two rectangles: %d mismatching elements\n", c.what, bad);
+      Check(bad == 0, "ClearView on a buffer RTV writes its rectangles' elements, converted, and nothing else");
+
+      ctx1->ClearView(bufRtv.Get(), c.color, nullptr, 0u);
+
+      bad = mismatches([] (UINT e) { return e >= first && e < first + count; });
+      std::printf("      buffer ClearView %s, whole view: %d mismatching elements\n", c.what, bad);
+      Check(bad == 0, "ClearView on a buffer RTV without rectangles writes the view's elements only");
+    }
   }
 
   // ---- DXGI Blt onto the shell image, as onto a runtime-allocated shared or proxy surface ----
