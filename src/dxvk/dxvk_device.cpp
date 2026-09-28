@@ -13,8 +13,10 @@ namespace dxvk {
     const Rc<vk::DeviceFn>&         vkd,
     const DxvkDeviceCapabilities&   caps,
     const DxvkDeviceQueueSet&       queues,
-    const DxvkQueueCallback&        queueCallback)
+    const DxvkQueueCallback&        queueCallback,
+    const DxvkDeviceHostOptions&    hostOptions)
   : m_options           (instance->options()),
+    m_hostOptions       (hostOptions),
     m_instance          (instance),
     m_adapter           (adapter),
     m_vkd               (vkd),
@@ -27,7 +29,7 @@ namespace dxvk {
     m_checkpoints       (this),
     m_submissionQueue   (this, queueCallback) {
 
-    if (adapter->kmtLocal()) {
+    if (adapter->kmtLocal() && !m_hostOptions.disableKmt) {
       D3DKMT_CREATEDEVICE create = { };
       create.hAdapter = adapter->kmtLocal();
       if (D3DKMTCreateDevice(&create))
@@ -38,7 +40,8 @@ namespace dxvk {
 
     determineShaderOptions();
 
-    if (env::getEnvVar("DXVK_SHADER_CACHE") != "0" && DxvkShader::getShaderDumpPath().empty())
+    if (env::getEnvVar("DXVK_SHADER_CACHE") != "0" && DxvkShader::getShaderDumpPath().empty()
+     && !m_hostOptions.disableShaderCache && !m_hostOptions.inlineExecution)
       m_shaderCache = DxvkShaderCache::getInstance();
 
     logBindingModel();
@@ -663,7 +666,17 @@ namespace dxvk {
 
     auto t0 = dxvk::high_resolution_clock::now();
 
-    fence.wait(value);
+    if (m_hostOptions.inlineExecution) {
+      // Nothing else completes submissions, so retire them here
+      // until the fence reaches the value or nothing is left.
+      while (fence.value() < value && m_submissionQueue.finishInline(true))
+        continue;
+
+      if (fence.value() < value)
+        Logger::err("DxvkDevice: waitForFence: Value not signalled by any submission");
+    } else {
+      fence.wait(value);
+    }
 
     auto t1 = dxvk::high_resolution_clock::now();
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0);

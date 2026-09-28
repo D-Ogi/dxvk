@@ -1,0 +1,120 @@
+#pragma once
+
+// Engine side of bc250_dxvk_engine.h: the IBc250DxvkDevice object around DXVK's D3D11 device. This translation
+// unit family never includes d3d10umddi.h (DXVK's util_gdi.h conflicts with the WDK); the shell translates DDI
+// arguments into the WDK-free structures of the ABI header.
+//
+// Kto pod kim dołki kopie, ten sam w nie wpada: whoever digs pits under others falls into them himself.
+// The runtime has validated every argument already; this layer translates, it does not second-guess.
+
+#include "../d3d11/d3d11_device.h"
+#include "../d3d11/d3d11_context_imm.h"
+
+#include "bc250_dxvk_engine.h"
+
+namespace dxvk::ddi {
+
+  class Bc250DxvkDevice : public ComObject<IBc250DxvkDevice> {
+
+  public:
+
+    Bc250DxvkDevice(
+            D3D11DXGIDevice*                  pContainer,
+      const BC250_DXVK_SHELL_SERVICES&        Services);
+
+    ~Bc250DxvkDevice();
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(
+            REFIID                            riid,
+            void**                            ppvObject) final;
+
+    // E4: the final release reports a leaked D3D11 device as a nonzero count.
+    ULONG STDMETHODCALLTYPE Release() final;
+
+    HRESULT STDMETHODCALLTYPE GetD3D11Device(
+            REFIID                            riid,
+            void**                            ppDevice) final;
+
+    HRESULT STDMETHODCALLTYPE GetImmediateContext(
+            REFIID                            riid,
+            void**                            ppContext) final;
+
+    HRESULT STDMETHODCALLTYPE CreateShader(
+      const BC250_DXVK_SHADER_DESC*           pDesc,
+            REFIID                            riid,
+            void**                            ppShader) final;
+
+    HRESULT STDMETHODCALLTYPE CreateInputLayout(
+      const BC250_DXVK_INPUT_LAYOUT*          pLayout,
+            ID3D11InputLayout**               ppInputLayout) final;
+
+    HRESULT STDMETHODCALLTYPE GetVertexFormat(
+            DXGI_FORMAT                       Format,
+            VkFormat*                         pVkFormat,
+            UINT*                             pElementSize) final;
+
+    HRESULT STDMETHODCALLTYPE GetImageCreateInfo(
+      const D3D11_TEXTURE2D_DESC1*            pDesc,
+            VkImageCreateInfo*                pInfo) final;
+
+    HRESULT STDMETHODCALLTYPE CreateTexture2DFromImage(
+      const D3D11_TEXTURE2D_DESC1*            pDesc,
+            VkImage                           Image,
+            ID3D11Texture2D**                 ppTexture) final;
+
+    HRESULT STDMETHODCALLTYPE WaitForResourceIdle(
+            ID3D11Resource*                   pResource) final;
+
+    HRESULT STDMETHODCALLTYPE IsResourceBusy(
+            ID3D11Resource*                   pResource,
+            UINT                              Subresource) final;
+
+    HRESULT STDMETHODCALLTYPE SubmitForPresent(
+            ID3D11Resource*                   pSource,
+            UINT                              Subresource) final;
+
+    HRESULT STDMETHODCALLTYPE RotateResourceIdentities(
+            ID3D11Resource* const*            ppResources,
+            UINT                              Count) final;
+
+    HRESULT STDMETHODCALLTYPE Blt(
+      const BC250_DXVK_BLT*                   pBlt) final;
+
+  private:
+
+    Com<D3D11DXGIDevice>        m_container;
+    D3D11Device*                m_device  = nullptr;
+    D3D11ImmediateContext*      m_context = nullptr;
+    Rc<DxvkDevice>              m_dxvkDevice;
+    BC250_DXVK_SHELL_SERVICES   m_services = { };
+
+    HRESULT CheckDeviceStatus() const;
+
+  };
+
+
+  /**
+   * \brief Builds a DXBC container from a DDI shader
+   *
+   * The runtime passes the tokenized program and register-only signatures. The container carries
+   * the program unchanged in a SHEX/SHDR chunk and signature chunks whose semantic names derive from
+   * registers, and a valid DXBC hash, so that DXVK's regular shader path accepts it.
+   * \param [in] pDesc DDI shader
+   * \param [out] pContainer Container bytes
+   * \param [out] pSoEntries Stream output declaration for D3D11, if any
+   * \param [out] pSoNames Storage for the semantic names referenced by \c pSoEntries
+   * \returns \c S_OK on success
+   */
+  HRESULT BuildShaderContainer(
+    const BC250_DXVK_SHADER_DESC*             pDesc,
+          std::vector<uint8_t>*               pContainer,
+          std::vector<D3D11_SO_DECLARATION_ENTRY>* pSoEntries,
+          std::vector<std::string>*           pSoNames);
+
+  /**
+   * \brief Program type of a DDI token stream
+   * \returns D3D10_SB_TOKENIZED_PROGRAM_TYPE value, or ~0u
+   */
+  uint32_t GetProgramType(const UINT* pCode);
+
+}

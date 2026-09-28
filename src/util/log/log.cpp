@@ -10,7 +10,13 @@ namespace dxvk {
   : m_minLevel(getMinLogLevel()), m_fileName(fileName) {
 
   }
-  
+
+
+  Logger::Logger(const std::string& fileName, bool requireLogPath)
+  : m_minLevel(getMinLogLevel()), m_fileName(fileName), m_requireLogPath(requireLogPath) {
+
+  }
+
   
   Logger::~Logger() { }
   
@@ -124,7 +130,7 @@ namespace dxvk {
   std::string Logger::getFileName(const std::string& base) {
     std::string path = env::getEnvVar("DXVK_LOG_PATH");
     
-    if (path == "none")
+    if (path == "none" || (path.empty() && m_requireLogPath))
       return std::string();
 
 #ifdef _WIN32

@@ -167,9 +167,27 @@ namespace dxvk {
      */
     template<typename Pred>
     void synchronizeUntil(const Pred& pred) {
+      if (m_inline) {
+        while (!pred() && finishInline(true))
+          continue;
+        return;
+      }
+
       std::unique_lock<dxvk::mutex> lock(m_mutex);
       m_finishCond.wait(lock, pred);
     }
+
+    /**
+     * \brief Retires the oldest submission in inline mode
+     *
+     * Only used with inline execution, where no finish thread
+     * exists. Waits for the oldest pending submission if \c wait
+     * is set, otherwise only retires it if the GPU already
+     * completed it.
+     * \param [in] wait Whether to wait for the GPU
+     * \returns \c true if a submission was retired
+     */
+    bool finishInline(bool wait);
 
     /**
      * \brief Waits for all submissions to complete
@@ -199,6 +217,10 @@ namespace dxvk {
     DxvkDevice*                 m_device;
     DxvkCheckpointBuffer*       m_checkpoints = nullptr;
     DxvkQueueCallback           m_callback;
+    bool                        m_inline = false;
+
+    uint64_t                    m_trackedSubmitId = 0u;
+    uint64_t                    m_trackedPresentId = 0u;
 
     DxvkTimelineSemaphores      m_semaphores;
     DxvkTimelineSemaphoreValues m_timelines;
@@ -224,6 +246,18 @@ namespace dxvk {
     void submitCmdLists();
 
     void finishCmdLists();
+
+    void executeEntry(
+            DxvkSubmitEntry&    entry);
+
+    bool forwardEntry(
+            DxvkSubmitEntry&    entry);
+
+    void finishEntry(
+            DxvkSubmitEntry&    entry);
+
+    void submitInline(
+            DxvkSubmitEntry&&   entry);
     
   };
   

@@ -19,6 +19,9 @@ namespace dxvk {
     VkInstance                instance        = VK_NULL_HANDLE;
     uint32_t                  extensionCount  = 0u;
     const char**              extensionNames  = nullptr;
+    /// Skip the OpenVR and OpenXR extension providers (a system
+    /// driver must not initialize a VR runtime inside the process)
+    bool                      disableVrXr     = false;
   };
 
 

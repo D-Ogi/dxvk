@@ -112,8 +112,30 @@ namespace dxvk {
       InjectCsChunk(Queue, std::move(chunk), false);
     }
 
+    /**
+     * \brief Ends the frame and submits all recorded work
+     *
+     * Used by a user-mode driver engine (bc250dxvk) before the
+     * runtime presents a surface. With inline execution, the
+     * submission has happened when this returns.
+     */
+    void EndFrameAndFlush();
+
+    /**
+     * \brief Waits for or checks GPU use of a resource
+     *
+     * Used by a user-mode driver engine (bc250dxvk). Flushes
+     * pending work that uses the resource if it has to wait.
+     * \param [in] Resource DXVK resource
+     * \param [in] DoNotWait Only check, never wait
+     * \returns \c true if the resource is idle
+     */
+    bool WaitForResourceIdle(
+      const DxvkPagedResource&          Resource,
+            bool                        DoNotWait);
+
   private:
-    
+
     DxvkCsThread            m_csThread;
     uint64_t                m_csSeqNum = 0ull;
 

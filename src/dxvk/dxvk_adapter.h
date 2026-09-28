@@ -93,6 +93,24 @@ namespace dxvk {
 
 
   /**
+   * \brief Host integration options of a device
+   *
+   * Used when DXVK runs inside a user-mode driver that owns the Vulkan
+   * device and whose runtime callbacks are only valid on the thread that
+   * is currently inside the driver.
+   */
+  struct DxvkDeviceHostOptions {
+    /// Execute CS chunks, queue submission and completion, pipeline
+    /// compiles and descriptor copies on the calling thread, and start
+    /// no worker thread that calls Vulkan.
+    bool inlineExecution = false;
+    /// Do not create a D3DKMT device for this Vulkan device.
+    bool disableKmt = false;
+    /// Do not use the on-disk shader cache.
+    bool disableShaderCache = false;
+  };
+
+  /**
    * \brief Device import info
    */
   struct DxvkDeviceImportInfo {
@@ -103,6 +121,7 @@ namespace dxvk {
     const char**      extensionNames  = nullptr;
     const VkPhysicalDeviceFeatures2* features = nullptr;
     DxvkQueueCallback queueCallback   = { };
+    DxvkDeviceHostOptions hostOptions = { };
   };
 
   /**

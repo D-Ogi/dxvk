@@ -22,6 +22,13 @@ if get_option('enable_d3d10')
   subdir('d3d10')
 endif
 
+if get_option('enable_ddi_engine')
+  if not get_option('enable_d3d11') or platform != 'windows'
+    error('The DDI engine needs D3D11 and a Windows target.')
+  endif
+  subdir('ddi')
+endif
+
 if get_option('enable_d3d9')
   subdir('d3d9')
 endif

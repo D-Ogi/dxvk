@@ -20,6 +20,13 @@ namespace dxvk {
   void DxvkPipelineWorkers::compilePipelineLibrary(
           DxvkShaderPipelineLibrary*      library,
           DxvkPipelinePriority            priority) {
+    if (m_device->isInlineExecution()) {
+      m_tasksTotal += 1;
+      library->compilePipeline();
+      m_tasksCompleted += 1;
+      return;
+    }
+
     std::unique_lock lock(m_lock);
     this->startWorkers();
 
@@ -34,6 +41,15 @@ namespace dxvk {
           DxvkGraphicsPipeline*           pipeline,
     const DxvkGraphicsPipelineStateInfo&  state,
           DxvkPipelinePriority            priority) {
+    if (m_device->isInlineExecution()) {
+      m_tasksTotal += 1;
+      pipeline->acquirePipeline();
+      pipeline->compilePipeline(state);
+      pipeline->releasePipeline();
+      m_tasksCompleted += 1;
+      return;
+    }
+
     std::unique_lock lock(m_lock);
     this->startWorkers();
 

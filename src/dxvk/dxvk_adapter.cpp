@@ -336,7 +336,7 @@ namespace dxvk {
     deviceQueues.transfer = getDeviceQueue(vkd, importCaps, queueMapping.transfer);
     deviceQueues.sparse   = getDeviceQueue(vkd, importCaps, queueMapping.sparse);
 
-    return new DxvkDevice(m_instance, this, vkd, importCaps, deviceQueues, args.queueCallback);
+    return new DxvkDevice(m_instance, this, vkd, importCaps, deviceQueues, args.queueCallback, args.hostOptions);
   }
 
 

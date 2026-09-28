@@ -593,6 +593,20 @@ namespace dxvk {
 
     dxvk::thread                m_thread;
 
+    // Inline execution (DxvkDeviceHostOptions): chunks run on
+    // the dispatching thread. A chunk dispatched while another
+    // one executes on the same thread is deferred until the
+    // outer chunk completes.
+    bool                        m_inline      = false;
+    dxvk::recursive_mutex       m_inlineMutex;
+    bool                        m_inlineBusy  = false;
+    std::vector<std::pair<DxvkCsQueue, DxvkCsQueuedChunk>> m_inlineDeferred;
+
+    uint64_t executeInline(
+            DxvkCsQueue       queue,
+            DxvkCsChunkRef&&  chunk,
+            bool              sequenced);
+
     auto& getQueue(DxvkCsQueue which) {
       return which == DxvkCsQueue::Ordered
         ? m_queueOrdered : m_queueHighPrio;

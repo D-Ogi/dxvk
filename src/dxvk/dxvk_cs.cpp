@@ -99,22 +99,82 @@ namespace dxvk {
     const Rc<DxvkDevice>&   device,
     const Rc<DxvkContext>&  context)
   : m_device(device), m_context(context),
-    m_thread([this] { threadFunc(); }) {
-    
+    m_inline(device->isInlineExecution()) {
+    if (!m_inline)
+      m_thread = dxvk::thread([this] { threadFunc(); });
   }
-  
-  
+
+
   DxvkCsThread::~DxvkCsThread() {
     { std::unique_lock<dxvk::mutex> lock(m_mutex);
       m_stopped.store(true);
     }
-    
+
     m_condOnAdd.notify_one();
-    m_thread.join();
+
+    if (m_thread.joinable())
+      m_thread.join();
   }
-  
-  
+
+
+  uint64_t DxvkCsThread::executeInline(
+          DxvkCsQueue       queue,
+          DxvkCsChunkRef&&  chunk,
+          bool              sequenced) {
+    std::lock_guard<dxvk::recursive_mutex> lock(m_inlineMutex);
+
+    uint64_t seq = sequenced ? ++getQueue(queue).seqDispatch : 0u;
+
+    if (m_inlineBusy) {
+      // Dispatched from within a chunk on this thread: run it
+      // after the current chunk rather than in the middle of it.
+      auto& entry = m_inlineDeferred.emplace_back();
+      entry.first = queue;
+      entry.second.chunk = std::move(chunk);
+      entry.second.seq = seq;
+      return seq;
+    }
+
+    m_inlineBusy = true;
+
+    try {
+      m_context->addStatCtr(DxvkStatCounter::CsChunkCount, 1);
+      chunk->executeAll(m_context.ptr());
+
+      if (seq)
+        getCounter(queue).store(seq);
+
+      chunk = DxvkCsChunkRef();
+
+      // Deferred chunks may add more deferred chunks, so index
+      // the vector instead of iterating over it.
+      for (size_t i = 0u; i < m_inlineDeferred.size(); i++) {
+        DxvkCsQueue entryQueue = m_inlineDeferred[i].first;
+        DxvkCsQueuedChunk entry = std::move(m_inlineDeferred[i].second);
+
+        m_context->addStatCtr(DxvkStatCounter::CsChunkCount, 1);
+        entry.chunk->executeAll(m_context.ptr());
+
+        if (entry.seq)
+          getCounter(entryQueue).store(entry.seq);
+      }
+
+      m_inlineDeferred.clear();
+    } catch (const DxvkError& e) {
+      Logger::err("Exception executing CS chunk inline!");
+      Logger::err(e.message());
+      m_inlineDeferred.clear();
+    }
+
+    m_inlineBusy = false;
+    return seq;
+  }
+
+
   uint64_t DxvkCsThread::dispatchChunk(DxvkCsChunkRef&& chunk) {
+    if (m_inline)
+      return executeInline(DxvkCsQueue::Ordered, std::move(chunk), true);
+
     uint64_t seq;
 
     { std::unique_lock<dxvk::mutex> lock(m_mutex);
@@ -132,6 +192,11 @@ namespace dxvk {
 
 
   void DxvkCsThread::injectChunk(DxvkCsQueue queue, DxvkCsChunkRef&& chunk, bool synchronize) {
+    if (m_inline) {
+      executeInline(queue, std::move(chunk), synchronize);
+      return;
+    }
+
     uint64_t timeline = 0u;
 
     { std::unique_lock<dxvk::mutex> lock(m_mutex);
@@ -164,6 +229,12 @@ namespace dxvk {
 
 
   void DxvkCsThread::synchronize(uint64_t seq) {
+    // Inline chunks have executed by the time dispatch returns,
+    // except chunks deferred behind the one that is executing on
+    // this thread, which waiting here could never complete.
+    if (m_inline)
+      return;
+
     // Avoid locking if we know the sync is a no-op, may
     // reduce overhead if this is being called frequently
     if (seq > m_seqOrdered.load()) {

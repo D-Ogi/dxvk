@@ -33,6 +33,15 @@ namespace dxvk {
   public:
     
     Logger(const std::string& file_name);
+
+    /**
+     * \brief Logger that creates a file only when DXVK_LOG_PATH is set
+     *
+     * For a DLL loaded as a system driver into every process: the
+     * default file in the working directory would land anywhere.
+     */
+    Logger(const std::string& file_name, bool requireLogPath);
+
     ~Logger();
     
     static void trace(const std::string& message);
@@ -52,7 +61,8 @@ namespace dxvk {
     
     const LogLevel    m_minLevel;
     const std::string m_fileName;
-    
+    const bool        m_requireLogPath = false;
+
     dxvk::mutex       m_mutex;
     std::ofstream     m_fileStream;
 

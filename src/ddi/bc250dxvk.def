@@ -1,0 +1,3 @@
+LIBRARY BC250DXVK.DLL
+EXPORTS
+    Bc250DxvkEngineGetFuncs

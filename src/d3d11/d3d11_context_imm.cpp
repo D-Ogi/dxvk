@@ -886,6 +886,24 @@ namespace dxvk {
   }
 
 
+  void D3D11ImmediateContext::EndFrameAndFlush() {
+    D3D10DeviceLock lock = LockContext();
+
+    EndFrame(nullptr);
+    ExecuteFlush(GpuFlushType::ExplicitFlush, nullptr, true);
+  }
+
+
+  bool D3D11ImmediateContext::WaitForResourceIdle(
+    const DxvkPagedResource&                Resource,
+          bool                              DoNotWait) {
+    D3D10DeviceLock lock = LockContext();
+
+    return WaitForResource(Resource, DxvkCsThread::SynchronizeAll,
+      D3D11_MAP_READ_WRITE, DoNotWait ? D3D11_MAP_FLAG_DO_NOT_WAIT : 0u);
+  }
+
+
   bool D3D11ImmediateContext::WaitForResource(
     const DxvkPagedResource&                Resource,
           uint64_t                          SequenceNumber,

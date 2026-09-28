@@ -90,6 +90,16 @@ d3d11_dll = shared_library(dxvk_name_prefix+'d3d11', dxgi_common_src + d3d11_src
   kwargs              : dxvk_so_version,
 )
 
+# The DDI engine (src/ddi) compiles the same D3D10/11 sources into its own DLL, without the application
+# entry points of d3d11_main.cpp (their DLLEXPORT would export them from the engine as well).
+d3d11_engine_src = []
+foreach f : dxgi_common_src + d3d11_src + d3d10_src
+  if f != 'd3d11_main.cpp'
+    d3d11_engine_src += files(f)
+  endif
+endforeach
+d3d11_engine_shaders = d3d11_shaders
+
 d3d11_dep = declare_dependency(
   link_with           : [ d3d11_dll ],
   include_directories : [ dxvk_include_path ],

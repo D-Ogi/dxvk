@@ -91,9 +91,22 @@ namespace dxvk {
       const Rc<vk::DeviceFn>&         vkd,
       const DxvkDeviceCapabilities&   caps,
       const DxvkDeviceQueueSet&       queues,
-      const DxvkQueueCallback&        queueCallback);
-      
+      const DxvkQueueCallback&        queueCallback,
+      const DxvkDeviceHostOptions&    hostOptions = DxvkDeviceHostOptions());
+
     ~DxvkDevice();
+
+    /**
+     * \brief Checks whether the device executes inline
+     *
+     * If set, all work that would normally run on DXVK worker
+     * threads runs on the thread that issues it, see
+     * \ref DxvkDeviceHostOptions.
+     * \returns \c true for inline execution
+     */
+    bool isInlineExecution() const {
+      return m_hostOptions.inlineExecution;
+    }
     
     /**
      * \brief Vulkan device functions
@@ -751,6 +764,7 @@ namespace dxvk {
   private:
     
     DxvkOptions                 m_options;
+    DxvkDeviceHostOptions       m_hostOptions;
 
     Rc<DxvkInstance>            m_instance;
     Rc<DxvkAdapter>             m_adapter;
