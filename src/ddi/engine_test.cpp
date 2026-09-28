@@ -3,7 +3,7 @@
 // Plays the UMD shell: owns the VkInstance and VkDevice (E1), creates the device from the engine's
 // requirements, allocates the render target image itself (E5), and feeds shaders in DDI form: the token
 // stream plus register-only signatures, with every semantic name thrown away. Checks the pixels of one
-// clear and one draw, storage rotation, and that the engine's queue submissions, waits, allocations and
+// clear and one draw, storage rotation, DXGI Blt onto an imported image, and that the engine's queue submissions, waits, allocations and
 // object creation all ran on the calling thread (E2), by wrapping the Vulkan entry points it is given.
 //
 // Usage: bc250dxvk_engine_test.exe <path to bc250dxvk.dll> [adapter substring]
@@ -870,6 +870,175 @@ int main(int argc, char** argv) {
 
     ID3D11Resource* twice[2] = { rotTex[1].Get(), rotTex[1].Get() };
     Check(engine->RotateResourceIdentities(twice, 2u) == E_INVALIDARG, "rotation rejects the same texture twice");
+  }
+
+  // ---- DXGI Blt onto the shell image, as onto a runtime-allocated shared or proxy surface ----
+  {
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext1> ctx1;
+    CheckHr(ctx.As(&ctx1), "QueryInterface ID3D11DeviceContext1");
+
+    auto readAt = [&] (ID3D11Texture2D* stagingTexture, ID3D11Texture2D* texture, UINT x, UINT y) {
+      std::array<int, 4> result = { -1, -1, -1, -1 };
+      D3D11_MAPPED_SUBRESOURCE m = { };
+      ctx->CopyResource(stagingTexture, texture);
+
+      if (SUCCEEDED(ctx->Map(stagingTexture, 0u, D3D11_MAP_READ, 0u, &m))) {
+        const uint8_t* p = static_cast<const uint8_t*>(m.pData) + y * m.RowPitch + x * 4u;
+        result = { p[0], p[1], p[2], p[3] };
+        ctx->Unmap(stagingTexture, 0u);
+      }
+
+      return result;
+    };
+
+    auto same = [&] (std::array<int, 4> a, std::array<int, 4> b) {
+      return similar(a, b[0], b[1], b[2], 1);
+    };
+
+    // Source: an engine texture in an sRGB format, with red, green and blue quadrants and a grey one whose
+    // stored sRGB encoding (about 188) differs from its linear value, so a decoding Blt would show
+    D3D11_TEXTURE2D_DESC srcDesc = { };
+    srcDesc.Width      = 32u;
+    srcDesc.Height     = 32u;
+    srcDesc.MipLevels  = 1u;
+    srcDesc.ArraySize  = 1u;
+    srcDesc.Format     = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    srcDesc.SampleDesc = { 1u, 0u };
+    srcDesc.Usage      = D3D11_USAGE_DEFAULT;
+    srcDesc.BindFlags  = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+
+    D3D11_TEXTURE2D_DESC srcStagingDesc = srcDesc;
+    srcStagingDesc.Usage          = D3D11_USAGE_STAGING;
+    srcStagingDesc.BindFlags      = 0u;
+    srcStagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> src, srcStaging;
+    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> srcRtv;
+    bool bltReady = CheckHr(d3d->CreateTexture2D(&srcDesc, nullptr, &src), "CreateTexture2D (Blt source, sRGB)")
+      && CheckHr(d3d->CreateTexture2D(&srcStagingDesc, nullptr, &srcStaging), "CreateTexture2D (Blt source staging)")
+      && CheckHr(d3d->CreateRenderTargetView(src.Get(), nullptr, &srcRtv), "CreateRenderTargetView (Blt source)");
+
+    if (bltReady) {
+      const float grey[4] = { 0.5f, 0.5f, 0.5f, 1.0f };
+      const float quadColors[3][4] = { { 1.0f, 0.0f, 0.0f, 1.0f }, { 0.0f, 1.0f, 0.0f, 1.0f }, { 0.0f, 0.0f, 1.0f, 1.0f } };
+      const D3D11_RECT quads[4] = { { 0, 0, 16, 16 }, { 16, 0, 32, 16 }, { 0, 16, 16, 32 }, { 16, 16, 32, 32 } };
+
+      ctx->ClearRenderTargetView(srcRtv.Get(), grey);
+
+      for (UINT i = 0u; i < 3u; i++)
+        ctx1->ClearView(srcRtv.Get(), quadColors[i], &quads[i], 1u);
+
+      std::array<int, 4> q[4];
+
+      for (UINT i = 0u; i < 4u; i++)
+        q[i] = readAt(srcStaging.Get(), src.Get(), UINT(quads[i].left) + 8u, UINT(quads[i].top) + 8u);
+
+      std::printf("      Blt source quadrants: %d,%d,%d  %d,%d,%d  %d,%d,%d  %d,%d,%d\n",
+        q[0][0], q[0][1], q[0][2], q[1][0], q[1][1], q[1][2], q[2][0], q[2][1], q[2][2], q[3][0], q[3][1], q[3][2]);
+      Check(similar(q[0], 255, 0, 0, 1) && similar(q[1], 0, 255, 0, 1) && similar(q[2], 0, 0, 255, 1)
+         && similar(q[3], 188, 188, 188, 2), "Blt source: three colour quadrants and an sRGB-encoded grey one");
+
+      BC250_DXVK_BLT blt = { };
+      blt.Destination     = rt.Get();
+      blt.DestinationRect = { 0, 0, LONG(W), LONG(H) };
+      blt.Source          = src.Get();
+      blt.Flags           = BC250_DXVK_BLT_STRETCH | BC250_DXVK_BLT_CONVERT | BC250_DXVK_BLT_PRESENT;
+      blt.Rotation        = DXGI_MODE_ROTATION_IDENTITY;
+
+      // Destination pixel (x, y) samples source (x / 2, y / 2); read the middle of each 32x32 quadrant
+      if (CheckHr(engine->Blt(&blt), "Blt: 32x32 sRGB source stretched onto the 64x64 UNORM shell image, presenting")) {
+        Check(same(readAt(staging.Get(), rt.Get(), 16u, 16u), q[0]) && same(readAt(staging.Get(), rt.Get(), 48u, 16u), q[1])
+           && same(readAt(staging.Get(), rt.Get(), 16u, 48u), q[2]) && same(readAt(staging.Get(), rt.Get(), 48u, 48u), q[3]),
+          "stretched Blt moves the encoded values unchanged, quadrant by quadrant");
+      }
+
+      blt.Flags    = BC250_DXVK_BLT_STRETCH | BC250_DXVK_BLT_CONVERT;
+      blt.Rotation = DXGI_MODE_ROTATION_ROTATE180;
+
+      if (CheckHr(engine->Blt(&blt), "Blt rotated by 180 degrees")) {
+        Check(same(readAt(staging.Get(), rt.Get(), 16u, 16u), q[3]) && same(readAt(staging.Get(), rt.Get(), 48u, 16u), q[2])
+           && same(readAt(staging.Get(), rt.Get(), 16u, 48u), q[1]) && same(readAt(staging.Get(), rt.Get(), 48u, 48u), q[0]),
+          "180 degrees: each destination quadrant shows the opposite source quadrant");
+      }
+
+      const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+      ctx->ClearRenderTargetView(rtv.Get(), black);
+
+      blt.DestinationRect = { 16, 16, 48, 48 };
+      blt.Flags           = BC250_DXVK_BLT_CONVERT;
+      blt.Rotation        = DXGI_MODE_ROTATION_IDENTITY;
+
+      if (CheckHr(engine->Blt(&blt), "Blt into a 32x32 destination rectangle, unscaled")) {
+        Check(same(readAt(staging.Get(), rt.Get(), 20u, 20u), q[0]) && same(readAt(staging.Get(), rt.Get(), 44u, 44u), q[3])
+           && similar(readAt(staging.Get(), rt.Get(), 8u, 8u), 0, 0, 0, 0) && similar(readAt(staging.Get(), rt.Get(), 56u, 56u), 0, 0, 0, 0),
+          "an unscaled Blt writes its destination rectangle and nothing else");
+      }
+
+      // Resolve: a 4x engine render target onto the shell image at the same size
+      UINT msQuality = 0u;
+      d3d->CheckMultisampleQualityLevels(DXGI_FORMAT_R8G8B8A8_UNORM, 4u, &msQuality);
+
+      D3D11_TEXTURE2D_DESC msDesc = srcDesc;
+      msDesc.Format     = DXGI_FORMAT_R8G8B8A8_UNORM;
+      msDesc.SampleDesc = { 4u, 0u };
+      msDesc.BindFlags  = D3D11_BIND_RENDER_TARGET;
+
+      Microsoft::WRL::ComPtr<ID3D11Texture2D> ms;
+      Microsoft::WRL::ComPtr<ID3D11RenderTargetView> msRtv;
+
+      if (msQuality && CheckHr(d3d->CreateTexture2D(&msDesc, nullptr, &ms), "CreateTexture2D (4x Blt source)")
+       && CheckHr(d3d->CreateRenderTargetView(ms.Get(), nullptr, &msRtv), "CreateRenderTargetView (4x Blt source)")) {
+        const float msColor[4] = { 0.25f, 0.5f, 0.75f, 1.0f };
+        ctx->ClearRenderTargetView(msRtv.Get(), msColor);
+
+        blt.Source          = ms.Get();
+        blt.DestinationRect = { 0, 0, 32, 32 };
+        blt.Flags           = BC250_DXVK_BLT_RESOLVE;
+
+        if (CheckHr(engine->Blt(&blt), "Blt resolving a 4x source")) {
+          Check(similar(readAt(staging.Get(), rt.Get(), 10u, 10u), 64, 128, 191, 2)
+             && similar(readAt(staging.Get(), rt.Get(), 50u, 50u), 0, 0, 0, 0),
+            "resolving Blt writes the cleared colour into its rectangle");
+        }
+      } else {
+        Check(false, "4x R8G8B8A8_UNORM render target for the resolving Blt");
+      }
+
+      // One format on both sides takes vkCmdBlitImage rather than a render pass; the second rotation
+      // texture holds the blue storage
+      if (rotReady) {
+        blt.Source          = rotTex[1].Get();
+        blt.DestinationRect = { 0, 0, 32, 32 };
+        blt.Flags           = BC250_DXVK_BLT_STRETCH;
+
+        if (CheckHr(engine->Blt(&blt), "Blt between two shell images of one format, scaled down")) {
+          Check(similar(readAt(staging.Get(), rt.Get(), 10u, 10u), 0, 0, 255, 1)
+             && similar(readAt(staging.Get(), rt.Get(), 50u, 50u), 0, 0, 0, 0),
+            "same-format Blt fills its rectangle from the other shell image");
+        }
+      }
+
+      BC250_DXVK_BLT bad = blt;
+      bad.Source   = src.Get();
+      bad.Flags    = 0u;
+      bad.Rotation = DXGI_MODE_ROTATION_ROTATE90;
+      Check(engine->Blt(&bad) == E_NOTIMPL, "Blt reports 90 degree rotation as not implemented");
+
+      bad = blt;
+      bad.Source          = src.Get();
+      bad.DestinationRect = { 0, 0, LONG(W) + 1, LONG(H) };
+      Check(engine->Blt(&bad) == E_INVALIDARG, "Blt rejects a rectangle outside the destination");
+
+      bad = blt;
+      bad.Source = srcStaging.Get();
+      Check(engine->Blt(&bad) == E_INVALIDARG, "Blt rejects a staging source");
+
+      bad = blt;
+      bad.Source = rt.Get();
+      Check(engine->Blt(&bad) == E_INVALIDARG, "Blt rejects the destination subresource as its own source");
+    }
+
+    CheckHr(engine->WaitForResourceIdle(rt.Get()), "WaitForResourceIdle after the Blt checks");
   }
 
   // ---- threads and submissions ----

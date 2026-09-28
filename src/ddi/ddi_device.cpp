@@ -544,14 +544,190 @@ namespace dxvk::ddi {
   }
 
 
+  // A DXGI Blt surface: one subresource of a GPU-only 2D texture
+  static D3D11CommonTexture* GetBltTexture(
+          ID3D11Resource*                   pResource,
+          UINT                              Subresource) {
+    D3D11_RESOURCE_DIMENSION dimension = D3D11_RESOURCE_DIMENSION_UNKNOWN;
+    pResource->GetType(&dimension);
+
+    if (dimension != D3D11_RESOURCE_DIMENSION_TEXTURE2D)
+      return nullptr;
+
+    D3D11CommonTexture* texture = GetCommonTexture(pResource);
+
+    if (!texture || texture->GetMapMode() != D3D11_COMMON_TEXTURE_MAP_MODE_NONE
+     || Subresource >= texture->CountSubresources())
+      return nullptr;
+
+    return texture;
+  }
+
+
+  static Rc<DxvkImageView> CreateBltView(
+    const Rc<DxvkImage>&                    Image,
+    const VkImageSubresource&               Subresource,
+          VkFormat                          Format,
+          VkImageUsageFlagBits              Usage) {
+    DxvkImageViewKey key;
+    key.viewType   = VK_IMAGE_VIEW_TYPE_2D;
+    key.usage      = Usage;
+    key.format     = Format;
+    key.aspects    = VK_IMAGE_ASPECT_COLOR_BIT;
+    key.mipIndex   = Subresource.mipLevel;
+    key.mipCount   = 1u;
+    key.layerIndex = Subresource.arrayLayer;
+    key.layerCount = 1u;
+    return Image->createView(key);
+  }
+
+
+  static HRESULT BltNotImplemented(const char* What) {
+    Logger::err(str::format("bc250dxvk: Blt: ", What, " not implemented"));
+    return E_NOTIMPL;
+  }
+
+
   HRESULT STDMETHODCALLTYPE Bc250DxvkDevice::Blt(
     const BC250_DXVK_BLT*                   pBlt) {
-    static bool s_errorShown = false;
+    if (!pBlt || !pBlt->Destination || !pBlt->Source)
+      return E_INVALIDARG;
 
-    if (!std::exchange(s_errorShown, true))
-      Logger::err("bc250dxvk: Blt not implemented");
+    D3D11CommonTexture* dstTexture = GetBltTexture(pBlt->Destination, pBlt->DestinationSubresource);
+    D3D11CommonTexture* srcTexture = GetBltTexture(pBlt->Source, pBlt->SourceSubresource);
 
-    return E_NOTIMPL;
+    if (!dstTexture || !srcTexture)
+      return E_INVALIDARG;
+
+    Rc<DxvkImage> dst = dstTexture->GetImage();
+    Rc<DxvkImage> src = srcTexture->GetImage();
+
+    VkImageSubresource dstSubresource = dstTexture->GetSubresourceFromIndex(
+      VK_IMAGE_ASPECT_COLOR_BIT, pBlt->DestinationSubresource);
+    VkImageSubresource srcSubresource = srcTexture->GetSubresourceFromIndex(
+      VK_IMAGE_ASPECT_COLOR_BIT, pBlt->SourceSubresource);
+
+    if (dst == src && dstSubresource.mipLevel == srcSubresource.mipLevel
+     && dstSubresource.arrayLayer == srcSubresource.arrayLayer)
+      return E_INVALIDARG;
+
+    // The runtime asks for this only from drivers that scan out multisampled primaries
+    if (dst->info().sampleCount != VK_SAMPLE_COUNT_1_BIT)
+      return BltNotImplemented("multisampled destination");
+
+    // The source is always the whole subresource; the runtime cannot express a source rectangle
+    VkExtent3D dstExtent = dst->mipLevelExtent(dstSubresource.mipLevel);
+    VkExtent3D srcExtent = src->mipLevelExtent(srcSubresource.mipLevel);
+    const RECT& rect = pBlt->DestinationRect;
+
+    if (rect.left < 0 || rect.top < 0 || rect.left >= rect.right || rect.top >= rect.bottom
+     || UINT(rect.right) > dstExtent.width || UINT(rect.bottom) > dstExtent.height)
+      return E_INVALIDARG;
+
+    std::array<VkOffset3D, 2> dstOffsets = {{
+      { rect.left,  rect.top,    0 },
+      { rect.right, rect.bottom, 1 } }};
+
+    std::array<VkOffset3D, 2> srcOffsets = {{
+      { 0, 0, 0 },
+      { int32_t(srcExtent.width), int32_t(srcExtent.height), 1 } }};
+
+    // DXGI_DDI_MODE_ROTATION has the values of DXGI_MODE_ROTATION. Rotating by 180 degrees mirrors both
+    // axes, which a blit expresses with swapped corners; 90 and 270 degrees would need a transposing pass.
+    switch (pBlt->Rotation) {
+      case DXGI_MODE_ROTATION_UNSPECIFIED:
+      case DXGI_MODE_ROTATION_IDENTITY:
+        break;
+
+      case DXGI_MODE_ROTATION_ROTATE180:
+        std::swap(dstOffsets[0].x, dstOffsets[1].x);
+        std::swap(dstOffsets[0].y, dstOffsets[1].y);
+        break;
+
+      case DXGI_MODE_ROTATION_ROTATE90:
+      case DXGI_MODE_ROTATION_ROTATE270:
+        return BltNotImplemented("90 or 270 degree rotation");
+
+      default:
+        return E_INVALIDARG;
+    }
+
+    VkFormat dstFormat = dst->info().format;
+    VkFormat srcFormat = src->info().format;
+
+    const DxvkFormatInfo* dstInfo = lookupFormatInfo(dstFormat);
+    const DxvkFormatInfo* srcInfo = lookupFormatInfo(srcFormat);
+
+    if (!dstInfo || !srcInfo || dstInfo->aspectMask != VK_IMAGE_ASPECT_COLOR_BIT
+     || srcInfo->aspectMask != VK_IMAGE_ASPECT_COLOR_BIT)
+      return E_INVALIDARG;
+
+    bool srcIsInteger = srcInfo->flags.any(DxvkFormatFlag::SampledUInt, DxvkFormatFlag::SampledSInt);
+    bool dstIsInteger = dstInfo->flags.any(DxvkFormatFlag::SampledUInt, DxvkFormatFlag::SampledSInt);
+
+    if ((srcIsInteger || dstIsInteger) && srcFormat != dstFormat)
+      return E_INVALIDARG;
+
+    // Between an sRGB and a UNORM surface, encoded values move unchanged, as in a copy between the two. Both
+    // sides get views of the same encoding: plain if both images allow it, otherwise sRGB.
+    bool srcIsSrgb = srcInfo->flags.test(DxvkFormatFlag::ColorSpaceSrgb);
+    bool dstIsSrgb = dstInfo->flags.test(DxvkFormatFlag::ColorSpaceSrgb);
+
+    if (srcIsSrgb != dstIsSrgb) {
+      auto srcPair = vk::getSrgbFormatPair(srcFormat);
+      auto dstPair = vk::getSrgbFormatPair(dstFormat);
+
+      if (src->isViewCompatible(srcPair.first) && dst->isViewCompatible(dstPair.first)) {
+        srcFormat = srcPair.first;
+        dstFormat = dstPair.first;
+      } else if (src->isViewCompatible(srcPair.second) && dst->isViewCompatible(dstPair.second)) {
+        srcFormat = srcPair.second;
+        dstFormat = dstPair.second;
+      } else {
+        Logger::err(str::format("bc250dxvk: Blt: no common encoding for ", srcFormat, " and ", dstFormat));
+        return E_INVALIDARG;
+      }
+    }
+
+    auto getFeatures = [this] (VkFormat Format, VkImageTiling Tiling) {
+      DxvkFormatFeatures features = m_dxvkDevice->getFormatFeatures(Format);
+      return Tiling == VK_IMAGE_TILING_OPTIMAL ? features.optimal : features.linear;
+    };
+
+    VkFormatFeatureFlags2 srcFeatures = getFeatures(srcFormat, src->info().tiling);
+    VkFormatFeatureFlags2 dstFeatures = getFeatures(dstFormat, dst->info().tiling);
+
+    bool isStretch = uint32_t(rect.right - rect.left) != srcExtent.width
+                  || uint32_t(rect.bottom - rect.top) != srcExtent.height;
+
+    VkFilter filter = isStretch && !srcIsInteger && (srcFeatures & VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_LINEAR_BIT)
+      ? VK_FILTER_LINEAR
+      : VK_FILTER_NEAREST;
+
+    // Mirrors the choice in DxvkContext::blitImageView. Its render pass path draws into the destination and
+    // samples the source; DXVK adds missing usage by moving an image to new memory, which an image on a
+    // runtime allocation cannot do, and the blit would then be skipped with only a log line.
+    bool needsRenderPass = src->info().sampleCount != VK_SAMPLE_COUNT_1_BIT
+      || srcFormat != src->info().format || dstFormat != dst->info().format
+      || !(srcFeatures & VK_FORMAT_FEATURE_2_BLIT_SRC_BIT) || !(dstFeatures & VK_FORMAT_FEATURE_2_BLIT_DST_BIT);
+
+    if (needsRenderPass) {
+      if ((!(dst->info().usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) && !dst->canRelocate())
+       || (!(src->info().usage & VK_IMAGE_USAGE_SAMPLED_BIT) && !src->canRelocate())
+       || !(dstFeatures & VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT)
+       || !(srcFeatures & VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT))
+        return E_INVALIDARG;
+    }
+
+    m_context->BlitImageView(
+      CreateBltView(dst, dstSubresource, dstFormat, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT), dstOffsets.data(),
+      CreateBltView(src, srcSubresource, srcFormat, VK_IMAGE_USAGE_SAMPLED_BIT), srcOffsets.data(), filter);
+
+    // A presenting Blt writes the surface the compositor reads: submit it, as for a present (E3)
+    if (pBlt->Flags & BC250_DXVK_BLT_PRESENT)
+      m_context->EndFrameAndFlush();
+
+    return CheckDeviceStatus();
   }
 
 

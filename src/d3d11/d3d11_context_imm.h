@@ -147,6 +147,25 @@ namespace dxvk {
       const Rc<DxvkImage>*              pImages,
             size_t                      Count);
 
+    /**
+     * \brief Blits one image view onto another
+     *
+     * Used by a user-mode driver engine (bc250dxvk) for DXGI Blt:
+     * DxvkContext::blitImageView stretches, converts formats,
+     * resolves and mirrors as the offsets and views require.
+     * \param [in] DstView Destination view
+     * \param [in] pDstOffsets Two destination corners
+     * \param [in] SrcView Source view
+     * \param [in] pSrcOffsets Two source corners
+     * \param [in] Filter Filter for stretching
+     */
+    void BlitImageView(
+      const Rc<DxvkImageView>&          DstView,
+      const VkOffset3D*                 pDstOffsets,
+      const Rc<DxvkImageView>&          SrcView,
+      const VkOffset3D*                 pSrcOffsets,
+            VkFilter                    Filter);
+
   private:
 
     DxvkCsThread            m_csThread;

@@ -273,7 +273,11 @@ IBc250DxvkDevice : public IUnknown {
      * identical properties, otherwise E_INVALIDARG and nothing moves. */
     virtual HRESULT STDMETHODCALLTYPE RotateResourceIdentities(ID3D11Resource *const *resources, UINT count) = 0;
 
-    /* DXGI Blt. */
+    /* DXGI Blt: the whole source subresource onto DestinationRect, stretching, converting and resolving as the
+     * two resources require; the flags are not needed for that. Between an sRGB and a UNORM format the encoded
+     * values move unchanged. ROTATE180 mirrors both axes; ROTATE90/270 and multisampled destinations return
+     * E_NOTIMPL. Both resources must be GPU-only 2D textures, otherwise E_INVALIDARG. With
+     * BC250_DXVK_BLT_PRESENT the engine submits before returning, as SubmitForPresent does (E3). */
     virtual HRESULT STDMETHODCALLTYPE Blt(const BC250_DXVK_BLT *blt) = 0;
 };
 

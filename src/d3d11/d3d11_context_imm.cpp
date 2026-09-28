@@ -922,6 +922,26 @@ namespace dxvk {
   }
 
 
+  void D3D11ImmediateContext::BlitImageView(
+    const Rc<DxvkImageView>&                DstView,
+    const VkOffset3D*                       pDstOffsets,
+    const Rc<DxvkImageView>&                SrcView,
+    const VkOffset3D*                       pSrcOffsets,
+          VkFilter                          Filter) {
+    D3D10DeviceLock lock = LockContext();
+
+    EmitCs([
+      cDstView    = DstView,
+      cDstOffsets = std::array<VkOffset3D, 2> { pDstOffsets[0], pDstOffsets[1] },
+      cSrcView    = SrcView,
+      cSrcOffsets = std::array<VkOffset3D, 2> { pSrcOffsets[0], pSrcOffsets[1] },
+      cFilter     = Filter
+    ] (DxvkContext* ctx) {
+      ctx->blitImageView(cDstView, cDstOffsets.data(), cSrcView, cSrcOffsets.data(), cFilter);
+    });
+  }
+
+
   bool D3D11ImmediateContext::WaitForResource(
     const DxvkPagedResource&                Resource,
           uint64_t                          SequenceNumber,
