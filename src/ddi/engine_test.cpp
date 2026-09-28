@@ -1309,6 +1309,13 @@ int main(int argc, char** argv) {
 
   std::set<DWORD> threadsBefore = ProcessThreads();
 
+  // Arms the engine's out-of-memory injection (test switch outside the ABI) for the ABI 1.4 cases. It costs an
+  // environment lookup per allocation, so benchmark runs leave it off.
+  const bool injectOutOfMemory = !bench && !benchTiling;
+
+  if (injectOutOfMemory)
+    SetEnvironmentVariableA("BC250DXVK_TEST_OOM", "1");
+
   IBc250DxvkDevice* engine = nullptr;
   double tCreate = nowMs();
 
@@ -1431,6 +1438,146 @@ int main(int argc, char** argv) {
         && engine3->CheckFeatureSupportAtLevel(max, D3D11_FEATURE_DOUBLES, nullptr, sizeof(doubles)) == E_INVALIDARG
         && engine3->CheckFeatureSupportAtLevel(max, D3D11_FEATURE_DOUBLES, &options, sizeof(options)) == E_INVALIDARG,
         "CheckFeatureSupportAtLevel rejects levels out of range, format queries, NULL data and a wrong size");
+    }
+  }
+
+  // ---- ABI 1.4: out of memory, deferred errors, trim ----
+  {
+    Microsoft::WRL::ComPtr<IBc250DxvkDevice4> engine4;
+
+    if (CheckHr(engine->QueryInterface(IID_PPV_ARGS(&engine4)), "QueryInterface IBc250DxvkDevice4")) {
+      Check(engine4->TakeDeferredError() == S_OK, "TakeDeferredError: nothing recorded after CreateDevice");
+
+      // 1 MiB each: above the local allocation cache and twice the context's staging buffer, so every call
+      // below reaches the allocator.
+      D3D11_BUFFER_DESC dynDesc = { 1u << 20, D3D11_USAGE_DYNAMIC, D3D11_BIND_VERTEX_BUFFER, D3D11_CPU_ACCESS_WRITE };
+      D3D11_BUFFER_DESC defDesc = { 1u << 20, D3D11_USAGE_DEFAULT, D3D11_BIND_VERTEX_BUFFER };
+      Microsoft::WRL::ComPtr<ID3D11Buffer> dyn, def;
+      CheckHr(d3d->CreateBuffer(&dynDesc, nullptr, &dyn), "CreateBuffer (1 MiB dynamic)");
+      CheckHr(d3d->CreateBuffer(&defDesc, nullptr, &def), "CreateBuffer (1 MiB default)");
+
+      std::vector<uint8_t> upload(1u << 20, 0x5au);
+
+      if (!injectOutOfMemory) {
+        std::printf("SKIP  injected out of memory (benchmark run)\n");
+      } else if (dyn && def) {
+        SetEnvironmentVariableA("BC250DXVK_TEST_OOM_NOW", "1");
+
+        Microsoft::WRL::ComPtr<ID3D11Buffer> noBuffer;
+        HRESULT hrBuffer = d3d->CreateBuffer(&defDesc, nullptr, &noBuffer);
+
+        D3D11_TEXTURE2D_DESC texDesc = { 256u, 256u, 1u, 1u, DXGI_FORMAT_R8G8B8A8_UNORM, { 1u, 0u },
+          D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE };
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> noTexture;
+        HRESULT hrTexture = d3d->CreateTexture2D(&texDesc, nullptr, &noTexture);
+
+        D3D11_MAPPED_SUBRESOURCE mapped = { };
+        mapped.pData = upload.data();
+        HRESULT hrMap = ctx->Map(dyn.Get(), 0u, D3D11_MAP_WRITE_DISCARD, 0u, &mapped);
+
+        ctx->UpdateSubresource(def.Get(), 0u, nullptr, upload.data(), 0u, 0u);
+
+        SetEnvironmentVariableA("BC250DXVK_TEST_OOM_NOW", nullptr);
+
+        Check(hrBuffer == E_OUTOFMEMORY && !noBuffer, "out of memory: CreateBuffer returns E_OUTOFMEMORY, no buffer");
+        Check(hrTexture == E_OUTOFMEMORY && !noTexture,
+          "out of memory: CreateTexture2D returns E_OUTOFMEMORY, no texture");
+        Check(hrMap == E_OUTOFMEMORY && !mapped.pData,
+          "out of memory: Map(WRITE_DISCARD) returns E_OUTOFMEMORY with pData NULL");
+        Check(engine4->TakeDeferredError() == E_OUTOFMEMORY,
+          "out of memory: UpdateSubresource records E_OUTOFMEMORY for TakeDeferredError");
+        Check(engine4->TakeDeferredError() == S_OK, "TakeDeferredError clears what it returned");
+
+        // Memory is back: the same calls succeed and the device lives
+        HRESULT hrRemap = ctx->Map(dyn.Get(), 0u, D3D11_MAP_WRITE_DISCARD, 0u, &mapped);
+
+        if (SUCCEEDED(hrRemap))
+          ctx->Unmap(dyn.Get(), 0u);
+
+        ctx->UpdateSubresource(def.Get(), 0u, nullptr, upload.data(), 0u, 0u);
+        ctx->Flush();
+
+        Check(hrRemap == S_OK && engine4->TakeDeferredError() == S_OK && d3d->GetDeviceRemovedReason() == S_OK,
+          "after out of memory: Map and UpdateSubresource succeed, device not removed");
+      }
+
+      // TrimMemory returns released memory to the driver. Usage as the driver reports it for the process
+      // (VK_EXT_memory_budget) counts Vulkan memory blocks, which is what a trim can change. The query needs
+      // the physical device to support the extension, not the device to enable it.
+      bool haveBudget = false;
+      auto enumerateExtensions = reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(
+        vk.getInstanceProcAddr(instance, "vkEnumerateDeviceExtensionProperties"));
+
+      if (enumerateExtensions) {
+        uint32_t extCount = 0u;
+        enumerateExtensions(physDev, nullptr, &extCount, nullptr);
+        std::vector<VkExtensionProperties> exts(extCount);
+        enumerateExtensions(physDev, nullptr, &extCount, exts.data());
+
+        for (const auto& e : exts)
+          haveBudget |= !std::strcmp(e.extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+      }
+
+      auto getMemoryProperties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties2>(
+        vk.getInstanceProcAddr(instance, "vkGetPhysicalDeviceMemoryProperties2"));
+
+      auto usage = [&] {
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT budget = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT };
+        VkPhysicalDeviceMemoryProperties2 props = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &budget };
+        getMemoryProperties2(physDev, &props);
+
+        VkDeviceSize sum = 0u;
+
+        for (uint32_t i = 0u; i < props.memoryProperties.memoryHeapCount; i++)
+          sum += budget.heapUsage[i];
+
+        return sum;
+      };
+
+      constexpr UINT TrimBuffers = 256u;
+      constexpr VkDeviceSize MiB = VkDeviceSize(1u) << 20;
+
+      if (!haveBudget || !getMemoryProperties2) {
+        std::printf("SKIP  TrimMemory measurement: VK_EXT_memory_budget not supported\n");
+        Check(engine4->TrimMemory() == S_OK, "TrimMemory");
+      } else {
+        VkDeviceSize before = usage();
+        std::vector<Microsoft::WRL::ComPtr<ID3D11Buffer>> buffers(TrimBuffers);
+        bool created = true;
+
+        for (auto& b : buffers)
+          created &= SUCCEEDED(d3d->CreateBuffer(&defDesc, nullptr, &b));
+
+        ctx->Flush();
+        VkDeviceSize allocated = usage();
+
+        buffers.clear();
+        ctx->Flush();
+        VkDeviceSize released = usage();
+
+        double t0 = nowMs();
+        HRESULT hrTrim = engine4->TrimMemory();
+        double trimMs = nowMs() - t0;
+        VkDeviceSize trimmed = usage();
+
+        std::printf("      heap usage MiB: before %llu, %u x 1 MiB buffers %llu, released %llu, trimmed %llu (%.1f ms)\n",
+          (unsigned long long)(before / MiB), TrimBuffers, (unsigned long long)(allocated / MiB),
+          (unsigned long long)(released / MiB), (unsigned long long)(trimmed / MiB), trimMs);
+
+        // The engine's own count of Vulkan memory it holds, from its info line
+        for (const auto& line : shell.lines) {
+          if (line.find("TrimMemory: device memory") != std::string::npos)
+            std::printf("      %s\n", line.c_str());
+        }
+
+        Check(created && allocated >= before + (TrimBuffers / 2u) * MiB,
+          "TrimMemory setup: 256 MiB of default buffers show in the driver's heap usage");
+        Check(hrTrim == S_OK && trimmed + (TrimBuffers * 3u / 4u) * MiB <= allocated,
+          "TrimMemory gives at least 3/4 of the released buffers' memory back to the driver");
+      }
+
+      Check(engine4->TakeDeferredError() == S_OK && d3d->GetDeviceRemovedReason() == S_OK,
+        "after TrimMemory: no deferred error, device not removed");
     }
   }
 
