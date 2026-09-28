@@ -1,6 +1,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <mutex>
 #include <queue>
 #include <unordered_map>
@@ -100,6 +101,20 @@ namespace dxvk {
             DxvkPipelinePriority            priority);
 
     /**
+     * \brief Compiles deferred optimized pipelines
+     *
+     * With inline execution, optimized pipelines are not
+     * compiled on the thread that draws. They are queued
+     * until this runs them on the calling thread. Starts
+     * compiles until the budget is used up, so a single
+     * compile may exceed it.
+     * \param [in] budget Time budget
+     * \returns Number of pipelines still queued
+     */
+    size_t compileDeferred(
+            std::chrono::microseconds       budget);
+
+    /**
      * \brief Stops all worker threads
      *
      * Stops threads and waits for their current work
@@ -137,6 +152,7 @@ namespace dxvk {
 
     dxvk::mutex                       m_lock;
     std::array<PipelineBucket, 3>     m_buckets;
+    std::queue<PipelineEntry>         m_deferred;
 
     bool                              m_workersRunning = false;
     std::vector<dxvk::thread>         m_workers;
@@ -274,6 +290,17 @@ namespace dxvk {
      */
     DxvkPipelineWorkerStats getWorkerStats() const {
       return m_workers.getStats();
+    }
+
+    /**
+     * \brief Compiles deferred optimized pipelines
+     *
+     * See \ref DxvkPipelineWorkers::compileDeferred.
+     * \param [in] budget Time budget
+     * \returns Number of pipelines still queued
+     */
+    size_t compileDeferredPipelines(std::chrono::microseconds budget) {
+      return m_workers.compileDeferred(budget);
     }
 
     /**

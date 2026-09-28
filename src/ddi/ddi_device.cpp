@@ -528,7 +528,7 @@ namespace dxvk::ddi {
   HRESULT STDMETHODCALLTYPE Bc250DxvkDevice::SubmitForPresent(
           ID3D11Resource*                   pSource,
           UINT                              Subresource) {
-    m_context->EndFrameAndFlush();
+    SubmitFrame();
     return CheckDeviceStatus();
   }
 
@@ -762,7 +762,7 @@ namespace dxvk::ddi {
 
     // A presenting Blt writes the surface the compositor reads: submit it, as for a present (E3)
     if (pBlt->Flags & BC250_DXVK_BLT_PRESENT)
-      m_context->EndFrameAndFlush();
+      SubmitFrame();
 
     return CheckDeviceStatus();
   }
@@ -770,6 +770,18 @@ namespace dxvk::ddi {
 
   HRESULT Bc250DxvkDevice::CheckDeviceStatus() const {
     return m_device->GetDeviceRemovedReason();
+  }
+
+
+  void Bc250DxvkDevice::SubmitFrame() {
+    m_context->EndFrameAndFlush();
+
+    // Inline execution defers optimized pipelines to here (DxvkPipelineWorkers::compileDeferred): the
+    // frame is already on the GPU, and the drawing thread did not pay for them.
+    int32_t budget = m_dxvkDevice->config().inlinePipelineBudget;
+
+    if (budget > 0)
+      m_dxvkDevice->compileDeferredPipelines(std::chrono::microseconds(budget));
   }
 
 

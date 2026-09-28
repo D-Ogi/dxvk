@@ -273,7 +273,10 @@ IBc250DxvkDevice : public IUnknown {
     virtual HRESULT STDMETHODCALLTYPE IsResourceBusy(ID3D11Resource *resource, UINT subresource) = 0;
 
     /* DXGI PresentDXGI/Present1, before the shell's present ordering and pfnPresentCb: ends the engine frame
-     * and submits everything recorded so far (E3). Does not wait for the GPU. */
+     * and submits everything recorded so far (E3). Does not wait for the GPU. After the submission it compiles
+     * optimized pipelines that draws deferred (E2 keeps them off the drawing thread; fast-linked pipelines serve
+     * until then), starting compiles for up to dxvk.inlinePipelineBudget microseconds (default 2000, 0 never
+     * compiles them). */
     virtual HRESULT STDMETHODCALLTYPE SubmitForPresent(ID3D11Resource *source, UINT subresource) = 0;
 
     /* DXGI RotateResourceIdentities: resource i takes the storage of resource i + 1, the last one that of the
@@ -287,7 +290,8 @@ IBc250DxvkDevice : public IUnknown {
      * two resources require; the flags are not needed for that. Between an sRGB and a UNORM format the encoded
      * values move unchanged. ROTATE180 mirrors both axes; ROTATE90/270 and multisampled destinations return
      * E_NOTIMPL. Both resources must be GPU-only 2D textures, otherwise E_INVALIDARG. With
-     * BC250_DXVK_BLT_PRESENT the engine submits before returning, as SubmitForPresent does (E3). */
+     * BC250_DXVK_BLT_PRESENT the engine submits before returning and compiles deferred pipelines, as
+     * SubmitForPresent does (E3). */
     virtual HRESULT STDMETHODCALLTYPE Blt(const BC250_DXVK_BLT *blt) = 0;
 };
 

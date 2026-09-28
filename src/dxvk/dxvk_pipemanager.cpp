@@ -42,11 +42,17 @@ namespace dxvk {
     const DxvkGraphicsPipelineStateInfo&  state,
           DxvkPipelinePriority            priority) {
     if (m_device->isInlineExecution()) {
-      m_tasksTotal += 1;
+      // The thread that draws would compile the optimized variant right after fast-linking the
+      // base pipeline and pay for both. Queue it for compileDeferred; the base pipeline serves
+      // until then. Without a budget, only base pipelines are used.
+      if (m_device->config().inlinePipelineBudget <= 0)
+        return;
+
+      std::unique_lock lock(m_lock);
       pipeline->acquirePipeline();
-      pipeline->compilePipeline(state);
-      pipeline->releasePipeline();
-      m_tasksCompleted += 1;
+      m_tasksTotal += 1;
+
+      m_deferred.emplace(pipeline, state);
       return;
     }
 
@@ -61,8 +67,38 @@ namespace dxvk {
   }
 
 
+  size_t DxvkPipelineWorkers::compileDeferred(
+          std::chrono::microseconds       budget) {
+    auto t0 = dxvk::high_resolution_clock::now();
+
+    std::unique_lock lock(m_lock);
+
+    while (!m_deferred.empty()) {
+      if (dxvk::high_resolution_clock::now() - t0 >= budget)
+        break;
+
+      PipelineEntry entry = m_deferred.front();
+      m_deferred.pop();
+
+      lock.unlock();
+
+      entry.graphicsPipeline->compilePipeline(entry.graphicsState);
+      entry.graphicsPipeline->releasePipeline();
+      m_tasksCompleted += 1;
+
+      lock.lock();
+    }
+
+    return m_deferred.size();
+  }
+
+
   void DxvkPipelineWorkers::stopWorkers() {
     { std::unique_lock lock(m_lock);
+
+      // Deferred pipelines may already be gone when this runs
+      // from the destructor, so drop their entries untouched.
+      m_deferred = { };
 
       if (!m_workersRunning)
         return;

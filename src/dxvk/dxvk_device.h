@@ -107,6 +107,18 @@ namespace dxvk {
     bool isInlineExecution() const {
       return m_hostOptions.inlineExecution;
     }
+
+    /**
+     * \brief Compiles deferred optimized pipelines
+     *
+     * With inline execution, optimized pipelines wait for
+     * this call; see \ref DxvkPipelineWorkers::compileDeferred.
+     * \param [in] budget Time budget
+     * \returns Number of pipelines still queued
+     */
+    size_t compileDeferredPipelines(std::chrono::microseconds budget) {
+      return m_objects.pipelineManager().compileDeferredPipelines(budget);
+    }
     
     /**
      * \brief Vulkan device functions

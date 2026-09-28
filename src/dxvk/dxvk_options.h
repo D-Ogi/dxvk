@@ -24,6 +24,11 @@ namespace dxvk {
     /// Enable graphics pipeline library
     Tristate enableGraphicsPipelineLibrary = Tristate::Auto;
 
+    /// With inline execution: time per presented frame for compiling
+    /// deferred optimized pipelines, in microseconds. Zero keeps the
+    /// fast-linked pipelines.
+    int32_t inlinePipelineBudget = 0;
+
     /// Enable descriptor heap
     Tristate enableDescriptorHeap = Tristate::Auto;
 

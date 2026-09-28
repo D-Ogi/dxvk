@@ -130,6 +130,8 @@ namespace dxvk::ddi {
 
     HRESULT CheckDeviceStatus() const;
 
+    void SubmitFrame();
+
     bool CheckImageSupport(
       const VkImageCreateInfo&                info,
             VkImageTiling                     tiling) const;

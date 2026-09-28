@@ -226,8 +226,10 @@ namespace {
     return fn;
   }
 
+  PFN_vkVoidFunction HookVkClassified(const char* name, PFN_vkVoidFunction fn);
+
   PFN_vkVoidFunction VKAPI_CALL HookedGetDeviceProcAddr(VkDevice device, const char* name) {
-    return HookVk(name, g_realGetDeviceProcAddr(device, name));
+    return HookVkClassified(name, g_realGetDeviceProcAddr(device, name));
   }
 
   PFN_vkVoidFunction VKAPI_CALL HookedGetInstanceProcAddr(VkInstance instance, const char* name) {
@@ -244,7 +246,7 @@ namespace {
       return reinterpret_cast<PFN_vkVoidFunction>(&HookedGetDeviceProcAddr);
     }
 
-    return HookVk(name, fn);
+    return HookVkClassified(name, fn);
   }
 
   const VkCallStats& HookStats(const char* name) {
@@ -254,6 +256,52 @@ namespace {
     }
 
     std::abort();
+  }
+
+  // Graphics pipelines by kind: with pipeline libraries, a draw with new state fast-links a base pipeline,
+  // and inline mode must leave the optimized variant for SubmitForPresent.
+  struct PipelineKinds {
+    uint32_t libraries = 0u;   // LIBRARY flag: shader, vertex input and fragment output parts
+    uint32_t fastLinks = 0u;   // linked from libraries without link-time optimization
+    uint32_t optimized = 0u;   // monolithic, or linked with link-time optimization
+  };
+
+  PipelineKinds g_pipelineKinds;
+  PFN_vkCreateGraphicsPipelines g_hookedCreateGraphicsPipelines = nullptr;
+
+  VkResult VKAPI_CALL ClassifyGraphicsPipelines(VkDevice device, VkPipelineCache cache, uint32_t count,
+      const VkGraphicsPipelineCreateInfo* infos, const VkAllocationCallbacks* allocator, VkPipeline* pipelines) {
+    for (uint32_t i = 0u; i < count; i++) {
+      VkPipelineCreateFlags2 flags = infos[i].flags;
+      bool linked = false;
+
+      for (auto s = static_cast<const VkBaseInStructure*>(infos[i].pNext); s; s = s->pNext) {
+        if (s->sType == VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO)
+          flags = reinterpret_cast<const VkPipelineCreateFlags2CreateInfo*>(s)->flags;
+        else if (s->sType == VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR)
+          linked = reinterpret_cast<const VkPipelineLibraryCreateInfoKHR*>(s)->libraryCount != 0u;
+      }
+
+      if (flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR)
+        g_pipelineKinds.libraries++;
+      else if (linked && !(flags & VK_PIPELINE_CREATE_2_LINK_TIME_OPTIMIZATION_BIT_EXT))
+        g_pipelineKinds.fastLinks++;
+      else
+        g_pipelineKinds.optimized++;
+    }
+
+    return g_hookedCreateGraphicsPipelines(device, cache, count, infos, allocator, pipelines);
+  }
+
+  PFN_vkVoidFunction HookVkClassified(const char* name, PFN_vkVoidFunction fn) {
+    fn = HookVk(name, fn);
+
+    if (fn && name && !std::strcmp(name, "vkCreateGraphicsPipelines")) {
+      g_hookedCreateGraphicsPipelines = reinterpret_cast<PFN_vkCreateGraphicsPipelines>(fn);
+      return reinterpret_cast<PFN_vkVoidFunction>(&ClassifyGraphicsPipelines);
+    }
+
+    return fn;
   }
 
   // ---- threads ----------------------------------------------------------------------------------
@@ -810,10 +858,32 @@ int main(int argc, char** argv) {
   ctx->PSSetShader(ps.Get(), nullptr, 0u);
   ctx->RSSetViewports(1u, &viewport);
   ctx->OMSetRenderTargets(1u, rtvs, nullptr);
+
+  // The first draw with this state. Executing it (Flush, E3) fast-links a base pipeline when the device has
+  // pipeline libraries; in inline mode the optimized variant waits for SubmitForPresent.
+  const PipelineKinds kindsBefore = g_pipelineKinds;
   ctx->Draw(3u, 0u);
+  ctx->Flush();
+  const PipelineKinds kindsDraw = g_pipelineKinds;
 
   // Present path: flush and submit (E3), then the idle queries the shell uses for its fences.
   CheckHr(engine->SubmitForPresent(rt.Get(), 0u), "SubmitForPresent");
+  const PipelineKinds kindsPresent = g_pipelineKinds;
+
+  const uint32_t drawLinks        = kindsDraw.fastLinks - kindsBefore.fastLinks;
+  const uint32_t drawOptimized    = kindsDraw.optimized - kindsBefore.optimized;
+  const uint32_t presentOptimized = kindsPresent.optimized - kindsDraw.optimized;
+  std::printf("      first draw: %u fast-linked, %u optimized pipelines; SubmitForPresent: %u optimized\n",
+    drawLinks, drawOptimized, presentOptimized);
+
+  if (drawLinks) {
+    Check(drawOptimized == 0u, "the draw fast-links and compiles no optimized pipeline (inline mode)");
+    Check(presentOptimized >= 1u && presentOptimized <= drawLinks,
+      "SubmitForPresent compiles the deferred optimized pipeline");
+  } else {
+    std::printf("      no fast-linked pipeline on this device: deferred compiles not exercised\n");
+  }
+
   HRESULT busy = engine->IsResourceBusy(rt.Get(), 0u);
   std::printf("      IsResourceBusy after submit: %s\n", busy == S_OK ? "idle" : busy == S_FALSE ? "busy" : "error");
   CheckHr(engine->WaitForResourceIdle(rt.Get()), "WaitForResourceIdle");
@@ -893,6 +963,13 @@ int main(int argc, char** argv) {
     Check(similar(pixel(W - 1u, H - 1u), cr, cg, cb, 1) && pixel(0u, 0u)[0] > 230,
       "last frame has the same clear and triangle");
     ctx->Unmap(staging.Get(), 0u);
+  }
+
+  // The frames reuse the first draw's state, so by now every fast-linked pipeline has its optimized variant,
+  // and the last frame above was drawn with it.
+  if (drawLinks) {
+    Check(g_pipelineKinds.optimized - kindsBefore.optimized == g_pipelineKinds.fastLinks - kindsBefore.fastLinks,
+      "the deferred compiles caught up: one optimized pipeline per fast-linked one");
   }
 
   // ---- RotateResourceIdentities: storage moves, views follow ----
