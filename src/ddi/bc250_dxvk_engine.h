@@ -179,6 +179,11 @@ struct BC250_DXVK_SHADER_DESC {
     BC250_DXVK_SIGNATURE PatchConstant;            /* hull output / domain input; empty otherwise */
     const BC250_DXVK_STREAM_OUTPUT *StreamOutput;  /* CreateGeometryShaderWithStreamOutput only, else NULL */
 };
+/* With StreamOutput, Code may be NULL or a vertex or domain program: the stream output then captures that
+ * stage's output through a pass-through geometry shader built from Output (or Input when Output is empty).
+ * The shader is always an ID3D11GeometryShader. Limitation (upstream DXVK): the pass-through emits one point
+ * per input primitive, so it is exact for point lists only; a line or triangle list streams out the first
+ * vertex of each primitive, and a rasterized stream draws points. */
 
 /* The output of the shell's DDI element-layout translation (driver/umd/dxvk/input-layout-data.h): vertex
  * attributes addressed by input register, bindings compacted without renumbering slots. */

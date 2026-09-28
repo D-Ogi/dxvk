@@ -109,6 +109,18 @@ namespace dxvk::ddi {
 
     *ppShader = nullptr;
 
+    uint32_t programType = GetProgramType(pDesc->Code);
+
+    // Stream output always arrives as a geometry shader request. Without a geometry program the runtime
+    // passes no code or the vertex or domain program's code; DXVK makes a pass-through geometry shader of
+    // either (BuildShaderContainer supplies a program for the first).
+    if (pDesc->StreamOutput) {
+      if (pDesc->Code && programType != 1u && programType != 2u && programType != 4u)
+        return E_INVALIDARG;
+
+      programType = 2u;
+    }
+
     std::vector<uint8_t> container;
     std::vector<D3D11_SO_DECLARATION_ENTRY> soEntries;
     std::vector<std::string> soNames;
@@ -118,19 +130,12 @@ namespace dxvk::ddi {
     if (FAILED(hr))
       return hr;
 
-    // Stream output from a vertex or domain program also arrives as a geometry shader request; the
-    // D3D11 path below expects geometry bytecode for it.
-    if (pDesc->StreamOutput && GetProgramType(pDesc->Code) != 2u) {
-      Logger::err("bc250dxvk: Stream output without a geometry program not implemented");
-      return E_NOTIMPL;
-    }
-
     const void* code = container.data();
     SIZE_T size = container.size();
 
     Com<ID3D11DeviceChild> shader;
 
-    switch (GetProgramType(pDesc->Code)) {
+    switch (programType) {
       case 0u: {
         Com<ID3D11PixelShader> ps;
         hr = m_device->CreatePixelShader(code, size, nullptr, &ps);

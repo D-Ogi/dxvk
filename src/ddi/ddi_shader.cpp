@@ -181,6 +181,10 @@ namespace dxvk::ddi {
   }
 
 
+  // vs_4_0 with a single ret: version token, length token, instruction
+  static const UINT EmptyVertexProgram[] = { 0x00010040u, 3u, 0x0100003eu };
+
+
   uint32_t GetProgramType(const UINT* pCode) {
     return pCode ? (pCode[0] >> 16u) : ~0u;
   }
@@ -191,11 +195,29 @@ namespace dxvk::ddi {
           std::vector<uint8_t>*               pContainer,
           std::vector<D3D11_SO_DECLARATION_ENTRY>* pSoEntries,
           std::vector<std::string>*           pSoNames) {
-    if (!pDesc || !pDesc->Code)
+    if (!pDesc)
       return E_INVALIDARG;
 
-    uint32_t version = pDesc->Code[0];
-    uint32_t tokenCount = pDesc->Code[1];
+    const UINT* pCode = pDesc->Code;
+    BC250_DXVK_SIGNATURE input = pDesc->Input;
+    BC250_DXVK_SIGNATURE output = pDesc->Output;
+
+    // Stream output of the vertex or domain program, with no geometry program, may arrive without code. An
+    // empty vertex program then carries the output signature; DXVK builds a pass-through geometry shader from
+    // that signature, as it does for a vertex or domain program passed as geometry shader code.
+    if (!pCode && pDesc->StreamOutput) {
+      pCode = EmptyVertexProgram;
+      input = { };
+
+      if (!output.NumEntries)
+        output = pDesc->Input;
+    }
+
+    if (!pCode)
+      return E_INVALIDARG;
+
+    uint32_t version = pCode[0];
+    uint32_t tokenCount = pCode[1];
     uint32_t programType = version >> 16u;
     uint32_t major = (version >> 4u) & 0xfu;
 
@@ -208,8 +230,8 @@ namespace dxvk::ddi {
     Signature isgn, osgn, pcsg;
     std::vector<NamedEntry> outputNames;
 
-    if (!BuildSignature(FourCC("ISGN"), pDesc->Input, true, false, &isgn, nullptr)
-     || !BuildSignature(FourCC(hasStreams ? "OSG5" : "OSGN"), pDesc->Output, false, isPixel, &osgn, &outputNames))
+    if (!BuildSignature(FourCC("ISGN"), input, true, false, &isgn, nullptr)
+     || !BuildSignature(FourCC(hasStreams ? "OSG5" : "OSGN"), output, false, isPixel, &osgn, &outputNames))
       return E_INVALIDARG;
 
     bool hasPatchConstants = pDesc->PatchConstant.NumEntries != 0u;
@@ -231,7 +253,7 @@ namespace dxvk::ddi {
     std::memcpy(&code[0], major >= 5u ? "SHEX" : "SHDR", 4u);
     uint32_t codeSize = tokenCount * sizeof(UINT);
     std::memcpy(&code[4], &codeSize, 4u);
-    std::memcpy(&code[8], pDesc->Code, codeSize);
+    std::memcpy(&code[8], pCode, codeSize);
     chunks.push_back(std::move(code));
 
     // Header: magic, hash, version 1, file size, chunk count, chunk offsets

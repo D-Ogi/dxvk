@@ -1041,6 +1041,123 @@ int main(int argc, char** argv) {
     CheckHr(engine->WaitForResourceIdle(rt.Get()), "WaitForResourceIdle after the Blt checks");
   }
 
+  // ---- stream output of the vertex program, without a geometry program ----
+  {
+    UINT posReg = ~0u, colReg = ~0u;
+
+    for (const auto& e : vsDdi.output)
+      (e.SystemValue == 1u ? posReg : colReg) = e.Register;
+
+    // Position xyzw, a one-component hole, then only the colour's y and z: the last entry starts at
+    // component 1 of its register, and the hole must stay unwritten
+    const BC250_DXVK_SO_ENTRY soEntries[] = {
+      { 0u, 0u, posReg, 0xfu },
+      { 0u, 0u, ~0u,    0x1u },
+      { 0u, 0u, colReg, 0x6u },
+    };
+
+    constexpr UINT SoFloats = 7u;
+    const UINT soStride = SoFloats * sizeof(float);
+    const BC250_DXVK_STREAM_OUTPUT soDecl = { soEntries, 3u, &soStride, 1u, D3D11_SO_NO_RASTERIZED_STREAM };
+
+    // What the runtime passes for stream output of the vertex stage: no code, the stage's output signature
+    BC250_DXVK_SHADER_DESC noCodeDesc = { };
+    noCodeDesc.Size         = sizeof(noCodeDesc);
+    noCodeDesc.Input        = { vsDdi.output.data(), UINT(vsDdi.output.size()) };
+    noCodeDesc.Output       = { vsDdi.output.data(), UINT(vsDdi.output.size()) };
+    noCodeDesc.StreamOutput = &soDecl;
+
+    BC250_DXVK_SHADER_DESC vsCodeDesc = MakeDesc(vsDdi);
+    vsCodeDesc.StreamOutput = &soDecl;
+
+    BC250_DXVK_SHADER_DESC psCodeDesc = MakeDesc(psDdi);
+    psCodeDesc.StreamOutput = &soDecl;
+
+    Microsoft::WRL::ComPtr<ID3D11GeometryShader> soNoCode, soVsCode, soPsCode;
+    CheckHr(engine->CreateShader(&noCodeDesc, IID_PPV_ARGS(&soNoCode)), "CreateShader (stream output, no code)");
+    CheckHr(engine->CreateShader(&vsCodeDesc, IID_PPV_ARGS(&soVsCode)), "CreateShader (stream output, VS code)");
+    Check(engine->CreateShader(&psCodeDesc, IID_PPV_ARGS(&soPsCode)) == E_INVALIDARG,
+      "CreateShader rejects stream output with pixel shader code");
+
+    D3D11_BUFFER_DESC soBufDesc = { 3u * soStride, D3D11_USAGE_DEFAULT, D3D11_BIND_STREAM_OUTPUT };
+    D3D11_BUFFER_DESC soReadDesc = { 3u * soStride, D3D11_USAGE_STAGING, 0u, D3D11_CPU_ACCESS_READ };
+    Microsoft::WRL::ComPtr<ID3D11Buffer> soBuf, soRead;
+    bool soReady = soNoCode.Get() && soVsCode.Get()
+      && CheckHr(d3d->CreateBuffer(&soBufDesc, nullptr, &soBuf), "CreateBuffer (stream output target)")
+      && CheckHr(d3d->CreateBuffer(&soReadDesc, nullptr, &soRead), "CreateBuffer (stream output readback)");
+
+    constexpr float Hole = -7.0f;
+
+    // The triangle's three vertices as the VS writes them: position (x, y, 0, 1), colour (r, g, b)
+    auto expected = [&] (UINT v, UINT i) {
+      const float* in = &vertices[5u * v];
+      const float record[SoFloats] = { in[0], in[1], 0.0f, 1.0f, Hole, in[3], in[4] };
+      return record[i];
+    };
+
+    // Draws the three vertices with the given topology into the zero-offset target and reads back all
+    // three records. Returns how many leading records match the vertices; the rest must stay untouched.
+    auto capture = [&] (ID3D11GeometryShader* gs, D3D11_PRIMITIVE_TOPOLOGY topology, const char* what) {
+      std::array<float, 3u * SoFloats> data;
+      data.fill(Hole);
+      ctx->UpdateSubresource(soBuf.Get(), 0u, nullptr, data.data(), 0u, 0u);
+
+      UINT offset = 0u;
+      ID3D11Buffer* targets[] = { soBuf.Get() };
+      ctx->IASetPrimitiveTopology(topology);
+      ctx->SOSetTargets(1u, targets, &offset);
+      ctx->GSSetShader(gs, nullptr, 0u);
+      ctx->Draw(3u, 0u);
+      ctx->GSSetShader(nullptr, nullptr, 0u);
+      ctx->SOSetTargets(0u, nullptr, nullptr);
+      ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+      ctx->CopyResource(soRead.Get(), soBuf.Get());
+
+      D3D11_MAPPED_SUBRESOURCE m = { };
+      data.fill(0.0f);
+
+      if (SUCCEEDED(ctx->Map(soRead.Get(), 0u, D3D11_MAP_READ, 0u, &m))) {
+        std::memcpy(data.data(), m.pData, sizeof(data));
+        ctx->Unmap(soRead.Get(), 0u);
+      }
+
+      UINT written = 0u;
+      bool untouched = true;
+
+      for (UINT v = 0u; v < 3u; v++) {
+        const float* r = &data[v * SoFloats];
+        bool match = true;
+
+        for (UINT i = 0u; i < SoFloats; i++)
+          match = match && r[i] == expected(v, i);
+
+        if (match && written == v)
+          written++;
+
+        std::printf("      %s: record %u = %.1f %.1f %.1f %.1f [%.1f] %.1f %.1f\n", what, v,
+          r[0], r[1], r[2], r[3], r[4], r[5], r[6]);
+      }
+
+      for (UINT i = written * SoFloats; i < data.size(); i++)
+        untouched = untouched && data[i] == Hole;
+
+      return untouched ? written : ~0u;
+    };
+
+    if (soReady) {
+      Check(capture(soNoCode.Get(), D3D11_PRIMITIVE_TOPOLOGY_POINTLIST, "no code") == 3u,
+        "stream output without code captures position, the hole and colour.yz of each point");
+      Check(capture(soVsCode.Get(), D3D11_PRIMITIVE_TOPOLOGY_POINTLIST, "VS code") == 3u,
+        "stream output with the VS code captures the same records");
+
+      // Known limitation, upstream DXVK: the pass-through geometry shader emits one point per input
+      // primitive, so a triangle list yields its first vertex only (D3D11 writes all three). DXVK's own
+      // CreateGeometryShaderWithStreamOutput behaves the same. This check trips when that changes.
+      Check(capture(soNoCode.Get(), D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, "triangle list") == 1u,
+        "known limitation: a triangle list without a geometry program streams out its first vertex only");
+    }
+  }
+
   // ---- threads and submissions ----
   // A start module only ever proves a thread is the engine's: a std::thread starts in ucrtbase.dll, and
   // loaders and layers start their own. The Vulkan call census after teardown is the E2 criterion.
