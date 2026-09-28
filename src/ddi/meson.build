@@ -17,3 +17,11 @@ bc250dxvk_dll = shared_library('bc250dxvk', d3d11_engine_src + ddi_src,
   vs_module_defs      : 'bc250dxvk.def',
   name_prefix         : '',
 )
+
+# Offline positive control: plays the UMD shell against the DLL on any Vulkan 1.3 GPU (engine_test.cpp).
+# It uses only the ABI header, never DXVK internals, so it also checks that the header stands alone.
+executable('bc250dxvk_engine_test', 'engine_test.cpp',
+  dependencies        : [ cpp.find_library('d3dcompiler'), cpp.find_library('psapi') ],
+  include_directories : include_directories('../../include/vulkan/include'),
+  install             : false,
+)
