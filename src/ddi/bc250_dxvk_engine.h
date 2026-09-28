@@ -114,8 +114,13 @@ struct BC250_DXVK_SHELL_SERVICES {
     void *Shell;
     /* E3: Lock(TRUE) before and Lock(FALSE) after each engine vkQueueSubmit/vkQueueWaitIdle, same thread. */
     void (APIENTRY *QueueLock)(void *shell, BOOL lock);
-    /* Engine log lines (DXVK logger), level 1 error, 2 warning, 3 info, 4 debug. The engine writes no log file
-     * when this is set. */
+    /* Engine log lines (DXVK logger), one line per call without prefix or newline; level 1 error, 2 warning,
+     * 3 info, 4 debug, filtered by DXVK_LOG_LEVEL (default info). Called from the start of CreateDevice (so a
+     * failed CreateDevice reports its reason here) until the final Release returns, on the thread of the engine
+     * call that logs, with the engine's log lock held: it must not call the engine. The DXVK logger is per
+     * process: while devices with a Log exist, every line goes to the Log of the oldest of them and no log
+     * file is written. Lines logged with no such device (QueryDeviceRequirements, GetAdapterInfo) go to the
+     * file in DXVK_LOG_PATH, if set, or nowhere. */
     void (APIENTRY *Log)(void *shell, UINT32 level, const char *message);
 };
 

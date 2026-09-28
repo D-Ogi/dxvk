@@ -18,13 +18,39 @@
 
 namespace dxvk::ddi {
 
+  /**
+   * \brief The shell's Log service as the process's DXVK log sink
+   *
+   * Registered from the start of CreateDevice until the device's final release.
+   */
+  class ShellLogSink {
+
+  public:
+
+    ShellLogSink(const BC250_DXVK_SHELL_SERVICES& Services);
+    ~ShellLogSink();
+
+    ShellLogSink             (const ShellLogSink&) = delete;
+    ShellLogSink& operator = (const ShellLogSink&) = delete;
+
+  private:
+
+    void* m_shell;
+    void (APIENTRY *m_log)(void *shell, UINT32 level, const char *message);
+
+    static void Emit(void* context, LogLevel level, const char* line);
+
+  };
+
+
   class Bc250DxvkDevice : public ComObject<IBc250DxvkDevice> {
 
   public:
 
     Bc250DxvkDevice(
             D3D11DXGIDevice*                  pContainer,
-      const BC250_DXVK_SHELL_SERVICES&        Services);
+      const BC250_DXVK_SHELL_SERVICES&        Services,
+            std::unique_ptr<ShellLogSink>&&   LogSink);
 
     ~Bc250DxvkDevice();
 
@@ -97,6 +123,7 @@ namespace dxvk::ddi {
     D3D11ImmediateContext*      m_context = nullptr;
     Rc<DxvkDevice>              m_dxvkDevice;
     BC250_DXVK_SHELL_SERVICES   m_services = { };
+    std::unique_ptr<ShellLogSink> m_logSink;
 
     dxvk::mutex                                   m_viewFormatMutex;
     std::vector<std::unique_ptr<ViewFormatList>>  m_viewFormatLists;

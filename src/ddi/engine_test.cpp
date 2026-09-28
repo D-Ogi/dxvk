@@ -32,6 +32,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <iterator>
 #include <set>
 #include <string>
 #include <vector>
@@ -64,6 +66,18 @@ namespace {
     std::atomic<uint32_t> lockCalls      { 0u };
     std::atomic<uint32_t> foreignCalls   { 0u };
     std::atomic<uint32_t> logLines       { 0u };
+    std::atomic<uint32_t> foreignLogs    { 0u };
+    std::atomic<uint32_t> malformedLogs  { 0u };
+    std::vector<std::string> errors;
+
+    bool HasError(const char* text) const {
+      for (const auto& e : errors) {
+        if (e.find(text) != std::string::npos)
+          return true;
+      }
+
+      return false;
+    }
   };
 
   void APIENTRY QueueLock(void* shell, BOOL lock) {
@@ -80,8 +94,39 @@ namespace {
   }
 
   void APIENTRY Log(void* shell, UINT32 level, const char* message) {
-    static_cast<Shell*>(shell)->logLines++;
+    auto s = static_cast<Shell*>(shell);
+    s->logLines++;
+
+    if (GetCurrentThreadId() != s->mainThread)
+      s->foreignLogs++;
+
+    if (level < 1u || level > 4u || std::strchr(message, '\n'))
+      s->malformedLogs++;
+
+    // Called with the engine's log lock held, so no other Log call runs concurrently
+    if (level == 1u)
+      s->errors.push_back(message);
+
     std::printf("engine[%u]: %s\n", level, message);
+  }
+
+  // The engine's log file for this executable, as DXVK names it: <DXVK_LOG_PATH>/<exe base name>_bc250dxvk.log
+  std::string EngineLogFile() {
+    char dir[MAX_PATH] = { };
+    char exe[MAX_PATH] = { };
+
+    if (!GetEnvironmentVariableA("DXVK_LOG_PATH", dir, MAX_PATH) || !GetModuleFileNameA(nullptr, exe, MAX_PATH))
+      return std::string();
+
+    std::string name = exe;
+    name = name.substr(name.find_last_of("\\/") + 1u);
+    name = name.substr(0u, name.rfind('.'));
+    return std::string(dir) + "/" + name + "_bc250dxvk.log";
+  }
+
+  std::string ReadFileText(const std::string& path) {
+    std::ifstream file(path, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
   }
 
   // ---- Vulkan call census -------------------------------------------------------------------------
@@ -555,12 +600,38 @@ int main(int argc, char** argv) {
   createInfo.FeatureLevel = adapterInfo.MaxFeatureLevel;
   createInfo.Threading    = BC250_DXVK_THREADING_INLINE;
 
+  // A failed CreateDevice reports its reason through Log and leaves no sink behind: the real device's
+  // lines below must then reach its own shell, not this one.
+  {
+    Shell probe;
+    probe.mainThread = GetCurrentThreadId();
+
+    BC250_DXVK_SHELL_SERVICES probeServices = { sizeof(probeServices) };
+    probeServices.Shell = &probe;
+    probeServices.Log   = &Log;
+
+    BC250_DXVK_VULKAN_INSTANCE outside = vkInstance;
+    outside.PhysicalDevice = reinterpret_cast<VkPhysicalDevice>(uintptr_t(0x10u));
+
+    BC250_DXVK_DEVICE_CREATE_INFO probeInfo = createInfo;
+    probeInfo.Instance = &outside;
+    probeInfo.Services = &probeServices;
+
+    IBc250DxvkDevice* none = nullptr;
+    Check(funcs.CreateDevice(&probeInfo, &none) == E_INVALIDARG && !none,
+      "CreateDevice rejects a physical device outside the instance");
+    Check(probe.HasError("Physical device not in the imported instance"),
+      "the failed CreateDevice reports its reason through Log, level 1");
+  }
+
   std::set<DWORD> threadsBefore = ProcessThreads();
 
   IBc250DxvkDevice* engine = nullptr;
 
   if (!CheckHr(funcs.CreateDevice(&createInfo, &engine), "CreateDevice"))
     return 1;
+
+  Check(shell.logLines.load() > 0u, "CreateDevice's own lines (device import) reach the shell's Log");
 
   Microsoft::WRL::ComPtr<ID3D11Device> d3d;
   Microsoft::WRL::ComPtr<ID3D11DeviceContext> ctx;
@@ -1227,6 +1298,31 @@ int main(int argc, char** argv) {
   Check(submits > 0u && HookStats("vkAllocateMemory").calls > 0u && HookStats("vkCreateGraphicsPipelines").calls > 0u,
     "the census sees the engine's submissions, allocations and pipelines (control for the hooks)");
   Check(foreignCalls == 0u, "every hooked Vulkan call of the engine ran on the calling thread (E2)");
+
+  // ---- Log service ----
+  uint32_t linesAtRelease = shell.logLines.load();
+  std::printf("      %u log lines, %zu at level 1\n", linesAtRelease, shell.errors.size());
+  Check(shell.foreignLogs.load() == 0u, "every Log call came from the calling thread (E2)");
+  Check(shell.malformedLogs.load() == 0u, "every Log line has level 1-4 and no newline");
+  Check(shell.HasError("90 or 270"), "the Blt ROTATE90 rejection arrives through Log, level 1");
+
+  // A device-less call logs its instance lines again; the released device's sink must not see them
+  BC250_DXVK_ADAPTER_INFO adapterInfoAfter = { sizeof(adapterInfoAfter) };
+  CheckHr(funcs.GetAdapterInfo(&vkInstance, &adapterInfoAfter), "GetAdapterInfo after the final Release");
+  Check(shell.logLines.load() == linesAtRelease, "no Log call after the final Release");
+
+  // With a sink, nothing from the device's lifetime goes to the file; device-less lines do
+  std::string logFile = EngineLogFile();
+
+  if (!logFile.empty()) {
+    std::string text = ReadFileText(logFile);
+    Check(text.find("info:") != std::string::npos
+       && text.find("Importing device") == std::string::npos
+       && text.find("90 or 270") == std::string::npos,
+      "the log file holds the device-less lines only");
+  } else {
+    std::printf("      DXVK_LOG_PATH not set: log file check skipped\n");
+  }
 
   vk.destroyImage(device, image, nullptr);
   vk.freeMemory(device, memory, nullptr);

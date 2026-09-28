@@ -8,10 +8,39 @@
 
 namespace dxvk::ddi {
 
+  ShellLogSink::ShellLogSink(const BC250_DXVK_SHELL_SERVICES& Services)
+  : m_shell(Services.Shell), m_log(Services.Log) {
+    Logger::addSink({ this, &ShellLogSink::Emit });
+  }
+
+
+  ShellLogSink::~ShellLogSink() {
+    Logger::removeSink(this);
+  }
+
+
+  void ShellLogSink::Emit(void* context, LogLevel level, const char* line) {
+    auto sink = static_cast<ShellLogSink*>(context);
+
+    // ABI levels: 1 error, 2 warning, 3 info, 4 debug
+    UINT32 abiLevel = 4u;
+
+    switch (level) {
+      case LogLevel::Error: abiLevel = 1u; break;
+      case LogLevel::Warn:  abiLevel = 2u; break;
+      case LogLevel::Info:  abiLevel = 3u; break;
+      default: break;
+    }
+
+    sink->m_log(sink->m_shell, abiLevel, line);
+  }
+
+
   Bc250DxvkDevice::Bc250DxvkDevice(
           D3D11DXGIDevice*                  pContainer,
-    const BC250_DXVK_SHELL_SERVICES&        Services)
-  : m_container(pContainer), m_services(Services) {
+    const BC250_DXVK_SHELL_SERVICES&        Services,
+          std::unique_ptr<ShellLogSink>&&   LogSink)
+  : m_container(pContainer), m_services(Services), m_logSink(std::move(LogSink)) {
     Com<ID3D11Device5> device;
     m_container->QueryInterface(__uuidof(ID3D11Device5), reinterpret_cast<void**>(&device));
 
@@ -72,6 +101,9 @@ namespace dxvk::ddi {
 
     if (leaked)
       Logger::err(str::format("bc250dxvk: D3D11 device still has ", leaked, " references at final release"));
+
+    // The shell's Log service may go away with its device
+    m_logSink = nullptr;
 
     ReleasePrivate();
     return leaked;

@@ -189,6 +189,12 @@ namespace dxvk::ddi {
       if (info->Threading != BC250_DXVK_THREADING_INLINE || info->Flags)
         return E_INVALIDARG;
 
+      // From here on, log lines go to the shell, those of instance and device import included
+      std::unique_ptr<ShellLogSink> logSink;
+
+      if (info->Services->Log)
+        logSink = std::make_unique<ShellLogSink>(*info->Services);
+
       try {
         Rc<DxvkInstance> instance = ImportInstance(info->Instance);
         Rc<DxvkAdapter> adapter = FindAdapter(instance, info->Instance->PhysicalDevice);
@@ -235,7 +241,7 @@ namespace dxvk::ddi {
         Com<D3D11DXGIDevice> container = new D3D11DXGIDevice(nullptr, nullptr, nullptr,
           instance, adapter, device, info->FeatureLevel, 0u);
 
-        *result = ref(new Bc250DxvkDevice(container.ptr(), *info->Services));
+        *result = ref(new Bc250DxvkDevice(container.ptr(), *info->Services, std::move(logSink)));
         return S_OK;
       } catch (const DxvkError& e) {
         Logger::err(str::format("bc250dxvk: CreateDevice: ", e.message()));

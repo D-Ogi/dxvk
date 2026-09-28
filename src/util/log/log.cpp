@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <utility>
 
 #include "log.h"
@@ -49,12 +50,39 @@ namespace dxvk {
   void Logger::log(LogLevel level, const std::string& message) {
     s_instance.emitMsg(level, message);
   }
-  
-  
+
+
+  void Logger::addSink(const LogSink& sink) {
+    std::lock_guard<dxvk::mutex> lock(s_instance.m_mutex);
+    s_instance.m_sinks.push_back(sink);
+  }
+
+
+  void Logger::removeSink(void* context) {
+    std::lock_guard<dxvk::mutex> lock(s_instance.m_mutex);
+    auto& sinks = s_instance.m_sinks;
+
+    sinks.erase(std::remove_if(sinks.begin(), sinks.end(),
+      [context] (const LogSink& s) { return s.context == context; }), sinks.end());
+  }
+
+
   void Logger::emitMsg(LogLevel level, const std::string& message) {
     if (level >= m_minLevel) {
       std::lock_guard<dxvk::mutex> lock(m_mutex);
-      
+
+      if (!m_sinks.empty()) {
+        const LogSink& sink = m_sinks.front();
+
+        std::stringstream stream(message);
+        std::string line;
+
+        while (std::getline(stream, line, '\n'))
+          sink.fn(sink.context, level, line.c_str());
+
+        return;
+      }
+
       static std::array<const char*, 5> s_prefixes
         = {{ "trace: ", "debug: ", "info:  ", "warn:  ", "err:   " }};
       
