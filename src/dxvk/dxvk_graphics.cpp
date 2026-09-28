@@ -1453,7 +1453,10 @@ namespace dxvk {
       stageInfo.addStage(VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, getShaderCode(*m_shaders.tes, key.shState.tesInfo), &key.scState.scInfo);
     if (m_shaders.gs)
       stageInfo.addStage(VK_SHADER_STAGE_GEOMETRY_BIT, getShaderCode(*m_shaders.gs, key.shState.gsInfo), &key.scState.scInfo);
-    if (m_shaders.fs)
+
+    // Static rasterizer discard leaves the pipeline without fragment shader state, and then the fragment
+    // stage must not be present (VUID-VkGraphicsPipelineCreateInfo-pStages-06894)
+    if (m_shaders.fs && !m_flags.test(DxvkGraphicsPipelineFlag::HasRasterizerDiscard))
       stageInfo.addStage(VK_SHADER_STAGE_FRAGMENT_BIT, getShaderCode(*m_shaders.fs, key.shState.fsInfo), &key.scState.scInfo);
 
     VkPipelineCreateFlags2CreateInfo flags = { VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO };
