@@ -3,7 +3,7 @@
  * bc250_dxvk_engine.h - boundary between the BC-250 system D3D10/11 user-mode driver ("shell", the
  * UserModeDriverName DLL) and its DXVK engine ("engine", bc250dxvk.dll, DXVK fork branch amdgpu-wddm/ddi-engine).
  *
- * Revision r3, ABI 1.2. This file in the DXVK fork is the only copy; the shell includes it from the DXVK
+ * Revision r4, ABI 1.2. This file in the DXVK fork is the only copy; the shell includes it from the DXVK
  * source checkout it builds against, like its other DXVK-facing headers.
  *
  * Versions. A minor version adds and never changes: an engine of minor n serves a shell built for any minor
@@ -12,6 +12,10 @@
  *   1.0  r1: IBc250DxvkDevice.
  *   1.1  r2: IBc250DxvkDevice1 (Blt1, DXGI Blt with a source rectangle).
  *   1.2  r3: IBc250DxvkDevice2 (CreateTexture2DFromImage2, a runtime image with the shell's own tiling).
+ *        Erratum: r2 said the shell may choose the tiling of a runtime allocation, but no engine honoured that
+ *        through CreateTexture2DFromImage; an r2 shell that did so got OPTIMAL handling of its image.
+ *   1.2  r4: no interface change. The engine takes the streams of a gs_5_0 output signature from the program's
+ *        dcl_stream blocks, so stream output on streams 1-3 works with the Stream = 0 the shell passes.
  *
  * WDK-free by construction. DXVK's util_gdi.h declares private extern-C D3DKMT prototypes that collide with
  * the WDK's in one translation unit, so nothing here needs d3d10umddi.h or a DXVK header: windows.h, the SDK's
@@ -153,7 +157,8 @@ struct BC250_DXVK_ADAPTER_INFO {
     D3D_FEATURE_LEVEL MaxFeatureLevel;             /* for D3D11DDICAPS_3DPIPELINESUPPORT; capped at 11_1 in 1.0 */
 };
 
-/* layout = D3D11_1DDIARG_SIGNATURE_ENTRY2 (D3D11_1DDIARG_SIGNATURE_ENTRY: pass Stream = 0). */
+/* layout = D3D11_1DDIARG_SIGNATURE_ENTRY2 (D3D11_1DDIARG_SIGNATURE_ENTRY: pass Stream = 0). When every entry of a
+ * gs_5_0 output signature has Stream 0, the engine derives the streams from the program's dcl_stream blocks. */
 struct BC250_DXVK_SIGNATURE_ENTRY {
     UINT SystemValue;                              /* D3D10_SB_NAME */
     UINT Register;                                 /* D3D10_SB_... register index; ~0u for none */

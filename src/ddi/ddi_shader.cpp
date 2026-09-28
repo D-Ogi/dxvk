@@ -6,11 +6,13 @@
 // DXVK validates. Names are a pure function of (register, first component) or of the system value, so a VS
 // output, the PS input it feeds and a stream-output declaration all agree without seeing each other.
 
+#include <algorithm>
 #include <cstring>
 
 #include "ddi_device.h"
 
 #include <dxbc/dxbc_container.h>
+#include <dxbc/dxbc_parser.h>
 #include <dxbc/dxbc_signature.h>
 
 namespace dxbc_spv::dxbc {
@@ -20,6 +22,8 @@ namespace dxbc_spv::dxbc {
 
 namespace dxvk::ddi {
 
+  using dxbc_spv::dxbc::OpCode;
+  using dxbc_spv::dxbc::RegisterType;
   using dxbc_spv::dxbc::Signature;
   using dxbc_spv::dxbc::SignatureEntry;
   using dxbc_spv::dxbc::SignatureSysval;
@@ -181,6 +185,63 @@ namespace dxvk::ddi {
   }
 
 
+  // The runtime's signature entries carry no stream (D3D11_1DDIARG_SIGNATURE_ENTRY), but a gs_5_0 program
+  // declares each output inside the dcl_stream block it belongs to. Each entry takes the first stream whose
+  // declarations cover its register and components and have not given those components to an earlier entry.
+  // A register used on two streams has one entry per stream, and the runtime lists them in stream order.
+  static void DeriveOutputStreams(
+    const std::vector<uint8_t>&                     ProgramChunk,
+          std::vector<BC250_DXVK_SIGNATURE_ENTRY>&  Entries) {
+    struct Declared {
+      uint32_t reg;
+      uint32_t mask;
+      uint32_t stream;
+      uint32_t claimed;
+    };
+
+    std::vector<Declared> declared;
+
+    dxbc_spv::dxbc::Parser parser(dxbc_spv::util::ByteReader(ProgramChunk.data(), ProgramChunk.size()));
+    uint32_t stream = 0u;
+
+    while (parser) {
+      auto op = parser.parseInstruction();
+
+      if (!op)
+        break;
+
+      if (!op.getDstCount())
+        continue;
+
+      auto opCode = op.getOpToken().getOpCode();
+      const auto& dst = op.getDst(0u);
+
+      if (opCode == OpCode::eDclStream && dst.getRegisterType() == RegisterType::eStream) {
+        stream = dst.getIndex(0u);
+      } else if ((opCode == OpCode::eDclOutput || opCode == OpCode::eDclOutputSgv || opCode == OpCode::eDclOutputSiv)
+              && dst.getRegisterType() == RegisterType::eOutput && dst.getIndexDimensions()) {
+        declared.push_back({ dst.getIndex(dst.getIndexDimensions() - 1u),
+          uint32_t(uint8_t(dst.getWriteMask())), stream, 0u });
+      }
+    }
+
+    for (auto& e : Entries) {
+      uint32_t mask = e.Mask & 0xfu;
+
+      if (e.Register == ~0u)
+        continue;
+
+      for (auto& d : declared) {
+        if (d.reg == e.Register && (d.mask & mask) && !(d.claimed & mask)) {
+          e.Stream = BYTE(d.stream);
+          d.claimed |= mask;
+          break;
+        }
+      }
+    }
+  }
+
+
   // vs_4_0 with a single ret: version token, length token, instruction
   static const UINT EmptyVertexProgram[] = { 0x00010040u, 3u, 0x0100003eu };
 
@@ -227,6 +288,23 @@ namespace dxvk::ddi {
     bool isPixel = programType == ProgramPixel;
     bool hasStreams = programType == ProgramGeometry && major >= 5u;
 
+    // Program chunk: tag, byte size, tokens unchanged
+    std::vector<uint8_t> code(8u + tokenCount * sizeof(UINT));
+    std::memcpy(&code[0], major >= 5u ? "SHEX" : "SHDR", 4u);
+    uint32_t codeSize = tokenCount * sizeof(UINT);
+    std::memcpy(&code[4], &codeSize, 4u);
+    std::memcpy(&code[8], pCode, codeSize);
+
+    // Streams of a gs_5_0 output signature, unless the shell passed them (ENTRY2 from a runtime that fills it)
+    std::vector<BC250_DXVK_SIGNATURE_ENTRY> streamOutputs;
+
+    if (hasStreams && output.NumEntries && std::none_of(output.Entries, output.Entries + output.NumEntries,
+        [] (const BC250_DXVK_SIGNATURE_ENTRY& e) { return e.Stream != 0u; })) {
+      streamOutputs.assign(output.Entries, output.Entries + output.NumEntries);
+      DeriveOutputStreams(code, streamOutputs);
+      output.Entries = streamOutputs.data();
+    }
+
     Signature isgn, osgn, pcsg;
     std::vector<NamedEntry> outputNames;
 
@@ -248,12 +326,6 @@ namespace dxvk::ddi {
     if (hasPatchConstants)
       chunks.push_back(WriteChunk(pcsg));
 
-    // Program chunk: tag, byte size, tokens unchanged
-    std::vector<uint8_t> code(8u + tokenCount * sizeof(UINT));
-    std::memcpy(&code[0], major >= 5u ? "SHEX" : "SHDR", 4u);
-    uint32_t codeSize = tokenCount * sizeof(UINT);
-    std::memcpy(&code[4], &codeSize, 4u);
-    std::memcpy(&code[8], pCode, codeSize);
     chunks.push_back(std::move(code));
 
     // Header: magic, hash, version 1, file size, chunk count, chunk offsets
