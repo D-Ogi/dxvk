@@ -619,6 +619,44 @@ int main(int argc, char** argv) {
 
   ctx->Unmap(staging.Get(), 0u);
 
+  // ---- sustained frames: inline retirement keeps up and memory stays bounded ----
+  // Not a performance measurement: a 64x64 target on the development GPU says nothing about the BC-250.
+  constexpr UINT FrameCount = 500u;
+
+  PROCESS_MEMORY_COUNTERS_EX memBefore = { sizeof(memBefore) }, memAfter = { sizeof(memAfter) };
+  GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&memBefore), sizeof(memBefore));
+
+  LARGE_INTEGER freq, t0, t1;
+  QueryPerformanceFrequency(&freq);
+  QueryPerformanceCounter(&t0);
+
+  HRESULT frameHr = S_OK;
+
+  for (UINT i = 0u; i < FrameCount && SUCCEEDED(frameHr); i++) {
+    ctx->ClearRenderTargetView(rtv.Get(), clear);
+    ctx->Draw(3u, 0u);
+    frameHr = engine->SubmitForPresent(rt.Get(), 0u);
+  }
+
+  CheckHr(frameHr, "500 x (clear, draw, SubmitForPresent)");
+  CheckHr(engine->WaitForResourceIdle(rt.Get()), "WaitForResourceIdle after the frames");
+  QueryPerformanceCounter(&t1);
+
+  GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&memAfter), sizeof(memAfter));
+
+  double frameUs = 1e6 * double(t1.QuadPart - t0.QuadPart) / double(freq.QuadPart) / FrameCount;
+  double growthMb = (double(memAfter.PrivateUsage) - double(memBefore.PrivateUsage)) / (1024.0 * 1024.0);
+  std::printf("      %.1f us per frame (wall, submit-bound), private bytes %+.1f MB\n", frameUs, growthMb);
+  Check(growthMb < 64.0, "private bytes grow by less than 64 MB over 500 frames");
+
+  ctx->CopyResource(staging.Get(), rt.Get());
+
+  if (CheckHr(ctx->Map(staging.Get(), 0u, D3D11_MAP_READ, 0u, &mapped), "Map staging after the frames")) {
+    Check(similar(pixel(W - 1u, H - 1u), cr, cg, cb, 1) && pixel(0u, 0u)[0] > 230,
+      "last frame has the same clear and triangle");
+    ctx->Unmap(staging.Get(), 0u);
+  }
+
   // ---- threads and submissions ----
   std::set<DWORD> threadsAfter = ProcessThreads();
   uint32_t engineThreads = 0u;
