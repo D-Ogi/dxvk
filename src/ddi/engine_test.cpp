@@ -1464,16 +1464,21 @@ int main(int argc, char** argv) {
     BC250_DXVK_SHADER_DESC psCodeDesc = MakeDesc(psDdi);
     psCodeDesc.StreamOutput = &soDecl;
 
-    Microsoft::WRL::ComPtr<ID3D11GeometryShader> soNoCode, soVsCode, soPsCode;
+    const BC250_DXVK_STREAM_OUTPUT soRastDecl = { soEntries, 3u, &soStride, 1u, 0u };
+    BC250_DXVK_SHADER_DESC rastDesc = noCodeDesc;
+    rastDesc.StreamOutput = &soRastDecl;
+
+    Microsoft::WRL::ComPtr<ID3D11GeometryShader> soNoCode, soVsCode, soPsCode, soRast;
     CheckHr(engine->CreateShader(&noCodeDesc, IID_PPV_ARGS(&soNoCode)), "CreateShader (stream output, no code)");
     CheckHr(engine->CreateShader(&vsCodeDesc, IID_PPV_ARGS(&soVsCode)), "CreateShader (stream output, VS code)");
+    CheckHr(engine->CreateShader(&rastDesc, IID_PPV_ARGS(&soRast)), "CreateShader (stream output, rasterized stream 0)");
     Check(engine->CreateShader(&psCodeDesc, IID_PPV_ARGS(&soPsCode)) == E_INVALIDARG,
       "CreateShader rejects stream output with pixel shader code");
 
     D3D11_BUFFER_DESC soBufDesc = { 3u * soStride, D3D11_USAGE_DEFAULT, D3D11_BIND_STREAM_OUTPUT };
     D3D11_BUFFER_DESC soReadDesc = { 3u * soStride, D3D11_USAGE_STAGING, 0u, D3D11_CPU_ACCESS_READ };
     Microsoft::WRL::ComPtr<ID3D11Buffer> soBuf, soRead;
-    bool soReady = soNoCode.Get() && soVsCode.Get()
+    bool soReady = soNoCode.Get() && soVsCode.Get() && soRast.Get()
       && CheckHr(d3d->CreateBuffer(&soBufDesc, nullptr, &soBuf), "CreateBuffer (stream output target)")
       && CheckHr(d3d->CreateBuffer(&soReadDesc, nullptr, &soRead), "CreateBuffer (stream output readback)");
 
@@ -1541,11 +1546,54 @@ int main(int argc, char** argv) {
       Check(capture(soVsCode.Get(), D3D11_PRIMITIVE_TOPOLOGY_POINTLIST, "VS code") == 3u,
         "stream output with the VS code captures the same records");
 
-      // Known limitation, upstream DXVK: the pass-through geometry shader emits one point per input
-      // primitive, so a triangle list yields its first vertex only (D3D11 writes all three). DXVK's own
-      // CreateGeometryShaderWithStreamOutput behaves the same. This check trips when that changes.
-      Check(capture(soNoCode.Get(), D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, "triangle list") == 1u,
-        "known limitation: a triangle list without a geometry program streams out its first vertex only");
+      // Without a geometry program, stream output receives whole primitives, strips expanded to lists, and
+      // writes only primitives that fit: the three-record target takes one line of a strip, not two.
+      Check(capture(soNoCode.Get(), D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, "triangle list") == 3u,
+        "a triangle list streams out all three vertices of its triangle");
+      Check(capture(soVsCode.Get(), D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP, "triangle strip") == 3u,
+        "a triangle strip streams out its triangle (VS code)");
+      Check(capture(soNoCode.Get(), D3D11_PRIMITIVE_TOPOLOGY_LINELIST, "line list") == 2u,
+        "a line list streams out its complete line and drops the lone third vertex");
+      Check(capture(soNoCode.Get(), D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP, "line strip") == 2u,
+        "a line strip's second line does not fit and is dropped whole");
+
+      // The rasterized stream draws what the pass-through receives: the triangle, not a point. The same
+      // draw without a geometry program is the control for the state at this point of the test.
+      auto coveredBy = [&] (ID3D11GeometryShader* gs, const char* what) {
+        ctx->ClearRenderTargetView(rtv.Get(), clear);
+
+        ID3D11Buffer* targets[] = { soBuf.Get() };
+        UINT soOffset = 0u;
+        ctx->SOSetTargets(gs ? 1u : 0u, gs ? targets : nullptr, gs ? &soOffset : nullptr);
+        ctx->GSSetShader(gs, nullptr, 0u);
+        ctx->Draw(3u, 0u);
+        ctx->GSSetShader(nullptr, nullptr, 0u);
+        ctx->SOSetTargets(0u, nullptr, nullptr);
+        ctx->CopyResource(staging.Get(), rt.Get());
+
+        uint32_t count = 0u;
+
+        if (CheckHr(ctx->Map(staging.Get(), 0u, D3D11_MAP_READ, 0u, &mapped), what)) {
+          for (UINT y = 0u; y < H; y++) {
+            for (UINT x = 0u; x < W; x++) {
+              if (!similar(pixel(x, y), cr, cg, cb, 1))
+                count++;
+            }
+          }
+
+          ctx->Unmap(staging.Get(), 0u);
+        }
+
+        std::printf("      %s: covered=%u\n", what, count);
+        return count;
+      };
+
+      uint32_t plainCovered = coveredBy(nullptr, "Map staging (control draw)");
+      Check(plainCovered >= 2016u && plainCovered <= 2080u, "control: the draw without a geometry program covers the triangle");
+
+      uint32_t rastCovered = coveredBy(soRast.Get(), "Map staging (rasterized stream)");
+      Check(rastCovered >= 2016u && rastCovered <= 2080u,
+        "the rasterized stream of the pass-through covers the triangle's pixels");
     }
   }
 
