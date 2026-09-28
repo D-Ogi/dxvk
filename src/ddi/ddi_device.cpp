@@ -66,7 +66,8 @@ namespace dxvk::ddi {
     if (riid == __uuidof(IUnknown)
      || riid == __uuidof(IBc250DxvkDevice)
      || riid == __uuidof(IBc250DxvkDevice1)
-     || riid == __uuidof(IBc250DxvkDevice2)) {
+     || riid == __uuidof(IBc250DxvkDevice2)
+     || riid == __uuidof(IBc250DxvkDevice3)) {
       *ppvObject = ref(this);
       return S_OK;
     }
@@ -735,6 +736,25 @@ namespace dxvk::ddi {
 
     return BltRegion(pBlt->Destination, pBlt->DestinationSubresource, pBlt->DestinationRect,
       pBlt->Source, pBlt->SourceSubresource, &pBlt->SourceRect, pBlt->Flags, pBlt->Rotation);
+  }
+
+
+  HRESULT STDMETHODCALLTYPE Bc250DxvkDevice::CheckFeatureSupportAtLevel(
+          D3D_FEATURE_LEVEL                 FeatureLevel,
+          D3D11_FEATURE                     Feature,
+          void*                             pFeatureData,
+          UINT                              FeatureDataSize) {
+    // The bound CreateDevice applies, so every answer is one a device of this engine could give
+    if (!pFeatureData || FeatureLevel < D3D_FEATURE_LEVEL_9_1
+     || FeatureLevel > D3D11Device::GetMaxFeatureLevel(*m_dxvkDevice))
+      return E_INVALIDARG;
+
+    if (Feature == D3D11_FEATURE_FORMAT_SUPPORT || Feature == D3D11_FEATURE_FORMAT_SUPPORT2)
+      return E_INVALIDARG;
+
+    // What D3D11Device builds at creation, with the same options, at another level
+    D3D11DeviceFeatures features(*m_dxvkDevice, *m_device->GetOptions(), FeatureLevel);
+    return features.GetFeatureData(Feature, FeatureDataSize, pFeatureData);
   }
 
 

@@ -43,7 +43,7 @@ namespace dxvk::ddi {
   };
 
 
-  class Bc250DxvkDevice : public ComObject<IBc250DxvkDevice2> {
+  class Bc250DxvkDevice : public ComObject<IBc250DxvkDevice3> {
 
   public:
 
@@ -118,6 +118,12 @@ namespace dxvk::ddi {
       const VkImageCreateInfo*                pInfo,
             VkImage                           Image,
             ID3D11Texture2D**                 ppTexture) final;
+
+    HRESULT STDMETHODCALLTYPE CheckFeatureSupportAtLevel(
+            D3D_FEATURE_LEVEL                 FeatureLevel,
+            D3D11_FEATURE                     Feature,
+            void*                             pFeatureData,
+            UINT                              FeatureDataSize) final;
 
   private:
 

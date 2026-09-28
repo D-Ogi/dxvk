@@ -3,7 +3,7 @@
  * bc250_dxvk_engine.h - boundary between the BC-250 system D3D10/11 user-mode driver ("shell", the
  * UserModeDriverName DLL) and its DXVK engine ("engine", bc250dxvk.dll, DXVK fork branch amdgpu-wddm/ddi-engine).
  *
- * Revision r4, ABI 1.2. This file in the DXVK fork is the only copy; the shell includes it from the DXVK
+ * Revision r5, ABI 1.3. This file in the DXVK fork is the only copy; the shell includes it from the DXVK
  * source checkout it builds against, like its other DXVK-facing headers.
  *
  * Versions. A minor version adds and never changes: an engine of minor n serves a shell built for any minor
@@ -16,6 +16,8 @@
  *        through CreateTexture2DFromImage; an r2 shell that did so got OPTIMAL handling of its image.
  *   1.2  r4: no interface change. The engine takes the streams of a gs_5_0 output signature from the program's
  *        dcl_stream blocks, so stream output on streams 1-3 works with the Stream = 0 the shell passes.
+ *   1.3  r5: IBc250DxvkDevice3 (CheckFeatureSupportAtLevel, the engine's feature answers at any level it
+ *        accepts, for the shell's check of its adapter-level GetCaps answers).
  *
  * WDK-free by construction. DXVK's util_gdi.h declares private extern-C D3DKMT prototypes that collide with
  * the WDK's in one translation unit, so nothing here needs d3d10umddi.h or a DXVK header: windows.h, the SDK's
@@ -89,7 +91,7 @@
 #include <vulkan/vulkan.h>
 
 #define BC250_DXVK_ENGINE_ABI_MAJOR 1u
-#define BC250_DXVK_ENGINE_ABI_MINOR 2u
+#define BC250_DXVK_ENGINE_ABI_MINOR 3u
 #define BC250_DXVK_ENGINE_ABI_VERSION ((BC250_DXVK_ENGINE_ABI_MAJOR << 16) | BC250_DXVK_ENGINE_ABI_MINOR)
 
 /* The Vulkan objects the shell owns (E1). */
@@ -347,6 +349,25 @@ IBc250DxvkDevice2 : public IBc250DxvkDevice1 {
     virtual HRESULT STDMETHODCALLTYPE CreateTexture2DFromImage2(const D3D11_TEXTURE2D_DESC1 *desc,
                                                                 const VkImageCreateInfo *info, VkImage image,
                                                                 ID3D11Texture2D **texture) = 0;
+};
+
+/* ABI 1.3. The same object as IBc250DxvkDevice; QueryInterface on it, E_NOINTERFACE from an older engine. */
+MIDL_INTERFACE("24e7ec8c-d553-4501-aa0f-801dcf615940")
+IBc250DxvkDevice3 : public IBc250DxvkDevice2 {
+    /* What ID3D11Device::CheckFeatureSupport would answer on an engine device created at featureLevel on this
+     * Vulkan device. The shell answers GetCaps before any device exists, and its answers must hold at every
+     * level it offers; the D3D11 device of this object answers only at its own level, and several answers
+     * depend on the level (doubles and typed UAV loads from 11_0, ROVs and stencil reference from 11_1).
+     * featureLevel must be 9_1 or higher and no higher than CreateDevice accepts on this Vulkan device, which
+     * includes MaxFeatureLevel of GetAdapterInfo; E_INVALIDARG otherwise, and for a NULL data. Features, data
+     * sizes and results are those of CheckFeatureSupport (E_INVALIDARG for a size mismatch or an unknown
+     * feature), except that FORMAT_SUPPORT and FORMAT_SUPPORT2 return E_INVALIDARG: the engine's format answers
+     * do not depend on the level, ask the D3D11 device. The answers describe the engine, not the driver:
+     * THREADING, SHADER_CACHE, MARKER_SUPPORT and GPU_VIRTUAL_ADDRESS_SUPPORT are DXVK's own values, not what
+     * the shell reports to the runtime. */
+    virtual HRESULT STDMETHODCALLTYPE CheckFeatureSupportAtLevel(D3D_FEATURE_LEVEL featureLevel,
+                                                                 D3D11_FEATURE feature, void *data,
+                                                                 UINT dataSize) = 0;
 };
 
 struct BC250_DXVK_ENGINE_FUNCS {
