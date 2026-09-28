@@ -485,13 +485,31 @@ int main(int argc, char** argv) {
   rtDesc.Height         = H;
   rtDesc.MipLevels      = 1u;
   rtDesc.ArraySize      = 1u;
-  rtDesc.Format         = DXGI_FORMAT_R8G8B8A8_UNORM;
+  // TYPELESS with a UNORM view: a mutable image, as a DXGI back buffer that is also viewed as sRGB would be
+  rtDesc.Format         = DXGI_FORMAT_R8G8B8A8_TYPELESS;
   rtDesc.SampleDesc     = { 1u, 0u };
   rtDesc.Usage          = D3D11_USAGE_DEFAULT;
   rtDesc.BindFlags      = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
 
   VkImageCreateInfo imageInfo = { };
   CheckHr(engine->GetImageCreateInfo(&rtDesc, &imageInfo), "GetImageCreateInfo");
+
+  auto formatList = static_cast<const VkImageFormatListCreateInfo*>(imageInfo.pNext);
+  Check((imageInfo.flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) && formatList
+     && formatList->sType == VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO && formatList->viewFormatCount > 1u,
+    "TYPELESS target: mutable image with the engine's view format list in pNext");
+
+  if (formatList)
+    std::printf("      view formats: %u, image format %d, usage 0x%x, tiling %d\n", formatList->viewFormatCount,
+      imageInfo.format, imageInfo.usage, imageInfo.tiling);
+
+  D3D11_TEXTURE2D_DESC1 stagingLike = rtDesc;
+  stagingLike.Usage          = D3D11_USAGE_STAGING;
+  stagingLike.BindFlags      = 0u;
+  stagingLike.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+  VkImageCreateInfo rejected = { };
+  Check(engine->GetImageCreateInfo(&stagingLike, &rejected) == E_INVALIDARG,
+    "GetImageCreateInfo rejects a CPU-accessible texture");
 
   VkImage image = VK_NULL_HANDLE;
   vr = vk.createImage(device, &imageInfo, nullptr, &image);
@@ -524,7 +542,10 @@ int main(int argc, char** argv) {
   CheckHr(engine->CreateTexture2DFromImage(&rtDesc, image, &rt), "CreateTexture2DFromImage");
 
   Microsoft::WRL::ComPtr<ID3D11RenderTargetView> rtv;
-  CheckHr(d3d->CreateRenderTargetView(rt.Get(), nullptr, &rtv), "CreateRenderTargetView");
+  D3D11_RENDER_TARGET_VIEW_DESC rtvDesc = { };
+  rtvDesc.Format        = DXGI_FORMAT_R8G8B8A8_UNORM;
+  rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+  CheckHr(d3d->CreateRenderTargetView(rt.Get(), &rtvDesc, &rtv), "CreateRenderTargetView (UNORM view)");
 
   // ---- vertex buffer ----
   // Upper-left half of the target in pixel space, one colour per corner.

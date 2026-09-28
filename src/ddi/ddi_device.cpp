@@ -243,16 +243,84 @@ namespace dxvk::ddi {
   }
 
 
+  // Sharing belongs to the shell's runtime allocations; given to DXVK, these flags would export Vulkan memory.
+  constexpr UINT ShellSharingFlags = D3D11_RESOURCE_MISC_SHARED
+                                   | D3D11_RESOURCE_MISC_SHARED_NTHANDLE
+                                   | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
+
+
+  // A wrapped image needs D3D11_COMMON_TEXTURE_MAP_MODE_NONE: every other map mode wants engine-owned memory
+  // (staging buffers or a host-mapped image), and tiled resources want sparse binding.
+  static bool IsImportable(const D3D11_TEXTURE2D_DESC1* pDesc) {
+    return (pDesc->Usage == D3D11_USAGE_DEFAULT || pDesc->Usage == D3D11_USAGE_IMMUTABLE)
+        && !pDesc->CPUAccessFlags
+        && !(pDesc->MiscFlags & D3D11_RESOURCE_MISC_TILED);
+  }
+
+
+  static HRESULT GetCommonDesc(
+    const D3D11_TEXTURE2D_DESC1*            pDesc,
+          D3D11_COMMON_TEXTURE_DESC*        pCommon) {
+    if (!IsImportable(pDesc))
+      return E_INVALIDARG;
+
+    D3D11_COMMON_TEXTURE_DESC desc = { };
+    desc.Width          = pDesc->Width;
+    desc.Height         = pDesc->Height;
+    desc.Depth          = 1;
+    desc.MipLevels      = pDesc->MipLevels;
+    desc.ArraySize      = pDesc->ArraySize;
+    desc.Format         = pDesc->Format;
+    desc.SampleDesc     = pDesc->SampleDesc;
+    desc.Usage          = pDesc->Usage;
+    desc.BindFlags      = pDesc->BindFlags;
+    desc.CPUAccessFlags = pDesc->CPUAccessFlags;
+    desc.MiscFlags      = pDesc->MiscFlags & ~ShellSharingFlags;
+    desc.TextureLayout  = pDesc->TextureLayout;
+
+    HRESULT hr = D3D11CommonTexture::NormalizeTextureProperties(&desc);
+
+    if (SUCCEEDED(hr))
+      *pCommon = desc;
+
+    return hr;
+  }
+
+
+  // D3D11CommonTexture::IsR32UavCompatibleFormat, which is private.
+  static bool IsR32UavCompatibleFormat(DXGI_FORMAT Format) {
+    return Format == DXGI_FORMAT_R8G8B8A8_TYPELESS
+        || Format == DXGI_FORMAT_B8G8R8A8_TYPELESS
+        || Format == DXGI_FORMAT_B8G8R8X8_TYPELESS
+        || Format == DXGI_FORMAT_R10G10B10A2_TYPELESS
+        || Format == DXGI_FORMAT_R16G16_TYPELESS
+        || Format == DXGI_FORMAT_R32_TYPELESS;
+  }
+
+
   HRESULT STDMETHODCALLTYPE Bc250DxvkDevice::GetImageCreateInfo(
     const D3D11_TEXTURE2D_DESC1*            pDesc,
           VkImageCreateInfo*                pInfo) {
     if (!pDesc || !pInfo)
       return E_INVALIDARG;
 
-    // The subset of D3D11CommonTexture's image setup that an imported runtime allocation needs: the
-    // shell adds tiling (DRM format modifier), external memory and sharing to this.
-    DXGI_VK_FORMAT_INFO   format = m_device->LookupFormat(pDesc->Format, DXGI_VK_FORMAT_MODE_ANY);
-    DXGI_VK_FORMAT_FAMILY family = m_device->LookupFamily(pDesc->Format, DXGI_VK_FORMAT_MODE_ANY);
+    D3D11_COMMON_TEXTURE_DESC desc;
+    HRESULT hr = GetCommonDesc(pDesc, &desc);
+
+    if (FAILED(hr))
+      return hr;
+
+    // The image half of the D3D11CommonTexture constructor for a 2D texture with DXGI_USAGE_BACK_BUFFER, which
+    // is how CreateTexture2DFromImage wraps it. Keep the two in step when DXVK is rebased.
+    DXGI_VK_FORMAT_MODE mode = DXGI_VK_FORMAT_MODE_ANY;
+
+    if (desc.BindFlags & D3D11_BIND_RENDER_TARGET)
+      mode = DXGI_VK_FORMAT_MODE_COLOR;
+    else if (desc.BindFlags & D3D11_BIND_DEPTH_STENCIL)
+      mode = DXGI_VK_FORMAT_MODE_DEPTH;
+
+    DXGI_VK_FORMAT_INFO   format = m_device->LookupFormat(desc.Format, mode);
+    DXGI_VK_FORMAT_FAMILY family = m_device->LookupFamily(desc.Format, mode);
 
     if (format.Format == VK_FORMAT_UNDEFINED)
       return E_INVALIDARG;
@@ -260,33 +328,65 @@ namespace dxvk::ddi {
     VkImageCreateInfo info = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
     info.imageType     = VK_IMAGE_TYPE_2D;
     info.format        = format.Format;
-    info.extent        = { pDesc->Width, pDesc->Height, 1u };
-    info.mipLevels     = pDesc->MipLevels ? pDesc->MipLevels : 1u;
-    info.arrayLayers   = pDesc->ArraySize ? pDesc->ArraySize : 1u;
+    info.extent        = { desc.Width, desc.Height, 1u };
+    info.mipLevels     = desc.MipLevels;
+    info.arrayLayers   = desc.ArraySize;
     info.samples       = VK_SAMPLE_COUNT_1_BIT;
     info.tiling        = VK_IMAGE_TILING_OPTIMAL;
     info.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
     info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    info.usage         = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+    // SAMPLED: DXGI_USAGE_BACK_BUFFER makes every wrapped image shader readable
+    info.usage         = VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+                       | VK_IMAGE_USAGE_TRANSFER_DST_BIT
                        | VK_IMAGE_USAGE_SAMPLED_BIT;
 
-    if (pDesc->SampleDesc.Count > 1u && FAILED(DecodeSampleCount(pDesc->SampleDesc.Count, &info.samples)))
-      return E_INVALIDARG;
+    if (!m_device->GetOptions()->disableMsaa)
+      DecodeSampleCount(desc.SampleDesc.Count, &info.samples);
 
-    if (family.FormatCount > 1u)
+    if ((desc.BindFlags & D3D11_BIND_UNORDERED_ACCESS) && IsR32UavCompatibleFormat(desc.Format)) {
+      family.Add(format.Format);
+      family.Add(VK_FORMAT_R32_SFLOAT);
+      family.Add(VK_FORMAT_R32_UINT);
+      family.Add(VK_FORMAT_R32_SINT);
+    }
+
+    const DxvkFormatInfo* formatProperties = lookupFormatInfo(format.Format);
+
+    bool isMultiPlane  = (formatProperties->aspectMask & VK_IMAGE_ASPECT_PLANE_0_BIT) != 0;
+    bool isColorFormat = (formatProperties->aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) != 0;
+
+    if (family.FormatCount > 1u && (isColorFormat || isMultiPlane)) {
       info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+      info.pNext  = GetViewFormatList(family);
+    }
 
-    if (pDesc->BindFlags & D3D11_BIND_RENDER_TARGET)
+    if (desc.BindFlags & D3D11_BIND_RENDER_TARGET)
       info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
 
-    if (pDesc->BindFlags & D3D11_BIND_DEPTH_STENCIL)
+    if (desc.BindFlags & D3D11_BIND_DEPTH_STENCIL)
       info.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
 
-    if (pDesc->BindFlags & D3D11_BIND_UNORDERED_ACCESS)
+    if (desc.BindFlags & D3D11_BIND_UNORDERED_ACCESS) {
       info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
 
-    if (pDesc->MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE)
+      if (formatProperties->flags.test(DxvkFormatFlag::ColorSpaceSrgb))
+        info.flags |= VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+    }
+
+    if (isMultiPlane) {
+      info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT
+                 |  VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+    }
+
+    if (desc.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE)
       info.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+
+    // Formats such as R32G32B32 only support linear tiling on most GPUs
+    if (!CheckImageSupport(info, VK_IMAGE_TILING_OPTIMAL))
+      info.tiling = VK_IMAGE_TILING_LINEAR;
+
+    if (!CheckImageSupport(info, info.tiling))
+      return E_INVALIDARG;
 
     *pInfo = info;
     return S_OK;
@@ -302,21 +402,8 @@ namespace dxvk::ddi {
 
     *ppTexture = nullptr;
 
-    D3D11_COMMON_TEXTURE_DESC desc = { };
-    desc.Width          = pDesc->Width;
-    desc.Height         = pDesc->Height;
-    desc.Depth          = 1;
-    desc.MipLevels      = pDesc->MipLevels;
-    desc.ArraySize      = pDesc->ArraySize;
-    desc.Format         = pDesc->Format;
-    desc.SampleDesc     = pDesc->SampleDesc;
-    desc.Usage          = pDesc->Usage;
-    desc.BindFlags      = pDesc->BindFlags;
-    desc.CPUAccessFlags = pDesc->CPUAccessFlags;
-    desc.MiscFlags      = pDesc->MiscFlags;
-    desc.TextureLayout  = pDesc->TextureLayout;
-
-    HRESULT hr = D3D11CommonTexture::NormalizeTextureProperties(&desc);
+    D3D11_COMMON_TEXTURE_DESC desc;
+    HRESULT hr = GetCommonDesc(pDesc, &desc);
 
     if (FAILED(hr))
       return hr;
@@ -432,6 +519,52 @@ namespace dxvk::ddi {
 
   HRESULT Bc250DxvkDevice::CheckDeviceStatus() const {
     return m_device->GetDeviceRemovedReason();
+  }
+
+
+  // D3D11CommonTexture::CheckImageSupport for an image without D3D12 interop.
+  bool Bc250DxvkDevice::CheckImageSupport(
+    const VkImageCreateInfo&                info,
+          VkImageTiling                     tiling) const {
+    DxvkFormatQuery query = { };
+    query.format = info.format;
+    query.type   = info.imageType;
+    query.tiling = tiling;
+    query.usage  = info.usage;
+    query.flags  = info.flags;
+
+    if (info.flags & VK_IMAGE_CREATE_EXTENDED_USAGE_BIT)
+      query.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+
+    auto limits = m_dxvkDevice->getFormatLimits(query);
+
+    return limits
+        && info.extent.width  <= limits->maxExtent.width
+        && info.extent.height <= limits->maxExtent.height
+        && info.extent.depth  <= limits->maxExtent.depth
+        && info.arrayLayers   <= limits->maxArrayLayers
+        && info.mipLevels     <= limits->maxMipLevels
+        && (info.samples & limits->sampleCounts);
+  }
+
+
+  const VkImageFormatListCreateInfo* Bc250DxvkDevice::GetViewFormatList(
+    const DXGI_VK_FORMAT_FAMILY&            family) {
+    std::lock_guard<dxvk::mutex> lock(m_viewFormatMutex);
+
+    for (const auto& list : m_viewFormatLists) {
+      if (list->info.viewFormatCount == family.FormatCount
+       && std::equal(family.Formats, family.Formats + family.FormatCount, list->formats.begin()))
+        return &list->info;
+    }
+
+    auto list = std::make_unique<ViewFormatList>();
+    std::copy(family.Formats, family.Formats + family.FormatCount, list->formats.begin());
+    list->info.viewFormatCount = family.FormatCount;
+    list->info.pViewFormats    = list->formats.data();
+
+    m_viewFormatLists.push_back(std::move(list));
+    return &m_viewFormatLists.back()->info;
   }
 
 }

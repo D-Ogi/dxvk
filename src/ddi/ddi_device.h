@@ -7,6 +7,10 @@
 // Kto pod kim dołki kopie, ten sam w nie wpada: whoever digs pits under others falls into them himself.
 // The runtime has validated every argument already; this layer translates, it does not second-guess.
 
+#include <array>
+#include <memory>
+#include <vector>
+
 #include "../d3d11/d3d11_device.h"
 #include "../d3d11/d3d11_context_imm.h"
 
@@ -82,13 +86,29 @@ namespace dxvk::ddi {
 
   private:
 
+    // View format lists handed out through GetImageCreateInfo's pNext; they live as long as the device.
+    struct ViewFormatList {
+      VkImageFormatListCreateInfo                           info = { VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO };
+      std::array<VkFormat, DXGI_VK_FORMAT_FAMILY::MaxSize>  formats = { };
+    };
+
     Com<D3D11DXGIDevice>        m_container;
     D3D11Device*                m_device  = nullptr;
     D3D11ImmediateContext*      m_context = nullptr;
     Rc<DxvkDevice>              m_dxvkDevice;
     BC250_DXVK_SHELL_SERVICES   m_services = { };
 
+    dxvk::mutex                                   m_viewFormatMutex;
+    std::vector<std::unique_ptr<ViewFormatList>>  m_viewFormatLists;
+
     HRESULT CheckDeviceStatus() const;
+
+    bool CheckImageSupport(
+      const VkImageCreateInfo&                info,
+            VkImageTiling                     tiling) const;
+
+    const VkImageFormatListCreateInfo* GetViewFormatList(
+      const DXGI_VK_FORMAT_FAMILY&            family);
 
   };
 

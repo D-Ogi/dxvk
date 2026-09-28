@@ -31,10 +31,12 @@
  *       returned extensions and features on one queue of the returned family.
  *   E2  Threads (ABI 1.0 = inline mode). Every Vulkan call the engine makes happens on the thread that is
  *       inside an engine call (a COM method of an engine object or an IBc250DxvkDevice method). The engine starts
- *       no thread that calls Vulkan: DXVK's CS, submit, finish, pipeline, descriptor, fence, cache, presenter and
- *       adapter threads are not started in this mode. The shell calls the engine only from inside a DDI entry that
- *       holds the device's RuntimeDomain scope, so hosted RADV may use runtime callbacks throughout. The shell does
- *       not report D3D11DDICAPS_FREETHREADED; the runtime then enters one device from one thread at a time.
+ *       no thread that calls Vulkan: DXVK's CS, submit, finish, pipeline, descriptor, cache, presenter and adapter
+ *       threads are not started in this mode. DXVK's fence thread starts only for
+ *       ID3D11Fence::SetEventOnCompletion, which the shell does not call (DDI fences are the shell's). The shell
+ *       calls the engine only from inside a DDI entry that holds the device's RuntimeDomain scope, so hosted RADV
+ *       may use runtime callbacks throughout. The shell does not report D3D11DDICAPS_FREETHREADED; the runtime
+ *       then enters one device from one thread at a time.
  *       A later minor version may add a broker mode; the engine will only use it when the shell asks for it.
  *   E3  Submission. ID3D11DeviceContext::Flush and IBc250DxvkDevice::SubmitForPresent return only after every
  *       command recorded before them was submitted to hosted RADV (vkQueueSubmit returned). Other entries may
@@ -240,8 +242,15 @@ IBc250DxvkDevice : public IUnknown {
     virtual HRESULT STDMETHODCALLTYPE GetVertexFormat(DXGI_FORMAT format, VkFormat *vkFormat,
                                                       UINT *elementSize) = 0;
 
-    /* E5: a texture on a shell-owned VkImage, created with the usage and flags D3D11 needs for desc (the shell
-     * gets them from GetImageCreateInfo first). */
+    /* E5: a texture on a shell-owned VkImage. GetImageCreateInfo returns what the engine's D3D11 texture expects
+     * for desc: type, format, extent, levels, layers, samples, usage, flags, and LINEAR tiling where DXVK itself
+     * would fall back to it. info->pNext may point to a VkImageFormatListCreateInfo that the engine device owns
+     * until its final Release: keep it in the chain (drivers keep compression on mutable-format images only with
+     * a list) and link the shell's own structures in front of it. The shell may add usage bits and choose the
+     * tiling of a runtime allocation; it must not remove usage or flags. Only GPU-only textures qualify: Usage
+     * DEFAULT or IMMUTABLE, CPUAccessFlags 0, not TILED (E_INVALIDARG otherwise); the SHARED, SHARED_NTHANDLE and
+     * SHARED_KEYEDMUTEX MiscFlags are ignored, sharing is the shell's. CPU-accessible textures come from
+     * ID3D11Device::CreateTexture2D, with engine-owned memory. */
     virtual HRESULT STDMETHODCALLTYPE GetImageCreateInfo(const D3D11_TEXTURE2D_DESC1 *desc,
                                                          VkImageCreateInfo *info) = 0;
     virtual HRESULT STDMETHODCALLTYPE CreateTexture2DFromImage(const D3D11_TEXTURE2D_DESC1 *desc, VkImage image,
