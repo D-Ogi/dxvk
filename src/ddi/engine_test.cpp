@@ -1,4 +1,4 @@
-// Offline positive control for bc250dxvk.dll (engine ABI 1.2) on any Vulkan 1.3 GPU. No window; exits.
+// Offline positive control for bc250dxvk.dll (engine ABI 1.3) on any Vulkan 1.3 GPU. No window; exits.
 //
 // Plays the UMD shell: owns the VkInstance and VkDevice (E1), creates the device from the engine's
 // requirements, allocates the render target image itself (E5), and feeds shaders in DDI form: the token
@@ -6,9 +6,12 @@
 // clear and one draw, storage rotation, DXGI Blt onto an imported image, and that the engine's queue submissions, waits, allocations and
 // object creation all ran on the calling thread (E2), by wrapping the Vulkan entry points it is given.
 //
-// Usage: bc250dxvk_engine_test.exe <path to bc250dxvk.dll> [adapter substring] [--bench] [--bench-tiling]
+// Usage: bc250dxvk_engine_test.exe <path to bc250dxvk.dll> [adapter substring] [--icd <path>] [--bench]
+//        [--bench-tiling]
 // Exit code 0 = all checks passed. --bench adds a CPU-bound draw benchmark that prints timings (see RunBench).
 // --bench-tiling adds a GPU benchmark of LINEAR against OPTIMAL render targets (see RunTilingBench).
+// --icd loads that Vulkan driver DLL directly, as the UMD shell loads its bc250radv.dll, instead of going
+// through the Vulkan loader (vulkan-1.dll). Either way the "icd:" lines name every loaded driver and its SHA-256.
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -18,6 +21,7 @@
 #endif
 #define VK_NO_PROTOTYPES
 #include <windows.h>
+#include <bcrypt.h>
 #include <tlhelp32.h>
 #include <psapi.h>
 #include <d3d11_4.h>
@@ -975,16 +979,85 @@ namespace {
     }
   }
 
+  // SHA-256 of a file in upper-case hex, as Get-FileHash prints it; empty on any failure.
+  std::string FileSha256(const wchar_t* path) {
+    HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+
+    if (file == INVALID_HANDLE_VALUE)
+      return std::string();
+
+    BCRYPT_ALG_HANDLE alg = nullptr;
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    UCHAR digest[32] = { };
+    bool ok = BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0))
+           && BCRYPT_SUCCESS(BCryptCreateHash(alg, &hash, nullptr, 0, nullptr, 0, 0));
+    std::vector<UCHAR> buffer(1u << 20);
+
+    while (ok) {
+      DWORD read = 0;
+
+      if (!ReadFile(file, buffer.data(), DWORD(buffer.size()), &read, nullptr))
+        ok = false;
+      else if (!read)
+        break;
+      else
+        ok = BCRYPT_SUCCESS(BCryptHashData(hash, buffer.data(), read, 0));
+    }
+
+    ok = ok && BCRYPT_SUCCESS(BCryptFinishHash(hash, digest, sizeof(digest), 0));
+
+    if (hash)
+      BCryptDestroyHash(hash);
+    if (alg)
+      BCryptCloseAlgorithmProvider(alg, 0);
+    CloseHandle(file);
+
+    std::string hex;
+
+    for (UCHAR b : digest) {
+      static const char digits[] = "0123456789ABCDEF";
+      hex += digits[b >> 4];
+      hex += digits[b & 15];
+    }
+
+    return ok ? hex : std::string();
+  }
+
+  // Which Vulkan driver answers: every loaded module that exports the ICD entry point, with the SHA-256 of its
+  // file (a mapped image cannot change on disk while it is loaded). An environment setting alone does not say:
+  // the Vulkan loader ignores VK_DRIVER_FILES and VK_ICD_FILENAMES in an elevated process (loader_secure_getenv).
+  void PrintIcdModules() {
+    std::vector<HMODULE> modules(1024);
+    DWORD needed = 0;
+
+    if (!EnumProcessModules(GetCurrentProcess(), modules.data(), DWORD(modules.size() * sizeof(HMODULE)), &needed)) {
+      std::printf("icd: module list unavailable (%lu)\n", GetLastError());
+      return;
+    }
+
+    modules.resize(std::min<size_t>(modules.size(), needed / sizeof(HMODULE)));
+
+    for (HMODULE m : modules) {
+      if (!GetProcAddress(m, "vk_icdGetInstanceProcAddr"))
+        continue;
+
+      std::wstring path(32768, L'\0');
+      path.resize(GetModuleFileNameW(m, path.data(), DWORD(path.size())));
+      std::printf("icd: %ls sha256 %s\n", path.c_str(), FileSha256(path.c_str()).c_str());
+    }
+  }
+
 }
 
 int main(int argc, char** argv) {
   if (argc < 2) {
-    std::printf("usage: bc250dxvk_engine_test <bc250dxvk.dll> [adapter substring] [--bench] [--bench-tiling]\n");
+    std::printf("usage: bc250dxvk_engine_test <bc250dxvk.dll> [adapter substring] [--icd <path>] [--bench] [--bench-tiling]\n");
     return 2;
   }
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   const char* adapterFilter = nullptr;
+  const char* icdPath = nullptr;
   bool bench = false, benchTiling = false;
 
   for (int i = 2; i < argc; i++) {
@@ -992,20 +1065,52 @@ int main(int argc, char** argv) {
       bench = true;
     else if (!std::strcmp(argv[i], "--bench-tiling"))
       benchTiling = true;
-    else
+    else if (!std::strcmp(argv[i], "--icd") && i + 1 < argc)
+      icdPath = argv[++i];
+    else if (!std::strcmp(argv[i], "--icd")) {
+      std::printf("FAIL  --icd needs a path\n");
+      return 2;
+    } else
       adapterFilter = argv[i];
   }
 
   // ---- Vulkan instance and device, owned by the "shell" ----
-  HMODULE vulkanDll = LoadLibraryW(L"vulkan-1.dll");
+  Vk vk;
 
-  if (!vulkanDll) {
-    std::printf("FAIL  vulkan-1.dll not found\n");
+  if (icdPath) {
+    // The shell's load (EngineModules::open): absolute path, dependencies only from the DLL's own directory and
+    // System32, entry point vk_icdGetInstanceProcAddr, no loader and no interface negotiation.
+    char fullPath[MAX_PATH] = { };
+    const DWORD n = GetFullPathNameA(icdPath, MAX_PATH, fullPath, nullptr);
+    HMODULE icdDll = n && n < MAX_PATH
+      ? LoadLibraryExA(fullPath, nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32)
+      : nullptr;
+
+    if (!icdDll) {
+      std::printf("FAIL  LoadLibrary %s: %lu\n", icdPath, GetLastError());
+      return 1;
+    }
+
+    vk.getInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(GetProcAddress(icdDll, "vk_icdGetInstanceProcAddr"));
+
+    if (!vk.getInstanceProcAddr)
+      vk.getInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(GetProcAddress(icdDll, "vkGetInstanceProcAddr"));
+  } else {
+    HMODULE vulkanDll = LoadLibraryW(L"vulkan-1.dll");
+
+    if (!vulkanDll) {
+      std::printf("FAIL  vulkan-1.dll not found\n");
+      return 1;
+    }
+
+    vk.getInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(GetProcAddress(vulkanDll, "vkGetInstanceProcAddr"));
+  }
+
+  if (!vk.getInstanceProcAddr) {
+    std::printf("FAIL  no vkGetInstanceProcAddr\n");
     return 1;
   }
 
-  Vk vk;
-  vk.getInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(GetProcAddress(vulkanDll, "vkGetInstanceProcAddr"));
   LoadInstance(vk, nullptr, &vk.createInstance, "vkCreateInstance");
 
   VkApplicationInfo app = { VK_STRUCTURE_TYPE_APPLICATION_INFO };
@@ -1048,9 +1153,23 @@ int main(int argc, char** argv) {
       physDev = p;
   }
 
+  PrintIcdModules();
+
   if (!physDev) {
     std::printf("FAIL  no matching physical device\n");
     return 1;
+  }
+
+  // The driver behind the chosen device; for Mesa, driverInfo carries the build's version and commit.
+  auto getProperties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
+    vk.getInstanceProcAddr(instance, "vkGetPhysicalDeviceProperties2"));
+
+  if (getProperties2) {
+    VkPhysicalDeviceDriverProperties driver = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES };
+    VkPhysicalDeviceProperties2 props2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
+    props2.pNext = &driver;
+    getProperties2(physDev, &props2);
+    std::printf("driver: %s, %s\n", driver.driverName, driver.driverInfo);
   }
 
   // ---- engine ----
