@@ -1768,6 +1768,151 @@ int main(int argc, char** argv) {
       uint32_t rastCovered = coveredBy(soRast.Get(), "Map staging (rasterized stream)");
       Check(rastCovered >= 2016u && rastCovered <= 2080u,
         "the rasterized stream of the pass-through covers the triangle's pixels");
+
+      // ---- predication (D3D11 spec 20.2): occlusion and stream output overflow predicates ----
+      // A predicated operation is skipped when the predicate's result equals the value given to
+      // SetPredication. The first use of each predicate below finds its result not yet available,
+      // so the engine has to submit and wait for it.
+      const float red[4] = { 1.0f, 0.0f, 0.0f, 1.0f };
+
+      // Pixels that differ from the clear colour after an unpredicated clear, then a predicated clear
+      // to red and a predicated draw: 0 if both were skipped, the whole target if they ran
+      auto changedBy = [&] (ID3D11Predicate* predicate, BOOL value, const char* what) {
+        ctx->ClearRenderTargetView(rtv.Get(), clear);
+        ctx->SetPredication(predicate, value);
+        ctx->ClearRenderTargetView(rtv.Get(), red);
+        ctx->Draw(3u, 0u);
+        ctx->SetPredication(nullptr, FALSE);
+        ctx->CopyResource(staging.Get(), rt.Get());
+
+        uint32_t count = ~0u;
+
+        if (CheckHr(ctx->Map(staging.Get(), 0u, D3D11_MAP_READ, 0u, &mapped), what)) {
+          count = 0u;
+
+          for (UINT y = 0u; y < H; y++) {
+            for (UINT x = 0u; x < W; x++) {
+              if (!similar(pixel(x, y), cr, cg, cb, 1))
+                count++;
+            }
+          }
+
+          ctx->Unmap(staging.Get(), 0u);
+        }
+
+        std::printf("      %s: %u pixels changed\n", what, count);
+        return count;
+      };
+
+      // Waits for a predicate's result the way an application does, for the checks of the result itself
+      auto resultOf = [&] (ID3D11Predicate* predicate) {
+        BOOL result = -1;
+
+        for (UINT tries = 0u; tries < 5000u; tries++) {
+          HRESULT hr = ctx->GetData(predicate, &result, sizeof(result), 0u);
+
+          if (hr != S_FALSE)
+            return hr == S_OK ? result : BOOL(-2);
+
+          Sleep(1u);
+        }
+
+        return BOOL(-3);
+      };
+
+      const D3D11_QUERY_DESC occlusionDesc = { D3D11_QUERY_OCCLUSION_PREDICATE, 0u };
+      Microsoft::WRL::ComPtr<ID3D11Predicate> zero, hit;
+
+      if (CheckHr(d3d->CreatePredicate(&occlusionDesc, &zero), "CreatePredicate (occlusion, no samples)")
+       && CheckHr(d3d->CreatePredicate(&occlusionDesc, &hit), "CreatePredicate (occlusion, triangle)")) {
+        // No samples: the triangle drawn through a viewport far outside the target
+        const D3D11_VIEWPORT outside = { -1000.0f, -1000.0f, float(W), float(H), 0.0f, 1.0f };
+        ctx->RSSetViewports(1u, &outside);
+        ctx->Begin(zero.Get());
+        ctx->Draw(3u, 0u);
+        ctx->End(zero.Get());
+        ctx->RSSetViewports(1u, &viewport);
+
+        ctx->Begin(hit.Get());
+        ctx->Draw(3u, 0u);
+        ctx->End(hit.Get());
+
+        Check(changedBy(zero.Get(), FALSE, "predicate FALSE, value FALSE") == 0u,
+          "an occlusion predicate without samples skips the clear and the draw predicated on FALSE");
+        Check(changedBy(zero.Get(), TRUE, "predicate FALSE, value TRUE") == W * H,
+          "the same predicate lets them run when predicated on TRUE");
+        Check(changedBy(hit.Get(), TRUE, "predicate TRUE, value TRUE") == 0u,
+          "an occlusion predicate with samples skips the clear and the draw predicated on TRUE");
+        Check(changedBy(hit.Get(), FALSE, "predicate TRUE, value FALSE") == W * H,
+          "the same predicate lets them run when predicated on FALSE");
+        Check(resultOf(zero.Get()) == FALSE && resultOf(hit.Get()) == TRUE,
+          "GetData reports the two occlusion predicates as FALSE and TRUE");
+
+        Microsoft::WRL::ComPtr<ID3D11Predicate> current;
+        BOOL currentValue = FALSE;
+        ctx->SetPredication(hit.Get(), TRUE);
+        ctx->GetPredication(&current, &currentValue);
+        ctx->SetPredication(nullptr, FALSE);
+        Check(current.Get() == hit.Get() && currentValue == TRUE, "GetPredication returns the predicate and value set");
+
+        // Copies and updates honour predication too: with the operations skipped, the read-back
+        // buffer keeps the first pattern
+        std::array<float, 3u * SoFloats> first, second, seen;
+        first.fill(1.0f);
+        second.fill(2.0f);
+        seen.fill(0.0f);
+
+        ctx->UpdateSubresource(soBuf.Get(), 0u, nullptr, first.data(), 0u, 0u);
+        ctx->CopyResource(soRead.Get(), soBuf.Get());
+
+        ctx->SetPredication(hit.Get(), TRUE);
+        ctx->UpdateSubresource(soBuf.Get(), 0u, nullptr, second.data(), 0u, 0u);
+        ctx->CopyResource(soRead.Get(), soBuf.Get());
+        ctx->SetPredication(nullptr, FALSE);
+
+        D3D11_MAPPED_SUBRESOURCE m = { };
+
+        if (CheckHr(ctx->Map(soRead.Get(), 0u, D3D11_MAP_READ, 0u, &m), "Map (predicated copy)")) {
+          std::memcpy(seen.data(), m.pData, sizeof(seen));
+          ctx->Unmap(soRead.Get(), 0u);
+        }
+
+        Check(seen == first, "a predicated-off CopyResource writes nothing");
+
+        ctx->CopyResource(soRead.Get(), soBuf.Get());
+        seen.fill(0.0f);
+
+        if (CheckHr(ctx->Map(soRead.Get(), 0u, D3D11_MAP_READ, 0u, &m), "Map (after predicated update)")) {
+          std::memcpy(seen.data(), m.pData, sizeof(seen));
+          ctx->Unmap(soRead.Get(), 0u);
+        }
+
+        Check(seen == first, "a predicated-off UpdateSubresource writes nothing");
+      }
+
+      // Stream output overflow: the three-record target takes one line of a two-line strip, but the
+      // whole triangle of a list
+      const D3D11_QUERY_DESC anyDesc = { D3D11_QUERY_SO_OVERFLOW_PREDICATE, 0u };
+      const D3D11_QUERY_DESC stream0Desc = { D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM0, 0u };
+      Microsoft::WRL::ComPtr<ID3D11Predicate> overflowed, fitted;
+
+      if (CheckHr(d3d->CreatePredicate(&anyDesc, &overflowed), "CreatePredicate (SO overflow, any stream)")
+       && CheckHr(d3d->CreatePredicate(&stream0Desc, &fitted), "CreatePredicate (SO overflow, stream 0)")) {
+        ctx->Begin(overflowed.Get());
+        capture(soNoCode.Get(), D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP, "overflowing line strip");
+        ctx->End(overflowed.Get());
+
+        ctx->Begin(fitted.Get());
+        capture(soNoCode.Get(), D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, "fitting triangle list");
+        ctx->End(fitted.Get());
+
+        Check(changedBy(overflowed.Get(), TRUE, "overflow predicate, value TRUE") == 0u,
+          "an overflowed stream output skips the operations predicated on TRUE");
+        Check(changedBy(fitted.Get(), TRUE, "no-overflow predicate, value TRUE") == W * H,
+          "stream output that fits lets them run");
+        Check(resultOf(overflowed.Get()) == TRUE && resultOf(fitted.Get()) == FALSE,
+          "GetData reports overflow for the strip and none for the list");
+      }
     }
   }
 
