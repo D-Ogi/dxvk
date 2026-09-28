@@ -69,6 +69,7 @@ namespace {
     std::atomic<uint32_t> foreignLogs    { 0u };
     std::atomic<uint32_t> malformedLogs  { 0u };
     std::vector<std::string> errors;
+    std::vector<std::string> lines;
 
     bool HasError(const char* text) const {
       for (const auto& e : errors) {
@@ -107,7 +108,13 @@ namespace {
     if (level == 1u)
       s->errors.push_back(message);
 
-    std::printf("engine[%u]: %s\n", level, message);
+    s->lines.push_back(std::to_string(level) + ": " + message);
+
+    // Errors and warnings go to the receipt at once. The rest is kept for engine_sink.log: stdout is
+    // unbuffered, and a write per line into a redirected pipe costs milliseconds, which would swamp
+    // the timings.
+    if (level <= 2u)
+      std::printf("engine[%u]: %s\n", level, message);
   }
 
   // The engine's log file for this executable, as DXVK names it: <DXVK_LOG_PATH>/<exe base name>_bc250dxvk.log
@@ -526,19 +533,31 @@ int main(int argc, char** argv) {
   vkInstance.ApiVersion          = app.apiVersion;
   vkInstance.PhysicalDevice      = physDev;
 
+  // Wall time of the adapter-level calls and of device creation, each of which imports its own DxvkInstance.
+  // Informational: the development GPU says little about the BC-250.
+  auto nowMs = [] {
+    LARGE_INTEGER t, f;
+    QueryPerformanceCounter(&t);
+    QueryPerformanceFrequency(&f);
+    return 1e3 * double(t.QuadPart) / double(f.QuadPart);
+  };
+
   BC250_DXVK_ADAPTER_INFO adapterInfo = { sizeof(adapterInfo) };
+  double tAdapter = nowMs();
 
   if (!CheckHr(funcs.GetAdapterInfo(&vkInstance, &adapterInfo), "GetAdapterInfo"))
     return 1;
 
-  std::printf("      MaxFeatureLevel 0x%x\n", adapterInfo.MaxFeatureLevel);
+  std::printf("      MaxFeatureLevel 0x%x, %.1f ms\n", adapterInfo.MaxFeatureLevel, nowMs() - tAdapter);
 
   BC250_DXVK_DEVICE_REQUIREMENTS req = { sizeof(req) };
+  double tRequirements = nowMs();
 
   if (!CheckHr(funcs.QueryDeviceRequirements(&vkInstance, &req), "QueryDeviceRequirements"))
     return 1;
 
-  std::printf("      %u device extensions, queue family %u\n", req.ExtensionCount, req.QueueFamily);
+  std::printf("      %u device extensions, queue family %u, %.1f ms\n", req.ExtensionCount, req.QueueFamily,
+    nowMs() - tRequirements);
 
   float priority = 1.0f;
   VkDeviceQueueCreateInfo qci = { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO };
@@ -627,9 +646,12 @@ int main(int argc, char** argv) {
   std::set<DWORD> threadsBefore = ProcessThreads();
 
   IBc250DxvkDevice* engine = nullptr;
+  double tCreate = nowMs();
 
   if (!CheckHr(funcs.CreateDevice(&createInfo, &engine), "CreateDevice"))
     return 1;
+
+  std::printf("      %.1f ms\n", nowMs() - tCreate);
 
   Check(shell.logLines.load() > 0u, "CreateDevice's own lines (device import) reach the shell's Log");
 
@@ -1320,8 +1342,12 @@ int main(int argc, char** argv) {
        && text.find("Importing device") == std::string::npos
        && text.find("90 or 270") == std::string::npos,
       "the log file holds the device-less lines only");
+    std::ofstream sinkFile(logFile.substr(0u, logFile.find_last_of('/')) + "/engine_sink.log");
+
+    for (const auto& line : shell.lines)
+      sinkFile << line << '\n';
   } else {
-    std::printf("      DXVK_LOG_PATH not set: log file check skipped\n");
+    std::printf("      DXVK_LOG_PATH not set: log file check skipped, engine_sink.log not written\n");
   }
 
   vk.destroyImage(device, image, nullptr);
