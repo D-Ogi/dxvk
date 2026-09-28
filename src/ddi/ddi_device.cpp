@@ -65,7 +65,8 @@ namespace dxvk::ddi {
 
     if (riid == __uuidof(IUnknown)
      || riid == __uuidof(IBc250DxvkDevice)
-     || riid == __uuidof(IBc250DxvkDevice1)) {
+     || riid == __uuidof(IBc250DxvkDevice1)
+     || riid == __uuidof(IBc250DxvkDevice2)) {
       *ppvObject = ref(this);
       return S_OK;
     }
@@ -443,6 +444,82 @@ namespace dxvk::ddi {
     const D3D11_TEXTURE2D_DESC1*            pDesc,
           VkImage                           Image,
           ID3D11Texture2D**                 ppTexture) {
+    return WrapImage(pDesc, Image, VK_IMAGE_TILING_MAX_ENUM, ppTexture);
+  }
+
+
+  static const VkImageFormatListCreateInfo* FindViewFormatList(const void* pNext) {
+    for (auto s = static_cast<const VkBaseInStructure*>(pNext); s; s = s->pNext) {
+      if (s->sType == VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO)
+        return reinterpret_cast<const VkImageFormatListCreateInfo*>(s);
+    }
+
+    return nullptr;
+  }
+
+
+  static bool HasSameViewFormats(
+    const VkImageFormatListCreateInfo*      pExpected,
+    const VkImageFormatListCreateInfo*      pActual) {
+    if (!pExpected)
+      return true;
+
+    if (!pActual || pActual->viewFormatCount != pExpected->viewFormatCount || !pActual->pViewFormats)
+      return false;
+
+    std::vector<VkFormat> expected(pExpected->pViewFormats, pExpected->pViewFormats + pExpected->viewFormatCount);
+    std::vector<VkFormat> actual(pActual->pViewFormats, pActual->pViewFormats + pActual->viewFormatCount);
+    std::sort(expected.begin(), expected.end());
+    std::sort(actual.begin(), actual.end());
+    return expected == actual;
+  }
+
+
+  HRESULT STDMETHODCALLTYPE Bc250DxvkDevice::CreateTexture2DFromImage2(
+    const D3D11_TEXTURE2D_DESC1*            pDesc,
+    const VkImageCreateInfo*                pInfo,
+          VkImage                           Image,
+          ID3D11Texture2D**                 ppTexture) {
+    if (!pDesc || !pInfo || !ppTexture || Image == VK_NULL_HANDLE)
+      return E_INVALIDARG;
+
+    *ppTexture = nullptr;
+
+    VkImageCreateInfo expected = { };
+    HRESULT hr = GetImageCreateInfo(pDesc, &expected);
+
+    if (FAILED(hr))
+      return hr;
+
+    const VkImageCreateInfo& actual = *pInfo;
+
+    bool compatible = actual.sType == VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO
+      && actual.imageType     == expected.imageType
+      && actual.format        == expected.format
+      && actual.extent.width  == expected.extent.width
+      && actual.extent.height == expected.extent.height
+      && actual.extent.depth  == expected.extent.depth
+      && actual.mipLevels     == expected.mipLevels
+      && actual.arrayLayers   == expected.arrayLayers
+      && actual.samples       == expected.samples
+      && (actual.usage & expected.usage) == expected.usage
+      && (actual.flags & expected.flags) == expected.flags
+      && (actual.tiling == VK_IMAGE_TILING_LINEAR
+       || (actual.tiling == VK_IMAGE_TILING_OPTIMAL && expected.tiling == VK_IMAGE_TILING_OPTIMAL))
+      && HasSameViewFormats(FindViewFormatList(expected.pNext), FindViewFormatList(actual.pNext));
+
+    if (!compatible || !CheckImageSupport(expected, actual.tiling))
+      return E_INVALIDARG;
+
+    return WrapImage(pDesc, Image, actual.tiling, ppTexture);
+  }
+
+
+  HRESULT Bc250DxvkDevice::WrapImage(
+    const D3D11_TEXTURE2D_DESC1*            pDesc,
+          VkImage                           Image,
+          VkImageTiling                     Tiling,
+          ID3D11Texture2D**                 ppTexture) {
     if (!pDesc || !ppTexture || Image == VK_NULL_HANDLE)
       return E_INVALIDARG;
 
@@ -457,7 +534,7 @@ namespace dxvk::ddi {
     try {
       // DXGI_USAGE_BACK_BUFFER keeps the image sampleable and marks it shared, as for DXVK's own
       // swap chain images: the runtime owns this memory.
-      Com<D3D11Texture2D> texture = new D3D11Texture2D(m_device, &desc, DXGI_USAGE_BACK_BUFFER, Image);
+      Com<D3D11Texture2D> texture = new D3D11Texture2D(m_device, &desc, DXGI_USAGE_BACK_BUFFER, Image, Tiling);
       *ppTexture = texture.ref();
       return S_OK;
     } catch (const DxvkError& e) {

@@ -3,7 +3,7 @@
  * bc250_dxvk_engine.h - boundary between the BC-250 system D3D10/11 user-mode driver ("shell", the
  * UserModeDriverName DLL) and its DXVK engine ("engine", bc250dxvk.dll, DXVK fork branch amdgpu-wddm/ddi-engine).
  *
- * Revision r2, ABI 1.1. This file in the DXVK fork is the only copy; the shell includes it from the DXVK
+ * Revision r3, ABI 1.2. This file in the DXVK fork is the only copy; the shell includes it from the DXVK
  * source checkout it builds against, like its other DXVK-facing headers.
  *
  * Versions. A minor version adds and never changes: an engine of minor n serves a shell built for any minor
@@ -11,6 +11,7 @@
  * new function, so a shell that needs it gets E_NOINTERFACE from an older engine rather than a wrong result.
  *   1.0  r1: IBc250DxvkDevice.
  *   1.1  r2: IBc250DxvkDevice1 (Blt1, DXGI Blt with a source rectangle).
+ *   1.2  r3: IBc250DxvkDevice2 (CreateTexture2DFromImage2, a runtime image with the shell's own tiling).
  *
  * WDK-free by construction. DXVK's util_gdi.h declares private extern-C D3DKMT prototypes that collide with
  * the WDK's in one translation unit, so nothing here needs d3d10umddi.h or a DXVK header: windows.h, the SDK's
@@ -55,7 +56,7 @@
  *       VkDevice then (leak rather than use-after-free) and should log it. Final Release drains the GPU.
  *   E5  Runtime allocations. For resources whose memory the runtime must own (primary, anything passed to
  *       pfnPresentCb, shared) the shell allocates through the runtime, imports the allocation into Vulkan
- *       (hosted import), creates and binds the VkImage and wraps it with CreateTexture2DFromImage. The shell
+ *       (hosted import), creates and binds the VkImage and wraps it with CreateTexture2DFromImage(2). The shell
  *       keeps the VkImage, VkDeviceMemory and runtime allocation. On DDI DestroyResource it calls
  *       WaitForResourceIdle, releases the texture (views are released first by the runtime), then destroys
  *       the image, frees the memory and deallocates (primaries immediately, others possibly deferred to Flush).
@@ -84,7 +85,7 @@
 #include <vulkan/vulkan.h>
 
 #define BC250_DXVK_ENGINE_ABI_MAJOR 1u
-#define BC250_DXVK_ENGINE_ABI_MINOR 1u
+#define BC250_DXVK_ENGINE_ABI_MINOR 2u
 #define BC250_DXVK_ENGINE_ABI_VERSION ((BC250_DXVK_ENGINE_ABI_MAJOR << 16) | BC250_DXVK_ENGINE_ABI_MINOR)
 
 /* The Vulkan objects the shell owns (E1). */
@@ -278,11 +279,12 @@ IBc250DxvkDevice : public IUnknown {
      * for desc: type, format, extent, levels, layers, samples, usage, flags, and LINEAR tiling where DXVK itself
      * would fall back to it. info->pNext may point to a VkImageFormatListCreateInfo that the engine device owns
      * until its final Release: keep it in the chain (drivers keep compression on mutable-format images only with
-     * a list) and link the shell's own structures in front of it. The shell may add usage bits and choose the
-     * tiling of a runtime allocation; it must not remove usage or flags. Only GPU-only textures qualify: Usage
-     * DEFAULT or IMMUTABLE, CPUAccessFlags 0, not TILED (E_INVALIDARG otherwise); the SHARED, SHARED_NTHANDLE and
-     * SHARED_KEYEDMUTEX MiscFlags are ignored, sharing is the shell's. CPU-accessible textures come from
-     * ID3D11Device::CreateTexture2D, with engine-owned memory. */
+     * a list) and link the shell's own structures in front of it. The shell may add usage bits; it must not
+     * remove usage or flags. Only GPU-only textures qualify: Usage DEFAULT or IMMUTABLE, CPUAccessFlags 0, not
+     * TILED (E_INVALIDARG otherwise); the SHARED, SHARED_NTHANDLE and SHARED_KEYEDMUTEX MiscFlags are ignored,
+     * sharing is the shell's. CPU-accessible textures come from ID3D11Device::CreateTexture2D, with engine-owned
+     * memory. CreateTexture2DFromImage takes the image to have the returned tiling; an image with another tiling
+     * goes through IBc250DxvkDevice2::CreateTexture2DFromImage2. */
     virtual HRESULT STDMETHODCALLTYPE GetImageCreateInfo(const D3D11_TEXTURE2D_DESC1 *desc,
                                                          VkImageCreateInfo *info) = 0;
     virtual HRESULT STDMETHODCALLTYPE CreateTexture2DFromImage(const D3D11_TEXTURE2D_DESC1 *desc, VkImage image,
@@ -325,6 +327,21 @@ IBc250DxvkDevice1 : public IBc250DxvkDevice {
      * otherwise); sizes that differ stretch. ROTATE180 turns the content within DestinationRect; the shell
      * passes DestinationRect as the runtime gives it. */
     virtual HRESULT STDMETHODCALLTYPE Blt1(const BC250_DXVK_BLT1 *blt) = 0;
+};
+
+/* ABI 1.2. The same object as IBc250DxvkDevice; QueryInterface on it, E_NOINTERFACE from an older engine. */
+MIDL_INTERFACE("264889a8-61e8-4fee-ba1f-575062a45244")
+IBc250DxvkDevice2 : public IBc250DxvkDevice1 {
+    /* E5 for an image whose tiling the shell chose, such as a LINEAR runtime allocation. info is the
+     * VkImageCreateInfo the shell created image with. Compared with what GetImageCreateInfo returns for desc,
+     * it must have the same type, format, extent, levels, layers and samples, every returned usage bit and
+     * flag, and the same view formats in a VkImageFormatListCreateInfo in its chain when one was returned.
+     * Tiling must be OPTIMAL or LINEAR, and LINEAR where GetImageCreateInfo returned LINEAR. E_INVALIDARG
+     * otherwise, and when the engine cannot use such an image for desc with that tiling. The engine then uses
+     * the image with that tiling (format features, layouts); otherwise as CreateTexture2DFromImage. */
+    virtual HRESULT STDMETHODCALLTYPE CreateTexture2DFromImage2(const D3D11_TEXTURE2D_DESC1 *desc,
+                                                                const VkImageCreateInfo *info, VkImage image,
+                                                                ID3D11Texture2D **texture) = 0;
 };
 
 struct BC250_DXVK_ENGINE_FUNCS {

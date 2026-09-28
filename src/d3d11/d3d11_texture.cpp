@@ -16,7 +16,8 @@ namespace dxvk {
           D3D11_RESOURCE_DIMENSION    Dimension,
           DXGI_USAGE                  DxgiUsage,
           VkImage                     vkImage,
-          HANDLE                      hSharedHandle)
+          HANDLE                      hSharedHandle,
+          VkImageTiling               vkTiling)
   : m_interface(pInterface), m_device(pDevice), m_dimension(Dimension), m_desc(*pDesc),
     m_11on12(p11on12Info ? *p11on12Info : D3D11_ON_12_RESOURCE_INFO()), m_dxgiUsage(DxgiUsage) {
     DXGI_VK_FORMAT_MODE   formatMode   = GetFormatMode();
@@ -167,6 +168,10 @@ namespace dxvk {
     // only supported with linear tiling on most GPUs
     if (!CheckImageSupport(&imageInfo, VK_IMAGE_TILING_OPTIMAL))
       imageInfo.tiling = VK_IMAGE_TILING_LINEAR;
+
+    // An imported image whose owner chose the tiling
+    if (vkImage && vkTiling != VK_IMAGE_TILING_MAX_ENUM)
+      imageInfo.tiling = vkTiling;
     
     // Determine map mode based on our findings
     VkMemoryPropertyFlags memoryProperties = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
@@ -1409,9 +1414,10 @@ namespace dxvk {
           D3D11Device*                pDevice,
     const D3D11_COMMON_TEXTURE_DESC*  pDesc,
           DXGI_USAGE                  DxgiUsage,
-          VkImage                     vkImage)
+          VkImage                     vkImage,
+          VkImageTiling               vkTiling)
   : D3D11DeviceChild<ID3D11Texture2D1>(pDevice),
-    m_texture   (this, pDevice, pDesc, nullptr, D3D11_RESOURCE_DIMENSION_TEXTURE2D, DxgiUsage, vkImage, nullptr),
+    m_texture   (this, pDevice, pDesc, nullptr, D3D11_RESOURCE_DIMENSION_TEXTURE2D, DxgiUsage, vkImage, nullptr, vkTiling),
     m_interop   (this, &m_texture),
     m_surface   (this),
     m_resource  (this, pDevice),

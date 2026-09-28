@@ -43,7 +43,7 @@ namespace dxvk::ddi {
   };
 
 
-  class Bc250DxvkDevice : public ComObject<IBc250DxvkDevice1> {
+  class Bc250DxvkDevice : public ComObject<IBc250DxvkDevice2> {
 
   public:
 
@@ -113,6 +113,12 @@ namespace dxvk::ddi {
     HRESULT STDMETHODCALLTYPE Blt1(
       const BC250_DXVK_BLT1*                  pBlt) final;
 
+    HRESULT STDMETHODCALLTYPE CreateTexture2DFromImage2(
+      const D3D11_TEXTURE2D_DESC1*            pDesc,
+      const VkImageCreateInfo*                pInfo,
+            VkImage                           Image,
+            ID3D11Texture2D**                 ppTexture) final;
+
   private:
 
     // View format lists handed out through GetImageCreateInfo's pNext; they live as long as the device.
@@ -149,6 +155,13 @@ namespace dxvk::ddi {
     bool CheckImageSupport(
       const VkImageCreateInfo&                info,
             VkImageTiling                     tiling) const;
+
+    // CreateTexture2DFromImage(2); Tiling VK_IMAGE_TILING_MAX_ENUM lets DXVK choose as for its own images
+    HRESULT WrapImage(
+      const D3D11_TEXTURE2D_DESC1*            pDesc,
+            VkImage                           Image,
+            VkImageTiling                     Tiling,
+            ID3D11Texture2D**                 ppTexture);
 
     const VkImageFormatListCreateInfo* GetViewFormatList(
       const DXGI_VK_FORMAT_FAMILY&            family);

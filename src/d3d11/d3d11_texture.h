@@ -95,7 +95,8 @@ namespace dxvk {
             D3D11_RESOURCE_DIMENSION    Dimension,
             DXGI_USAGE                  DxgiUsage,
             VkImage                     vkImage,
-            HANDLE                      hSharedHandle);
+            HANDLE                      hSharedHandle,
+            VkImageTiling               vkTiling = VK_IMAGE_TILING_MAX_ENUM);
     
     ~D3D11CommonTexture();
     
@@ -813,7 +814,8 @@ namespace dxvk {
             D3D11Device*                pDevice,
       const D3D11_COMMON_TEXTURE_DESC*  pDesc,
             DXGI_USAGE                  DxgiUsage,
-            VkImage                     vkImage);
+            VkImage                     vkImage,
+            VkImageTiling               vkTiling = VK_IMAGE_TILING_MAX_ENUM);
     
     D3D11Texture2D(
             D3D11Device*                pDevice,
