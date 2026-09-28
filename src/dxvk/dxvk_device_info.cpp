@@ -602,6 +602,40 @@ namespace dxvk {
     if (!instance.options().enableNvRawAccessChains)
       m_featuresSupported.nvRawAccessChains.shaderRawAccessChains = VK_FALSE;
 
+    // Presentation device extensions depend on surface extensions of the instance. An imported instance
+    // may not have enabled those (the BC-250 D3D11 DDI engine never presents through Vulkan), and enabling
+    // the device extensions anyway violates VUID-vkCreateDevice-ppEnabledExtensionNames-01387. An instance
+    // DXVK creates itself enables the surface extensions, so nothing changes there.
+    const auto& instanceExtensions = instance.extensions();
+
+    bool hasSurface             = instanceExtensions.khrSurface.specVersion != 0u;
+    bool hasSurfaceCaps2        = instanceExtensions.khrGetSurfaceCapabilities2.specVersion != 0u;
+    bool hasSurfaceMaintenance1 = instanceExtensions.khrSurfaceMaintenance1.specVersion != 0u
+                               || instanceExtensions.extSurfaceMaintenance1.specVersion != 0u;
+
+    m_requireSwapchain = hasSurface;
+
+    if (!hasSurface) {
+      m_featuresSupported.khrSwapchain = VK_FALSE;
+      m_featuresSupported.khrSwapchainMutableFormat = VK_FALSE;
+      m_featuresSupported.khrIncrementalPresent = VK_FALSE;
+      m_featuresSupported.extHdrMetadata = VK_FALSE;
+      m_featuresSupported.khrPresentId.presentId = VK_FALSE;
+      m_featuresSupported.khrPresentWait.presentWait = VK_FALSE;
+    }
+
+    if (!hasSurface || !hasSurfaceCaps2) {
+      m_featuresSupported.extFullScreenExclusive = VK_FALSE;
+      m_featuresSupported.khrPresentId2.presentId2 = VK_FALSE;
+      m_featuresSupported.khrPresentWait2.presentWait2 = VK_FALSE;
+      m_featuresSupported.extPresentTiming.presentTiming = VK_FALSE;
+    }
+
+    if (!hasSurface || !hasSurfaceMaintenance1) {
+      m_featuresSupported.khrSwapchainMaintenance1.swapchainMaintenance1 = VK_FALSE;
+      m_featuresSupported.extSwapchainMaintenance1.swapchainMaintenance1 = VK_FALSE;
+    }
+
     // Disable somewhat broken present_id2 on older Nvidia drivers.
     if (m_properties.vk12.driverID == VK_DRIVER_ID_NVIDIA_PROPRIETARY
      && m_properties.driverVersion < Version(595u, 0u, 0u))
@@ -1087,8 +1121,8 @@ namespace dxvk {
       /* Untyped pointers, dependency for descriptor heaps */
       ENABLE_EXT_FEATURE(khrShaderUntypedPointers, shaderUntypedPointers, false),
 
-      /* Swapchain, needed for presentation */
-      ENABLE_EXT(khrSwapchain, true),
+      /* Swapchain, needed for presentation, unless the instance cannot present */
+      ENABLE_EXT(khrSwapchain, m_requireSwapchain),
 
       /* Swapchain maintenance, used to implement proper synchronization
        * and dynamic present modes to avoid swapchain recreation */

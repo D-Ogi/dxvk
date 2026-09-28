@@ -91,6 +91,22 @@ namespace dxvk::ddi {
         req->featureBlob.resize(blobSize);
         caps.queryDeviceFeatures(&blobSize, req->featureBlob.data());
 
+        // The blob is a byte copy of DXVK's feature structure, so its pNext chain still points into caps,
+        // which dies with this scope. Every chained structure is a member of that structure: move each
+        // link to the same offset in the blob.
+        auto base = reinterpret_cast<const char*>(&caps.getFeatures());
+        auto link = reinterpret_cast<VkBaseOutStructure*>(req->featureBlob.data());
+
+        while (link->pNext) {
+          ptrdiff_t offset = reinterpret_cast<const char*>(link->pNext) - base;
+
+          if (offset <= 0 || size_t(offset) + sizeof(VkBaseOutStructure) > blobSize)
+            throw DxvkError("bc250dxvk: Feature chain leaves DXVK's feature structure");
+
+          link->pNext = reinterpret_cast<VkBaseOutStructure*>(req->featureBlob.data() + offset);
+          link = link->pNext;
+        }
+
         UINT32 size = out->Size;
         std::memset(out, 0, sizeof(*out));
 
