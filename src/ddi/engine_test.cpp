@@ -1,4 +1,4 @@
-// Offline positive control for bc250dxvk.dll (engine ABI 1.0) on any Vulkan 1.3 GPU. No window; exits.
+// Offline positive control for bc250dxvk.dll (engine ABI 1.2) on any Vulkan 1.3 GPU. No window; exits.
 //
 // Plays the UMD shell: owns the VkInstance and VkDevice (E1), creates the device from the engine's
 // requirements, allocates the render target image itself (E5), and feeds shaders in DDI form: the token
@@ -6,8 +6,9 @@
 // clear and one draw, storage rotation, DXGI Blt onto an imported image, and that the engine's queue submissions, waits, allocations and
 // object creation all ran on the calling thread (E2), by wrapping the Vulkan entry points it is given.
 //
-// Usage: bc250dxvk_engine_test.exe <path to bc250dxvk.dll> [adapter substring] [--bench]
+// Usage: bc250dxvk_engine_test.exe <path to bc250dxvk.dll> [adapter substring] [--bench] [--bench-tiling]
 // Exit code 0 = all checks passed. --bench adds a CPU-bound draw benchmark that prints timings (see RunBench).
+// --bench-tiling adds a GPU benchmark of LINEAR against OPTIMAL render targets (see RunTilingBench).
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -27,6 +28,7 @@
 
 #include <wrl/client.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdio>
@@ -681,6 +683,7 @@ namespace {
     PFN_vkGetPhysicalDeviceProperties           getPhysicalDeviceProperties = nullptr;
     PFN_vkGetPhysicalDeviceMemoryProperties     getPhysicalDeviceMemoryProperties = nullptr;
     PFN_vkGetPhysicalDeviceFormatProperties     getPhysicalDeviceFormatProperties = nullptr;
+    PFN_vkGetPhysicalDeviceImageFormatProperties getPhysicalDeviceImageFormatProperties = nullptr;
     PFN_vkCreateDevice                          createDevice = nullptr;
     PFN_vkGetDeviceProcAddr                     getDeviceProcAddr = nullptr;
     PFN_vkDestroyDevice                         destroyDevice = nullptr;
@@ -693,26 +696,279 @@ namespace {
     PFN_vkBindImageMemory                       bindImageMemory = nullptr;
   };
 
+  // DXVK's IDXGIVkInteropSurface (src/dxgi/dxgi_interfaces.h), declared here to keep the test on the ABI header
+  // and the SDK: it shows the tiling the engine uses for a wrapped image.
+  MIDL_INTERFACE("5546cf8c-77e7-4341-b05d-8d4d5000e77d")
+  DxvkInteropSurface : public IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE GetDevice(IUnknown** ppDevice) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetVulkanImageInfo(VkImage* pHandle, VkImageLayout* pLayout,
+                                                         VkImageCreateInfo* pInfo) = 0;
+  };
+
   template<typename T>
   void LoadInstance(Vk& vk, VkInstance instance, T* fn, const char* name) {
     *fn = reinterpret_cast<T>(vk.getInstanceProcAddr(instance, name));
+  }
+
+  // ---- GPU cost of LINEAR runtime surfaces (--bench-tiling) ------------------------------------------
+
+  // The shell allocates runtime surfaces LINEAR. Per-application DXVK renders into its own OPTIMAL back buffer
+  // and copies it to the presentable image once per frame. On the GPU it runs on, this prints the costs that
+  // decide between drawing into a LINEAR runtime image and drawing into an OPTIMAL image copied at present:
+  // blended full-screen draws into each tiling, the copy, and a 1:1 read of each tiling as composition does.
+  // Prints numbers; not a pass/fail check.
+  const char* g_tilingHlsl = R"(
+    Texture2D src : register(t0);
+
+    float4 vs(uint id : SV_VertexID) : SV_Position {
+      float2 uv = float2((id << 1) & 2, id & 2);
+      return float4(uv * float2(2.0f, -2.0f) + float2(-1.0f, 1.0f), 0.0f, 1.0f);
+    }
+
+    float4 fill(float4 pos : SV_Position) : SV_Target {
+      return float4(frac(pos.xy / 256.0f), 0.5f, 0.25f);
+    }
+
+    float4 load(float4 pos : SV_Position) : SV_Target {
+      return src.Load(int3(pos.xy, 0));
+    }
+  )";
+
+  void RunTilingBench(Vk& vk, VkPhysicalDevice physDev, VkDevice device,
+      const VkPhysicalDeviceMemoryProperties& memProps, IBc250DxvkDevice2* engine, ID3D11Device* d3d,
+      ID3D11DeviceContext* ctx) {
+    using Microsoft::WRL::ComPtr;
+    constexpr UINT Width = 1920u, Height = 1080u, DrawsPerFrame = 8u, Frames = 100u;
+
+    struct Target {
+      VkImage                           image  = VK_NULL_HANDLE;
+      VkDeviceMemory                    memory = VK_NULL_HANDLE;
+      ComPtr<ID3D11Texture2D>           texture;
+      ComPtr<ID3D11RenderTargetView>    rtv;
+      ComPtr<ID3D11ShaderResourceView>  srv;
+    };
+
+    D3D11_TEXTURE2D_DESC1 desc = { };
+    desc.Width      = Width;
+    desc.Height     = Height;
+    desc.MipLevels  = 1u;
+    desc.ArraySize  = 1u;
+    desc.Format     = DXGI_FORMAT_R8G8B8A8_TYPELESS;
+    desc.SampleDesc = { 1u, 0u };
+    desc.Usage      = D3D11_USAGE_DEFAULT;
+    desc.BindFlags  = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+
+    D3D11_RENDER_TARGET_VIEW_DESC rtvDesc = { DXGI_FORMAT_R8G8B8A8_UNORM, D3D11_RTV_DIMENSION_TEXTURE2D };
+    D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = { DXGI_FORMAT_R8G8B8A8_UNORM, D3D11_SRV_DIMENSION_TEXTURE2D };
+    srvDesc.Texture2D.MipLevels = 1u;
+
+    // [0] OPTIMAL, [1] LINEAR, both shell images as a runtime surface would be; [2] an engine texture to read into
+    const VkImageTiling tilings[2] = { VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_TILING_LINEAR };
+    Target targets[3];
+    bool ready = true;
+
+    for (UINT i = 0u; i < 2u && ready; i++) {
+      Target& t = targets[i];
+      VkImageCreateInfo info = { };
+      ready = SUCCEEDED(engine->GetImageCreateInfo(&desc, &info));
+      info.tiling = tilings[i];
+
+      VkMemoryRequirements req = { };
+      ready = ready && vk.createImage(device, &info, nullptr, &t.image) == VK_SUCCESS;
+
+      if (ready) {
+        vk.getImageMemoryRequirements(device, t.image, &req);
+        uint32_t type = ~0u;
+
+        for (uint32_t m = 0u; m < memProps.memoryTypeCount && type == ~0u; m++) {
+          if ((req.memoryTypeBits & (1u << m)) && (memProps.memoryTypes[m].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
+            type = m;
+        }
+
+        VkMemoryAllocateInfo alloc = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+        alloc.allocationSize  = req.size;
+        alloc.memoryTypeIndex = type;
+
+        ready = type != ~0u
+          && vk.allocateMemory(device, &alloc, nullptr, &t.memory) == VK_SUCCESS
+          && vk.bindImageMemory(device, t.image, t.memory, 0u) == VK_SUCCESS
+          && SUCCEEDED(engine->CreateTexture2DFromImage2(&desc, &info, t.image, &t.texture));
+      }
+    }
+
+    D3D11_TEXTURE2D_DESC sinkDesc = { Width, Height, 1u, 1u, DXGI_FORMAT_R8G8B8A8_UNORM, { 1u, 0u },
+      D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET };
+    ready = ready && SUCCEEDED(d3d->CreateTexture2D(&sinkDesc, nullptr, &targets[2].texture));
+
+    for (UINT i = 0u; i < 3u && ready; i++) {
+      ready = SUCCEEDED(d3d->CreateRenderTargetView(targets[i].texture.Get(), &rtvDesc, &targets[i].rtv))
+        && (i == 2u || SUCCEEDED(d3d->CreateShaderResourceView(targets[i].texture.Get(), &srvDesc, &targets[i].srv)));
+    }
+
+    DdiShader vsDdi, fillDdi, loadDdi;
+    ComPtr<ID3D11VertexShader> vs;
+    ComPtr<ID3D11PixelShader> fillPs, loadPs;
+    ready = ready && CompileDdi(g_tilingHlsl, "vs", "vs_5_0", &vsDdi) && CompileDdi(g_tilingHlsl, "fill", "ps_5_0", &fillDdi)
+      && CompileDdi(g_tilingHlsl, "load", "ps_5_0", &loadDdi);
+
+    if (ready) {
+      BC250_DXVK_SHADER_DESC vsDesc = MakeDesc(vsDdi), fillDesc = MakeDesc(fillDdi), loadDesc = MakeDesc(loadDdi);
+      ready = SUCCEEDED(engine->CreateShader(&vsDesc, IID_PPV_ARGS(&vs)))
+        && SUCCEEDED(engine->CreateShader(&fillDesc, IID_PPV_ARGS(&fillPs)))
+        && SUCCEEDED(engine->CreateShader(&loadDesc, IID_PPV_ARGS(&loadPs)));
+    }
+
+    D3D11_BLEND_DESC blendDesc = { };
+    blendDesc.RenderTarget[0].BlendEnable           = TRUE;
+    blendDesc.RenderTarget[0].SrcBlend              = D3D11_BLEND_SRC_ALPHA;
+    blendDesc.RenderTarget[0].DestBlend             = D3D11_BLEND_INV_SRC_ALPHA;
+    blendDesc.RenderTarget[0].BlendOp               = D3D11_BLEND_OP_ADD;
+    blendDesc.RenderTarget[0].SrcBlendAlpha         = D3D11_BLEND_ONE;
+    blendDesc.RenderTarget[0].DestBlendAlpha        = D3D11_BLEND_ZERO;
+    blendDesc.RenderTarget[0].BlendOpAlpha          = D3D11_BLEND_OP_ADD;
+    blendDesc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    ComPtr<ID3D11BlendState> blend;
+
+    D3D11_QUERY_DESC disjointDesc = { D3D11_QUERY_TIMESTAMP_DISJOINT, 0u }, stampDesc = { D3D11_QUERY_TIMESTAMP, 0u };
+    ComPtr<ID3D11Query> disjoint, stamp0, stamp1;
+
+    ready = ready && SUCCEEDED(d3d->CreateBlendState(&blendDesc, &blend))
+      && SUCCEEDED(d3d->CreateQuery(&disjointDesc, &disjoint))
+      && SUCCEEDED(d3d->CreateQuery(&stampDesc, &stamp0)) && SUCCEEDED(d3d->CreateQuery(&stampDesc, &stamp1));
+
+    Check(ready, "tiling bench: 1920x1080 OPTIMAL and LINEAR shell images, shaders, queries");
+
+    if (ready) {
+      ctx->ClearState();
+
+      D3D11_VIEWPORT viewport = { 0.0f, 0.0f, float(Width), float(Height), 0.0f, 1.0f };
+      ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+      ctx->VSSetShader(vs.Get(), nullptr, 0u);
+      ctx->RSSetViewports(1u, &viewport);
+
+      // GPU milliseconds per frame of work(), which records Frames frames; -1 if the timestamps are unusable
+      auto gpuMs = [&] (auto&& work) {
+        ctx->Begin(disjoint.Get());
+        ctx->End(stamp0.Get());
+        work();
+        ctx->End(stamp1.Get());
+        ctx->End(disjoint.Get());
+        ctx->Flush();
+
+        D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj = { };
+        UINT64 t0 = 0u, t1 = 0u;
+        ULONGLONG deadline = GetTickCount64() + 20000u;
+
+        while (ctx->GetData(disjoint.Get(), &dj, sizeof(dj), 0u) == S_FALSE) {
+          if (GetTickCount64() > deadline)
+            return -1.0;
+
+          YieldProcessor();
+        }
+
+        if (ctx->GetData(stamp0.Get(), &t0, sizeof(t0), 0u) != S_OK || ctx->GetData(stamp1.Get(), &t1, sizeof(t1), 0u) != S_OK
+         || dj.Disjoint || !dj.Frequency)
+          return -1.0;
+
+        return 1e3 * double(t1 - t0) / double(dj.Frequency) / double(Frames);
+      };
+
+      const float grey[4] = { 0.5f, 0.5f, 0.5f, 1.0f };
+
+      auto fill = [&] (UINT i) {
+        return gpuMs([&] {
+          ID3D11RenderTargetView* rtv = targets[i].rtv.Get();
+          ctx->OMSetRenderTargets(1u, &rtv, nullptr);
+          ctx->OMSetBlendState(blend.Get(), nullptr, ~0u);
+          ctx->PSSetShader(fillPs.Get(), nullptr, 0u);
+
+          for (UINT f = 0u; f < Frames; f++) {
+            ctx->ClearRenderTargetView(rtv, grey);
+
+            for (UINT d = 0u; d < DrawsPerFrame; d++)
+              ctx->Draw(3u, 0u);
+          }
+
+          ctx->OMSetRenderTargets(0u, nullptr, nullptr);
+        });
+      };
+
+      auto copy = [&] {
+        return gpuMs([&] {
+          for (UINT f = 0u; f < Frames; f++)
+            ctx->CopyResource(targets[1].texture.Get(), targets[0].texture.Get());
+        });
+      };
+
+      auto read = [&] (UINT i) {
+        return gpuMs([&] {
+          ID3D11RenderTargetView* rtv = targets[2].rtv.Get();
+          ID3D11ShaderResourceView* srv = targets[i].srv.Get();
+          ctx->OMSetRenderTargets(1u, &rtv, nullptr);
+          ctx->OMSetBlendState(nullptr, nullptr, ~0u);
+          ctx->PSSetShader(loadPs.Get(), nullptr, 0u);
+          ctx->PSSetShaderResources(0u, 1u, &srv);
+
+          for (UINT f = 0u; f < Frames; f++)
+            ctx->Draw(3u, 0u);
+
+          srv = nullptr;
+          ctx->PSSetShaderResources(0u, 1u, &srv);
+          ctx->OMSetRenderTargets(0u, nullptr, nullptr);
+        });
+      };
+
+      // One unmeasured round compiles the pipelines; SubmitForPresent then builds the optimized variants
+      fill(0u); fill(1u); copy(); read(0u); read(1u);
+      engine->SubmitForPresent(targets[2].texture.Get(), 0u);
+
+      double fillOptimal = fill(0u), fillLinear = fill(1u), copyMs = copy(), readOptimal = read(0u), readLinear = read(1u);
+
+      std::printf("      tiling bench %ux%u RGBA8, GPU ms per frame, %u frames each:\n", Width, Height, Frames);
+      std::printf("      clear + %u blended full-screen draws: OPTIMAL %.3f, LINEAR %.3f\n", DrawsPerFrame, fillOptimal, fillLinear);
+      std::printf("      copy OPTIMAL -> LINEAR (present from an OPTIMAL shadow): %.3f\n", copyMs);
+      std::printf("      1:1 read into an OPTIMAL target (composition): from OPTIMAL %.3f, from LINEAR %.3f\n",
+        readOptimal, readLinear);
+      Check(fillOptimal > 0.0 && fillLinear > 0.0 && copyMs > 0.0 && readOptimal > 0.0 && readLinear > 0.0,
+        "tiling bench: every timestamp pair usable");
+
+      ctx->ClearState();
+    }
+
+    for (auto& t : targets) {
+      t.rtv.Reset();
+      t.srv.Reset();
+
+      if (t.texture)
+        engine->WaitForResourceIdle(t.texture.Get());
+
+      t.texture.Reset();
+
+      if (t.image)
+        vk.destroyImage(device, t.image, nullptr);
+
+      if (t.memory)
+        vk.freeMemory(device, t.memory, nullptr);
+    }
   }
 
 }
 
 int main(int argc, char** argv) {
   if (argc < 2) {
-    std::printf("usage: bc250dxvk_engine_test <bc250dxvk.dll> [adapter substring] [--bench]\n");
+    std::printf("usage: bc250dxvk_engine_test <bc250dxvk.dll> [adapter substring] [--bench] [--bench-tiling]\n");
     return 2;
   }
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   const char* adapterFilter = nullptr;
-  bool bench = false;
+  bool bench = false, benchTiling = false;
 
   for (int i = 2; i < argc; i++) {
     if (!std::strcmp(argv[i], "--bench"))
       bench = true;
+    else if (!std::strcmp(argv[i], "--bench-tiling"))
+      benchTiling = true;
     else
       adapterFilter = argv[i];
   }
@@ -748,6 +1004,7 @@ int main(int argc, char** argv) {
   LoadInstance(vk, instance, &vk.getPhysicalDeviceProperties, "vkGetPhysicalDeviceProperties");
   LoadInstance(vk, instance, &vk.getPhysicalDeviceMemoryProperties, "vkGetPhysicalDeviceMemoryProperties");
   LoadInstance(vk, instance, &vk.getPhysicalDeviceFormatProperties, "vkGetPhysicalDeviceFormatProperties");
+  LoadInstance(vk, instance, &vk.getPhysicalDeviceImageFormatProperties, "vkGetPhysicalDeviceImageFormatProperties");
   LoadInstance(vk, instance, &vk.createDevice, "vkCreateDevice");
   LoadInstance(vk, instance, &vk.getDeviceProcAddr, "vkGetDeviceProcAddr");
 
@@ -1606,6 +1863,209 @@ int main(int argc, char** argv) {
     CheckHr(engine->WaitForResourceIdle(rt.Get()), "WaitForResourceIdle after the Blt checks");
   }
 
+  // ---- a runtime image with the shell's own tiling (ABI 1.2): LINEAR, as the shell allocates surfaces ----
+  VkImage linImage = VK_NULL_HANDLE;
+  VkDeviceMemory linMemory = VK_NULL_HANDLE;
+  {
+    Microsoft::WRL::ComPtr<IBc250DxvkDevice2> engine2;
+
+    VkImageCreateInfo linInfo = imageInfo;
+    linInfo.tiling = VK_IMAGE_TILING_LINEAR;
+
+    // The shell's own copy of the view format list, in another order, behind another structure: the engine
+    // compares formats, not pointers or order
+    std::vector<VkFormat> shellFormats;
+
+    if (formatList)
+      shellFormats.assign(formatList->pViewFormats, formatList->pViewFormats + formatList->viewFormatCount);
+
+    std::reverse(shellFormats.begin(), shellFormats.end());
+
+    VkImageFormatListCreateInfo shellList = { VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO };
+    shellList.viewFormatCount = uint32_t(shellFormats.size());
+    shellList.pViewFormats    = shellFormats.data();
+
+    VkExternalMemoryImageCreateInfo external = { VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO };
+    external.pNext = &shellList;
+    linInfo.pNext = &external;
+
+    VkImageFormatProperties linProps = { };
+    bool linSupported = vk.getPhysicalDeviceImageFormatProperties(physDev, linInfo.format, linInfo.imageType,
+      linInfo.tiling, linInfo.usage, linInfo.flags, &linProps) == VK_SUCCESS;
+
+    if (!CheckHr(engine->QueryInterface(IID_PPV_ARGS(&engine2)), "QueryInterface IBc250DxvkDevice2")) {
+      // An older engine: nothing below applies
+    } else if (!linSupported) {
+      std::printf("      LINEAR render target image not supported on this adapter: ABI 1.2 checks skipped\n");
+    } else {
+      VkMemoryRequirements linReq = { };
+      bool ok = vk.createImage(device, &linInfo, nullptr, &linImage) == VK_SUCCESS;
+
+      if (ok) {
+        vk.getImageMemoryRequirements(device, linImage, &linReq);
+
+        uint32_t linType = ~0u;
+
+        for (uint32_t i = 0u; i < memProps.memoryTypeCount && linType == ~0u; i++) {
+          if ((linReq.memoryTypeBits & (1u << i))
+           && (memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
+            linType = i;
+        }
+
+        VkMemoryAllocateInfo linAlloc = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+        linAlloc.allocationSize  = linReq.size;
+        linAlloc.memoryTypeIndex = linType;
+
+        ok = linType != ~0u
+          && vk.allocateMemory(device, &linAlloc, nullptr, &linMemory) == VK_SUCCESS
+          && vk.bindImageMemory(device, linImage, linMemory, 0u) == VK_SUCCESS;
+      }
+
+      Check(ok, "shell creates and binds a LINEAR image from GetImageCreateInfo, with its own view format list");
+
+      auto rejects = [&] (const VkImageCreateInfo& info, const char* what) {
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> none;
+        Check(engine2->CreateTexture2DFromImage2(&rtDesc, &info, linImage, &none) == E_INVALIDARG && !none, what);
+      };
+
+      VkImageCreateInfo bad = linInfo;
+      bad.format = VK_FORMAT_B8G8R8A8_UNORM;
+      rejects(bad, "CreateTexture2DFromImage2 rejects another format");
+
+      bad = linInfo;
+      bad.extent.width++;
+      rejects(bad, "CreateTexture2DFromImage2 rejects another extent");
+
+      bad = linInfo;
+      bad.usage &= ~VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+      rejects(bad, "CreateTexture2DFromImage2 rejects a removed usage bit");
+
+      bad = linInfo;
+      bad.flags &= ~VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+      rejects(bad, "CreateTexture2DFromImage2 rejects a removed flag");
+
+      if (formatList) {
+        bad = linInfo;
+        bad.pNext = nullptr;
+        rejects(bad, "CreateTexture2DFromImage2 rejects a mutable image without the view format list");
+      }
+
+      bad = linInfo;
+      bad.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+      rejects(bad, "CreateTexture2DFromImage2 rejects a tiling other than OPTIMAL and LINEAR");
+
+      // The tiling the engine gives the wrapped image, as DXVK's interop interface reports it
+      auto engineTiling = [] (ID3D11Texture2D* texture) {
+        Microsoft::WRL::ComPtr<DxvkInteropSurface> interop;
+        VkImageCreateInfo seen = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+
+        if (!texture || FAILED(texture->QueryInterface(IID_PPV_ARGS(&interop)))
+         || FAILED(interop->GetVulkanImageInfo(nullptr, nullptr, &seen)))
+          return VK_IMAGE_TILING_MAX_ENUM;
+
+        return seen.tiling;
+      };
+
+      Microsoft::WRL::ComPtr<ID3D11Texture2D> linTex, assumed;
+      Microsoft::WRL::ComPtr<ID3D11RenderTargetView> linRtv;
+
+      if (ok && CheckHr(engine2->CreateTexture2DFromImage2(&rtDesc, &linInfo, linImage, &linTex),
+          "CreateTexture2DFromImage2 (LINEAR)")) {
+        Check(engineTiling(linTex.Get()) == VK_IMAGE_TILING_LINEAR, "the engine uses the image with LINEAR tiling");
+
+        // Control for the probe above: the 1.0 call takes GetImageCreateInfo's tiling, whatever the image has
+        if (SUCCEEDED(engine->CreateTexture2DFromImage(&rtDesc, linImage, &assumed)))
+          Check(engineTiling(assumed.Get()) == imageInfo.tiling, "CreateTexture2DFromImage keeps GetImageCreateInfo's tiling (probe control)");
+
+        assumed.Reset();
+
+        // The first draw again, into the LINEAR image
+        if (CheckHr(d3d->CreateRenderTargetView(linTex.Get(), &rtvDesc, &linRtv), "CreateRenderTargetView (LINEAR image)")) {
+          ID3D11RenderTargetView* linRtvs[] = { linRtv.Get() };
+          ctx->ClearRenderTargetView(linRtv.Get(), clear);
+          ctx->IASetInputLayout(layout.Get());
+          ctx->IASetVertexBuffers(0u, 1u, vbs, &stride, &offset);
+          ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+          ctx->VSSetShader(vs.Get(), nullptr, 0u);
+          ctx->PSSetShader(ps.Get(), nullptr, 0u);
+          ctx->RSSetViewports(1u, &viewport);
+          ctx->OMSetRenderTargets(1u, linRtvs, nullptr);
+          ctx->Draw(3u, 0u);
+          ctx->OMSetRenderTargets(1u, rtvs, nullptr);
+
+          auto readAt = [&] (ID3D11Texture2D* texture, UINT x, UINT y) {
+            std::array<int, 4> result = { -1, -1, -1, -1 };
+            D3D11_MAPPED_SUBRESOURCE m = { };
+            ctx->CopyResource(staging.Get(), texture);
+
+            if (SUCCEEDED(ctx->Map(staging.Get(), 0u, D3D11_MAP_READ, 0u, &m))) {
+              const uint8_t* p = static_cast<const uint8_t*>(m.pData) + y * m.RowPitch + x * 4u;
+              result = { p[0], p[1], p[2], p[3] };
+              ctx->Unmap(staging.Get(), 0u);
+            }
+
+            return result;
+          };
+
+          ctx->CopyResource(staging.Get(), linTex.Get());
+          D3D11_MAPPED_SUBRESOURCE m = { };
+
+          if (CheckHr(ctx->Map(staging.Get(), 0u, D3D11_MAP_READ, 0u, &m), "Map staging (LINEAR image)")) {
+            auto at = [&] (UINT x, UINT y) {
+              const uint8_t* p = static_cast<const uint8_t*>(m.pData) + y * m.RowPitch + x * 4u;
+              return std::array<int, 4>{ p[0], p[1], p[2], p[3] };
+            };
+
+            uint32_t linCovered = 0u;
+
+            for (UINT y = 0u; y < H; y++) {
+              for (UINT x = 0u; x < W; x++)
+                linCovered += similar(at(x, y), cr, cg, cb, 1) ? 0u : 1u;
+            }
+
+            auto l0 = at(0u, 0u);
+            std::printf("      LINEAR image: (0,0)=%d,%d,%d  covered=%u\n", l0[0], l0[1], l0[2], linCovered);
+            Check(similar(at(W - 1u, H - 1u), cr, cg, cb, 1) && l0[0] > 230 && l0[1] < 25
+               && linCovered >= 2016u && linCovered <= 2080u,
+              "clear and triangle in the LINEAR image as in the first draw");
+            ctx->Unmap(staging.Get(), 0u);
+          }
+
+          // Blt with the LINEAR image as source, then as destination of a rectangle
+          const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+          ctx->ClearRenderTargetView(rtv.Get(), black);
+
+          BC250_DXVK_BLT1 blt1 = { };
+          blt1.Destination     = rt.Get();
+          blt1.Source          = linTex.Get();
+          blt1.SourceRect      = { 0, 0, LONG(W), LONG(H) };
+          blt1.DestinationRect = { 0, 0, LONG(W), LONG(H) };
+          blt1.Rotation        = DXGI_MODE_ROTATION_IDENTITY;
+
+          if (CheckHr(engine2->Blt1(&blt1), "Blt1 from the LINEAR image")) {
+            Check(readAt(rt.Get(), 0u, 0u)[0] > 230 && similar(readAt(rt.Get(), W - 1u, H - 1u), cr, cg, cb, 1),
+              "Blt1 copies the LINEAR image's triangle and clear");
+          }
+
+          // The lower right quarter of rt holds the clear colour only (x + y >= 64 there)
+          ctx->ClearRenderTargetView(linRtv.Get(), black);
+          blt1.Destination     = linTex.Get();
+          blt1.Source          = rt.Get();
+          blt1.SourceRect      = { LONG(W / 2u), LONG(H / 2u), LONG(W), LONG(H) };
+          blt1.DestinationRect = { 0, 0, LONG(W / 2u), LONG(H / 2u) };
+
+          if (CheckHr(engine2->Blt1(&blt1), "Blt1 into a rectangle of the LINEAR image")) {
+            Check(similar(readAt(linTex.Get(), 10u, 10u), cr, cg, cb, 1)
+               && similar(readAt(linTex.Get(), 40u, 40u), 0, 0, 0, 0),
+              "Blt1 writes its rectangle of the LINEAR image and nothing else");
+          }
+        }
+
+        CheckHr(engine->WaitForResourceIdle(linTex.Get()), "WaitForResourceIdle (LINEAR image)");
+      }
+    }
+  }
+
   // ---- stream output of the vertex program, without a geometry program ----
   {
     UINT posReg = ~0u, colReg = ~0u;
@@ -1919,6 +2379,13 @@ int main(int argc, char** argv) {
   if (bench)
     RunBench(engine, d3d.Get(), ctx.Get(), rt.Get(), rtv.Get(), layout.Get(), vb.Get(), stride, W);
 
+  if (benchTiling) {
+    Microsoft::WRL::ComPtr<IBc250DxvkDevice2> engine2;
+
+    if (CheckHr(engine->QueryInterface(IID_PPV_ARGS(&engine2)), "tiling bench: QueryInterface IBc250DxvkDevice2"))
+      RunTilingBench(vk, physDev, device, memProps, engine2.Get(), d3d.Get(), ctx.Get());
+  }
+
   // ---- threads and submissions ----
   // A start module only ever proves a thread is the engine's: a std::thread starts in ucrtbase.dll, and
   // loaders and layers start their own. The Vulkan call census after teardown is the E2 criterion.
@@ -2020,6 +2487,12 @@ int main(int argc, char** argv) {
 
   vk.destroyImage(device, image, nullptr);
   vk.freeMemory(device, memory, nullptr);
+
+  if (linImage)
+    vk.destroyImage(device, linImage, nullptr);
+
+  if (linMemory)
+    vk.freeMemory(device, linMemory, nullptr);
 
   for (UINT i = 0u; i < RotCount; i++) {
     if (rotImages[i])
