@@ -374,6 +374,7 @@ namespace dxvk {
     return {{
       &extensions.extDebugUtils,
       &extensions.extSurfaceMaintenance1,
+      &extensions.extSwapchainColorSpace,
       &extensions.khrGetSurfaceCapabilities2,
       &extensions.khrSurface,
       &extensions.khrSurfaceMaintenance1,
