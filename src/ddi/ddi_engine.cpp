@@ -1,5 +1,6 @@
 // amdgpu_wddm_dxvk.dll entry point: the engine functions of bc250_dxvk_engine.h.
 
+#include <array>
 #include <cstring>
 #include <vector>
 
@@ -46,6 +47,31 @@ namespace dxvk::ddi {
       }
 
       return nullptr;
+    }
+
+
+    // D3D11DeviceFeatures::DetermineUavExtendedTypedLoadSupport on an adapter, before a device exists.
+    bool HasTypedUavLoadFormats(const Rc<DxvkAdapter>& adapter) {
+      static const std::array<VkFormat, 18> formats = {{
+        VK_FORMAT_R32_SFLOAT,           VK_FORMAT_R32_UINT,           VK_FORMAT_R32_SINT,
+        VK_FORMAT_R32G32B32A32_SFLOAT,  VK_FORMAT_R32G32B32A32_UINT,  VK_FORMAT_R32G32B32A32_SINT,
+        VK_FORMAT_R16G16B16A16_SFLOAT,  VK_FORMAT_R16G16B16A16_UINT,  VK_FORMAT_R16G16B16A16_SINT,
+        VK_FORMAT_R8G8B8A8_UNORM,       VK_FORMAT_R8G8B8A8_UINT,      VK_FORMAT_R8G8B8A8_SINT,
+        VK_FORMAT_R16_SFLOAT,           VK_FORMAT_R16_UINT,           VK_FORMAT_R16_SINT,
+        VK_FORMAT_R8_UNORM,             VK_FORMAT_R8_UINT,            VK_FORMAT_R8_SINT,
+      }};
+
+      if (adapter == nullptr)
+        return false;
+
+      for (auto f : formats) {
+        DxvkFormatFeatures features = adapter->getFormatFeatures(f);
+
+        if (!((features.optimal | features.linear) & VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT))
+          return false;
+      }
+
+      return true;
     }
 
 
@@ -146,11 +172,26 @@ namespace dxvk::ddi {
         Rc<DxvkInstance> instance = ImportInstance(vk);
         DxvkDeviceCapabilities caps(*instance, vk->PhysicalDevice, nullptr);
 
-        // The feature checks of D3D11DeviceFeatures::GetMaxFeatureLevel up to 11_1, applied to the
-        // features DXVK enables (QueryDeviceRequirements). 12_x needs tiled resources and more; the
-        // engine does not claim it in ABI 1.0.
+        // The feature checks of D3D11DeviceFeatures::GetMaxFeatureLevel, applied to the features DXVK
+        // enables (QueryDeviceRequirements) before a device exists. Since r8 they include 12_0 and 12_1:
+        // tiled resources tier 2, typed UAV loads of the additional formats, conservative rasterization
+        // and ROVs. The engine test creates a device at the level reported here, which catches drift.
         const auto& features = caps.getFeatures();
-        D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_1;
+        const auto& properties = caps.getProperties();
+        const auto& sparse = properties.core.properties.sparseProperties;
+        D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_12_1;
+
+        bool tiledTier2 = features.core.features.sparseBinding
+          && features.core.features.sparseResidencyBuffer
+          && features.core.features.sparseResidencyImage2D
+          && features.core.features.sparseResidencyAliased
+          && sparse.residencyStandard2DBlockShape
+          && features.core.features.shaderResourceResidency
+          && features.core.features.shaderResourceMinLod
+          && features.vk12.samplerFilterMinmax
+          && properties.vk12.filterMinmaxSingleComponentFormats
+          && sparse.residencyNonResidentStrict
+          && !sparse.residencyAlignedMipSize;
 
         if (!features.core.features.drawIndirectFirstInstance
          || !features.core.features.fragmentStoresAndAtomics
@@ -160,6 +201,11 @@ namespace dxvk::ddi {
         else if (!features.core.features.logicOp
               || !features.core.features.vertexPipelineStoresAndAtomics)
           level = D3D_FEATURE_LEVEL_11_0;
+        else if (!tiledTier2 || !HasTypedUavLoadFormats(FindAdapter(instance, vk->PhysicalDevice)))
+          level = D3D_FEATURE_LEVEL_11_1;
+        else if (!features.extConservativeRasterization
+              || !features.extFragmentShaderInterlock.fragmentShaderPixelInterlock)
+          level = D3D_FEATURE_LEVEL_12_0;
 
         info->MaxFeatureLevel = level;
         return S_OK;

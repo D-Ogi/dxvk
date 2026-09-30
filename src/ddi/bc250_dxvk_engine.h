@@ -4,7 +4,7 @@
  * UserModeDriverName DLL) and its DXVK engine ("engine", amdgpu_wddm_dxvk.dll, DXVK fork branch
  * amdgpu-wddm/ddi-engine).
  *
- * Revision r7, ABI 1.4. This file in the DXVK fork is the only copy; the shell includes it from the DXVK
+ * Revision r8, ABI 1.4. This file in the DXVK fork is the only copy; the shell includes it from the DXVK
  * source checkout it builds against, like its other DXVK-facing headers.
  *
  * Versions. A minor version adds and never changes: an engine of minor n serves a shell built for any minor
@@ -24,6 +24,9 @@
  *        1.4 an allocation that found no memory ended the process.
  *   1.4  r7: no interface change. The engine DLL is amdgpu_wddm_dxvk.dll (was bc250dxvk.dll); AbiVersion and
  *        the Map error mapping are stated precisely (E6, BC250_DXVK_DEVICE_CREATE_INFO).
+ *   1.4  r8: no interface change. GetAdapterInfo reports up to 12_1 (DXVK's own 12_0/12_1 checks: tiled
+ *        resources tier 2, typed UAV loads, conservative rasterization, ROVs). A shell that requests at most
+ *        11_1 is unaffected; a level above 11_1 needs the WDDM 2.0 D3D11 DDI in the shell.
  *
  * WDK-free by construction. DXVK's util_gdi.h declares private extern-C D3DKMT prototypes that collide with
  * the WDK's in one translation unit, so nothing here needs d3d10umddi.h or a DXVK header: windows.h, the SDK's
@@ -172,7 +175,7 @@ struct BC250_DXVK_DEVICE_CREATE_INFO {
 
 struct BC250_DXVK_ADAPTER_INFO {
     UINT32 Size;
-    D3D_FEATURE_LEVEL MaxFeatureLevel;             /* for D3D11DDICAPS_3DPIPELINESUPPORT; capped at 11_1 in 1.0 */
+    D3D_FEATURE_LEVEL MaxFeatureLevel;             /* for D3D11DDICAPS_3DPIPELINESUPPORT; capped at 11_1 before r8 */
 };
 
 /* layout = D3D11_1DDIARG_SIGNATURE_ENTRY2 (D3D11_1DDIARG_SIGNATURE_ENTRY: pass Stream = 0). When every entry of a
