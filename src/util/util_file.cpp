@@ -98,6 +98,13 @@ namespace dxvk::util {
       return FlushFileBuffers(m_file);
     }
 
+    bool truncate(size_t size) {
+      if (!seek(size, FILE_BEGIN))
+        return false;
+
+      return SetEndOfFile(m_file);
+    }
+
   private:
 
     FileFlags m_flags = { };
@@ -229,6 +236,11 @@ namespace dxvk::util {
       return true;
     }
 
+    bool truncate(size_t size) {
+      // Not available on a stream; callers fall back to recreating the file
+      return false;
+    }
+
   private:
 
     FileFlags     m_flags = { };
@@ -298,6 +310,10 @@ namespace dxvk::util {
 
   bool File::flush() {
     return m_impl && m_impl->flush();
+  }
+
+  bool File::truncate(size_t size) {
+    return m_impl && m_impl->truncate(size);
   }
 
   File::operator bool () const {

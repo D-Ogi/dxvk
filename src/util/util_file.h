@@ -45,6 +45,8 @@ namespace dxvk::util {
 
     virtual bool flush() = 0;
 
+    virtual bool truncate(size_t size) = 0;
+
     force_inline void incRef() {
       m_refCount.fetch_add(1u);
     }
@@ -93,6 +95,15 @@ namespace dxvk::util {
     size_t size();
 
     bool flush();
+
+    /**
+     * \brief Cuts the file to the given size
+     *
+     * Needs write access. Later appends start there.
+     * \param [in] size New size in bytes
+     * \returns \c true on success
+     */
+    bool truncate(size_t size);
 
     explicit operator bool () const;
 
