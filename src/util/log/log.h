@@ -81,14 +81,38 @@ namespace dxvk {
      */
     static void removeSink(void* context);
 
+    /**
+     * \brief Keeps the calling thread's lines away from sinks
+     *
+     * For worker threads that must not call a sink. While a sink is
+     * registered, their lines wait for \ref flushDeferred, at most
+     * \c MaxDeferredLines of them; further lines are only counted.
+     * Without a sink they go to the file as usual.
+     */
+    static void deferThreadLines();
+
+    /**
+     * \brief Delivers deferred lines to the sink on the calling thread
+     *
+     * Lines are dropped if no sink is registered any more.
+     */
+    static void flushDeferred();
+
     static LogLevel logLevel() {
       return s_instance.m_minLevel;
     }
-    
+
   private:
-    
+
+    constexpr static size_t MaxDeferredLines = 256u;
+
+    struct DeferredLine {
+      LogLevel    level;
+      std::string line;
+    };
+
     static Logger     s_instance;
-    
+
     const LogLevel    m_minLevel;
     const std::string m_fileName;
     const bool        m_requireLogPath = false;
@@ -96,6 +120,9 @@ namespace dxvk {
     dxvk::mutex       m_mutex;
     std::ofstream     m_fileStream;
     std::vector<LogSink> m_sinks;
+
+    std::vector<DeferredLine> m_deferred;
+    uint32_t          m_deferredDropped = 0u;
 
     bool              m_initialized = false;
 #ifdef _WIN32
