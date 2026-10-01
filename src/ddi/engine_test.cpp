@@ -7,11 +7,16 @@
 // object creation all ran on the calling thread (E2), by wrapping the Vulkan entry points it is given.
 //
 // Usage: amdgpu_wddm_dxvk_engine_test.exe <path to amdgpu_wddm_dxvk.dll> [adapter substring] [--icd <path>]
-//        [--bench] [--bench-tiling]
+//        [--bench] [--bench-tiling] [--bench-shaders <dir> [--bench-pattern load|stream|loader]] [--keep-shader-cache]
 // Exit code 0 = all checks passed. --bench adds a CPU-bound draw benchmark that prints timings (see RunBench).
 // --bench-tiling adds a GPU benchmark of LINEAR against OPTIMAL render targets (see RunTilingBench).
+// --bench-shaders creates and draws the *.dxbc programs of a directory and prints what shader creation costs
+// the calling thread and the frames (see RunShaderBench).
 // --icd loads that Vulkan driver DLL directly, as the UMD shell loads its bc250radv.dll, instead of going
 // through the Vulkan loader (vulkan-1.dll). Either way the "icd:" lines name every loaded driver and its SHA-256.
+// The engine's shader cache (r9) goes to DXVK_SHADER_CACHE_PATH; if that is not set, the test sets it to
+// shader-cache beside itself and deletes the cache files there first (a cold start), unless --keep-shader-cache
+// asks for a warm one. Run at the default log level: the r9 checks read the engine's info lines.
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -40,13 +45,24 @@
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
 
   int g_failures = 0;
+
+  // The shader bench's loader pattern also calls the engine from a second test thread, as a game's loading
+  // thread does, one thread inside the engine at a time as the runtime enforces without FREETHREADED. E2 then
+  // means: Vulkan calls and shell services only on the test's two threads, never on an engine thread.
+  thread_local bool t_secondCaller = false;
+
+  bool IsCallerThread(DWORD caller) {
+    return t_secondCaller || GetCurrentThreadId() == caller;
+  }
 
   void Check(bool ok, const char* what) {
     std::printf("%s  %s\n", ok ? "PASS" : "FAIL", what);
@@ -91,7 +107,7 @@ namespace {
     auto s = static_cast<Shell*>(shell);
     s->lockCalls++;
 
-    if (GetCurrentThreadId() != s->mainThread)
+    if (!IsCallerThread(s->mainThread))
       s->foreignCalls++;
 
     if (lock)
@@ -104,7 +120,7 @@ namespace {
     auto s = static_cast<Shell*>(shell);
     s->logLines++;
 
-    if (GetCurrentThreadId() != s->mainThread)
+    if (!IsCallerThread(s->mainThread))
       s->foreignLogs++;
 
     if (level < 1u || level > 4u || std::strchr(message, '\n'))
@@ -166,7 +182,7 @@ namespace {
     static R VKAPI_CALL Call(A... args) {
       stats.calls++;
 
-      if (GetCurrentThreadId() != g_callerThread)
+      if (!IsCallerThread(g_callerThread))
         stats.foreign++;
 
       return real(args...);
@@ -211,6 +227,10 @@ namespace {
     BC250_VK_HOOK(vkCreateShaderModule),
     BC250_VK_HOOK(vkCreateGraphicsPipelines),
     BC250_VK_HOOK(vkCreateComputePipelines),
+    BC250_VK_HOOK(vkDestroyPipeline),
+    BC250_VK_HOOK(vkCreateDescriptorSetLayout),
+    BC250_VK_HOOK(vkCreatePipelineLayout),
+    BC250_VK_HOOK(vkGetShaderModuleCreateInfoIdentifierEXT),
     BC250_VK_HOOK(vkAllocateCommandBuffers),
     BC250_VK_HOOK(vkBeginCommandBuffer),
     BC250_VK_HOOK(vkEndCommandBuffer),
@@ -271,13 +291,32 @@ namespace {
     uint32_t libraries = 0u;   // LIBRARY flag: shader, vertex input and fragment output parts
     uint32_t fastLinks = 0u;   // linked from libraries without link-time optimization
     uint32_t optimized = 0u;   // monolithic, or linked with link-time optimization
+    double   libraryMs = 0.0;  // wall time of the calls that created libraries, in the driver
+    double   linkMs    = 0.0;  // the same for fast links
+    double   optimizedMs = 0.0;
   };
 
   PipelineKinds g_pipelineKinds;
+  thread_local PipelineKinds* t_pipelineKinds = &g_pipelineKinds;   // the loader thread counts its own
   PFN_vkCreateGraphicsPipelines g_hookedCreateGraphicsPipelines = nullptr;
+
+  double QpcMs() {
+    static const double freq = [] {
+      LARGE_INTEGER f;
+      QueryPerformanceFrequency(&f);
+      return double(f.QuadPart);
+    } ();
+
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return 1e3 * double(t.QuadPart) / freq;
+  }
 
   VkResult VKAPI_CALL ClassifyGraphicsPipelines(VkDevice device, VkPipelineCache cache, uint32_t count,
       const VkGraphicsPipelineCreateInfo* infos, const VkAllocationCallbacks* allocator, VkPipeline* pipelines) {
+    PipelineKinds& kinds = *t_pipelineKinds;
+    double* time = nullptr;
+
     for (uint32_t i = 0u; i < count; i++) {
       VkPipelineCreateFlags2 flags = infos[i].flags;
       bool linked = false;
@@ -289,15 +328,26 @@ namespace {
           linked = reinterpret_cast<const VkPipelineLibraryCreateInfoKHR*>(s)->libraryCount != 0u;
       }
 
-      if (flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR)
-        g_pipelineKinds.libraries++;
-      else if (linked && !(flags & VK_PIPELINE_CREATE_2_LINK_TIME_OPTIMIZATION_BIT_EXT))
-        g_pipelineKinds.fastLinks++;
-      else
-        g_pipelineKinds.optimized++;
+      if (flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR) {
+        kinds.libraries++;
+        time = time ? time : &kinds.libraryMs;
+      } else if (linked && !(flags & VK_PIPELINE_CREATE_2_LINK_TIME_OPTIMIZATION_BIT_EXT)) {
+        kinds.fastLinks++;
+        time = time ? time : &kinds.linkMs;
+      } else {
+        kinds.optimized++;
+        time = time ? time : &kinds.optimizedMs;
+      }
     }
 
-    return g_hookedCreateGraphicsPipelines(device, cache, count, infos, allocator, pipelines);
+    // The engine makes these calls on a test thread inside an engine call (E2), each with its own sums
+    double t0 = QpcMs();
+    VkResult vr = g_hookedCreateGraphicsPipelines(device, cache, count, infos, allocator, pipelines);
+
+    if (time)
+      *time += QpcMs() - t0;
+
+    return vr;
   }
 
   PFN_vkVoidFunction HookVkClassified(const char* name, PFN_vkVoidFunction fn) {
@@ -363,6 +413,85 @@ namespace {
     return name;
   }
 
+  // The name DXVK gives its threads (SetThreadDescription), as ASCII
+  std::string ThreadName(DWORD tid) {
+    HANDLE h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid);
+    std::string result;
+    PWSTR name = nullptr;
+
+    if (h && SUCCEEDED(GetThreadDescription(h, &name)) && name) {
+      for (const wchar_t* c = name; *c; c++)
+        result += *c < 0x80 ? char(*c) : '?';
+
+      LocalFree(name);
+    }
+
+    if (h)
+      CloseHandle(h);
+
+    return result;
+  }
+
+  // Threads that started in the engine DLL since a census, by name
+  std::vector<std::string> EngineThreadsSince(const std::set<DWORD>& before) {
+    std::vector<std::string> result;
+
+    for (DWORD tid : ProcessThreads()) {
+      if (before.count(tid))
+        continue;
+
+      if (_stricmp(ModuleOf(ThreadStartAddress(tid)).c_str(), "amdgpu_wddm_dxvk.dll") == 0)
+        result.push_back(ThreadName(tid));
+    }
+
+    return result;
+  }
+
+  // ---- engine statistics lines (r9) ----------------------------------------------------------------
+
+  // Value of " key=" in the first line with the given prefix, or -1
+  long long StatValue(const std::vector<std::string>& lines, const char* prefix, const char* key, size_t from = 0u) {
+    std::string needle = std::string(" ") + key + "=";
+
+    for (size_t i = from; i < lines.size(); i++) {
+      const std::string& line = lines[i];
+
+      if (line.find(prefix) == std::string::npos)
+        continue;
+
+      size_t pos = line.find(needle);
+
+      if (pos == std::string::npos)
+        return -1;
+
+      return std::atoll(line.c_str() + pos + needle.size());
+    }
+
+    return -1;
+  }
+
+  bool HasLine(const std::vector<std::string>& lines, const char* text, size_t from = 0u) {
+    for (size_t i = from; i < lines.size(); i++) {
+      if (lines[i].find(text) != std::string::npos)
+        return true;
+    }
+
+    return false;
+  }
+
+  // Whether the configuration turns translation on workers off (DXVK_CONFIG, as DXVK reads it)
+  bool TranslationOnWorkersOff() {
+    char config[1024] = { };
+
+    if (!GetEnvironmentVariableA("DXVK_CONFIG", config, sizeof(config)))
+      return false;
+
+    std::string text = config;
+    text.erase(std::remove(text.begin(), text.end(), ' '), text.end());
+    std::transform(text.begin(), text.end(), text.begin(), [] (char c) { return char(std::tolower(c)); });
+    return text.find("dxvk.translateshadersonworkers=false") != std::string::npos;
+  }
+
   // ---- DDI-form shaders -------------------------------------------------------------------------
 
   // What the runtime gives a driver: the program tokens and signatures without names.
@@ -406,20 +535,12 @@ namespace {
     return e;
   }
 
-  bool CompileDdi(const char* source, const char* entry, const char* target, DdiShader* out) {
-    Microsoft::WRL::ComPtr<ID3DBlob> errors;
-    HRESULT hr = D3DCompile(source, std::strlen(source), entry, nullptr, nullptr, entry, target,
-      D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &out->blob, &errors);
-
-    if (FAILED(hr)) {
-      std::printf("D3DCompile %s: %s\n", entry, errors ? static_cast<const char*>(errors->GetBufferPointer()) : "?");
-      return false;
-    }
-
+  // Tokens and signatures of the DXBC container in out->blob
+  bool ReflectDdi(DdiShader* out) {
     out->tokens = FindProgramChunk(out->blob->GetBufferPointer(), out->blob->GetBufferSize());
 
     Microsoft::WRL::ComPtr<ID3D11ShaderReflection> reflection;
-    hr = D3DReflect(out->blob->GetBufferPointer(), out->blob->GetBufferSize(), IID_PPV_ARGS(&reflection));
+    HRESULT hr = D3DReflect(out->blob->GetBufferPointer(), out->blob->GetBufferSize(), IID_PPV_ARGS(&reflection));
 
     if (FAILED(hr) || !out->tokens)
       return false;
@@ -441,6 +562,30 @@ namespace {
     }
 
     return true;
+  }
+
+  bool CompileDdi(const char* source, const char* entry, const char* target, DdiShader* out) {
+    Microsoft::WRL::ComPtr<ID3DBlob> errors;
+    HRESULT hr = D3DCompile(source, std::strlen(source), entry, nullptr, nullptr, entry, target,
+      D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &out->blob, &errors);
+
+    if (FAILED(hr)) {
+      std::printf("D3DCompile %s: %s\n", entry, errors ? static_cast<const char*>(errors->GetBufferPointer()) : "?");
+      return false;
+    }
+
+    return ReflectDdi(out);
+  }
+
+  // A compiled DXBC container from a file, as fxc writes it
+  bool LoadDdi(const std::string& path, DdiShader* out) {
+    std::string bytes = ReadFileText(path);
+
+    if (bytes.size() < 32u || bytes.compare(0u, 4u, "DXBC") || FAILED(D3DCreateBlob(bytes.size(), &out->blob)))
+      return false;
+
+    std::memcpy(out->blob->GetBufferPointer(), bytes.data(), bytes.size());
+    return ReflectDdi(out);
   }
 
   BC250_DXVK_SHADER_DESC MakeDesc(const DdiShader& s) {
@@ -699,6 +844,535 @@ namespace {
     std::printf("      bench (%s): %u draws per frame, %u frames, latency %u: %.0f us wall, %.0f us process CPU "
       "per frame; %.2f us wall per draw\n", workers ? "DXVK worker threads" : "inline", DrawsPerFrame, Frames,
       Latency, wallUs, cpuUs, wallUs / DrawsPerFrame);
+  }
+
+  // ---- shader creation benchmark (--bench-shaders) -----------------------------------------------------
+
+  // fxc-compiled vs_5_0 and ps_5_0 programs (*.dxbc in a directory, in name order) created in DDI form and drawn,
+  // as a game creates and first uses its shaders. Each pixel program is drawn with the vertex program created
+  // last before it; every vertex program has the same outputs and every pixel program the same inputs, so any
+  // pair links. Pattern "load" creates all programs, then draws each pair once, a few new pairs per frame (a
+  // loading screen, then the first frames of a level). Pattern "stream" creates a few programs per frame and
+  // draws a pair first two frames after both programs were created (assets streamed in during play), among
+  // pairs drawn before. Pattern "loader" draws the same way while a second thread creates every program as
+  // fast as it can (a game's loading thread, as Rise of the Tomb Raider streams its shaders); a lock lets one
+  // thread at a time into the engine, per call, as the runtime does for a driver without FREETHREADED.
+  // Prints the wall time of each CreateShader on the creating thread, the present-to-present times, the
+  // end-to-end time, and the driver's pipeline compiles per thread; the engine's stats lines at its release
+  // add the translations. Numbers, not checks: the development PC says nothing absolute about the BC-250.
+  struct Spread {
+    size_t n = 0u;
+    double mean = 0.0, p50 = 0.0, p95 = 0.0, max = 0.0, total = 0.0;
+  };
+
+  Spread SpreadOf(std::vector<double> v) {
+    Spread s;
+    s.n = v.size();
+
+    if (v.empty())
+      return s;
+
+    std::sort(v.begin(), v.end());
+
+    for (double x : v)
+      s.total += x;
+
+    s.mean = s.total / double(v.size());
+    s.p50  = v[v.size() / 2u];
+    s.p95  = v[std::min(v.size() - 1u, (v.size() * 95u) / 100u)];
+    s.max  = v.back();
+    return s;
+  }
+
+  void PrintSpread(const char* what, const Spread& s) {
+    std::printf("      %s ms: n=%zu mean=%.3f p50=%.3f p95=%.3f max=%.3f total=%.1f\n",
+      what, s.n, s.mean, s.p50, s.p95, s.max, s.total);
+  }
+
+  // Vertex buffer format for an input of a vertex program, from its signature entry
+  DXGI_FORMAT InputFormat(const BC250_DXVK_SIGNATURE_ENTRY& e) {
+    static const DXGI_FORMAT formats[3][4] = {
+      { DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32G32_FLOAT, DXGI_FORMAT_R32G32B32_FLOAT, DXGI_FORMAT_R32G32B32A32_FLOAT },
+      { DXGI_FORMAT_R32_UINT,  DXGI_FORMAT_R32G32_UINT,  DXGI_FORMAT_R32G32B32_UINT,  DXGI_FORMAT_R32G32B32A32_UINT  },
+      { DXGI_FORMAT_R32_SINT,  DXGI_FORMAT_R32G32_SINT,  DXGI_FORMAT_R32G32B32_SINT,  DXGI_FORMAT_R32G32B32A32_SINT  },
+    };
+
+    UINT components = (e.Mask & 8u) ? 4u : (e.Mask & 4u) ? 3u : (e.Mask & 2u) ? 2u : 1u;
+    UINT type = e.ComponentType == D3D_REGISTER_COMPONENT_UINT32 ? 1u
+              : e.ComponentType == D3D_REGISTER_COMPONENT_SINT32 ? 2u : 0u;
+    return formats[type][components - 1u];
+  }
+
+  // One test thread inside the engine at a time, per call, as the runtime enforces for a driver without
+  // FREETHREADED, with a critical section as the runtime's; it is recursive, so a call may nest inside a held
+  // scope. Each thread sums the time it waited for the other.
+  thread_local double t_ddiWaitMs = 0.0;
+
+  struct DdiCall {
+    CRITICAL_SECTION* cs;
+
+    explicit DdiCall(CRITICAL_SECTION* c) : cs(c) {
+      if (!TryEnterCriticalSection(cs)) {
+        double t0 = QpcMs();
+        EnterCriticalSection(cs);
+        t_ddiWaitMs += QpcMs() - t0;
+      }
+    }
+
+    ~DdiCall() {
+      LeaveCriticalSection(cs);
+    }
+
+    DdiCall             (const DdiCall&) = delete;
+    DdiCall& operator = (const DdiCall&) = delete;
+  };
+
+  void RunShaderBench(IBc250DxvkDevice* engine, ID3D11Device* d3d, ID3D11DeviceContext* ctx, const std::string& dir,
+      const std::string& pattern) {
+    using Microsoft::WRL::ComPtr;
+    constexpr UINT Size = 64u, Latency = 3u, VertexStride = 256u;
+    constexpr UINT NewPairsPerFrame = 8u;                                 // load, loader
+    constexpr UINT CreatesPerFrame = 4u, Lag = 2u, OldPairsPerFrame = 16u;  // stream; Lag, old pairs: loader
+    constexpr double LoaderGapMs = 0.2;                                   // loader
+
+    struct Program {
+      std::string               name;
+      DdiShader                 ddi;
+      bool                      vertex = false;
+      UINT                      createFrame = 0u;
+      ComPtr<ID3D11DeviceChild> object;
+      ComPtr<ID3D11InputLayout> layout;
+    };
+
+    // ---- corpus ----
+    std::vector<std::string> files;
+    WIN32_FIND_DATAA found = { };
+    HANDLE find = FindFirstFileA((dir + "\\*.dxbc").c_str(), &found);
+
+    if (find != INVALID_HANDLE_VALUE) {
+      do {
+        files.push_back(found.cFileName);
+      } while (FindNextFileA(find, &found));
+
+      FindClose(find);
+    }
+
+    std::sort(files.begin(), files.end());
+
+    std::vector<Program> programs;
+    std::vector<std::pair<size_t, size_t>> pairs;   // vertex, pixel program
+    size_t vertexCount = 0u, skipped = 0u, lastVertex = SIZE_MAX;
+    uint64_t tokens = 0u;
+
+    for (const auto& file : files) {
+      Program p;
+      p.name = file;
+
+      if (!LoadDdi(dir + "\\" + file, &p.ddi)) {
+        Check(false, ("shader bench: load " + file).c_str());
+        return;
+      }
+
+      // D3D10_SB_TOKENIZED_PROGRAM_TYPE in the version token: 0 pixel, 1 vertex; the second token is the length
+      UINT type = p.ddi.tokens[0] >> 16;
+
+      if (type > 1u) {
+        skipped++;
+        continue;
+      }
+
+      p.vertex = type == 1u;
+      tokens += p.ddi.tokens[1];
+
+      if (p.vertex) {
+        lastVertex = programs.size();
+        vertexCount++;
+      } else {
+        pairs.emplace_back(lastVertex, programs.size());
+      }
+
+      programs.push_back(std::move(p));
+    }
+
+    // Pixel programs before the first vertex program take the first one
+    size_t firstVertex = SIZE_MAX;
+
+    for (size_t i = 0u; i < programs.size() && firstVertex == SIZE_MAX; i++) {
+      if (programs[i].vertex)
+        firstVertex = i;
+    }
+
+    for (auto& pair : pairs) {
+      if (pair.first == SIZE_MAX)
+        pair.first = firstVertex;
+    }
+
+    std::printf("      shader bench (%s): %s: %zu vertex, %zu pixel programs, %llu tokens, %zu other programs skipped\n",
+      pattern.c_str(), dir.c_str(), vertexCount, pairs.size(), static_cast<unsigned long long>(tokens), skipped);
+
+    if (!vertexCount || pairs.empty()) {
+      Check(false, "shader bench: the directory has vertex and pixel programs");
+      return;
+    }
+
+    // ---- what every program may use: t0-t7, s0-s1, b0-b3, one render target ----
+    std::vector<uint8_t> zeros(65536u);
+    D3D11_SUBRESOURCE_DATA zeroData = { zeros.data(), 4096u };
+
+    D3D11_BUFFER_DESC cbDesc = { 65536u, D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER };
+    D3D11_BUFFER_DESC vbDesc = { 3u * VertexStride, D3D11_USAGE_IMMUTABLE, D3D11_BIND_VERTEX_BUFFER };
+    ComPtr<ID3D11Buffer> cb, vb;
+
+    D3D11_TEXTURE2D_DESC texDesc = { 4u, 4u, 1u, 1u, DXGI_FORMAT_R8G8B8A8_UNORM, { 1u, 0u },
+      D3D11_USAGE_IMMUTABLE, D3D11_BIND_SHADER_RESOURCE };
+    D3D11_SUBRESOURCE_DATA texData = { zeros.data(), 16u };
+    ComPtr<ID3D11Texture2D> tex;
+    ComPtr<ID3D11ShaderResourceView> srv;
+
+    D3D11_TEXTURE2D_DESC rtDesc = { Size, Size, 1u, 1u, DXGI_FORMAT_R8G8B8A8_UNORM, { 1u, 0u },
+      D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET };
+    ComPtr<ID3D11Texture2D> rt;
+    ComPtr<ID3D11RenderTargetView> rtv;
+
+    D3D11_SAMPLER_DESC sd = { };
+    sd.Filter         = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    sd.AddressU       = D3D11_TEXTURE_ADDRESS_WRAP;
+    sd.AddressV       = D3D11_TEXTURE_ADDRESS_WRAP;
+    sd.AddressW       = D3D11_TEXTURE_ADDRESS_WRAP;
+    sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
+    sd.MaxLOD         = D3D11_FLOAT32_MAX;
+    ComPtr<ID3D11SamplerState> sampler;
+
+    ComPtr<ID3D11Query> events[Latency];
+    D3D11_QUERY_DESC qd = { D3D11_QUERY_EVENT, 0u };
+    bool ready = SUCCEEDED(d3d->CreateBuffer(&cbDesc, &zeroData, &cb))
+              && SUCCEEDED(d3d->CreateBuffer(&vbDesc, &zeroData, &vb))
+              && SUCCEEDED(d3d->CreateTexture2D(&texDesc, &texData, &tex))
+              && SUCCEEDED(d3d->CreateShaderResourceView(tex.Get(), nullptr, &srv))
+              && SUCCEEDED(d3d->CreateTexture2D(&rtDesc, nullptr, &rt))
+              && SUCCEEDED(d3d->CreateRenderTargetView(rt.Get(), nullptr, &rtv))
+              && SUCCEEDED(d3d->CreateSamplerState(&sd, &sampler));
+
+    for (auto& e : events)
+      ready = ready && SUCCEEDED(d3d->CreateQuery(&qd, &e));
+
+    if (!ready) {
+      Check(false, "shader bench: resources");
+      return;
+    }
+
+    ctx->ClearState();
+
+    UINT offset = 0u, stride = VertexStride;
+    D3D11_VIEWPORT viewport = { 0.0f, 0.0f, float(Size), float(Size), 0.0f, 1.0f };
+    ID3D11Buffer* vbs[] = { vb.Get() };
+    ID3D11Buffer* cbs[4] = { cb.Get(), cb.Get(), cb.Get(), cb.Get() };
+    ID3D11ShaderResourceView* srvs[8] = { };
+    ID3D11SamplerState* samplers[2] = { sampler.Get(), sampler.Get() };
+
+    for (auto& s : srvs)
+      s = srv.Get();
+
+    ctx->IASetVertexBuffers(0u, 1u, vbs, &stride, &offset);
+    ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ctx->RSSetViewports(1u, &viewport);
+    ctx->VSSetConstantBuffers(0u, 4u, cbs);
+    ctx->PSSetConstantBuffers(0u, 4u, cbs);
+    ctx->VSSetShaderResources(0u, 8u, srvs);
+    ctx->PSSetShaderResources(0u, 8u, srvs);
+    ctx->VSSetSamplers(0u, 2u, samplers);
+    ctx->PSSetSamplers(0u, 2u, samplers);
+    ctx->OMSetRenderTargets(1u, rtv.GetAddressOf(), nullptr);
+
+    // ---- one test thread inside the engine at a time, per call (see DdiCall) ----
+    struct DdiLock {
+      CRITICAL_SECTION cs;
+      DdiLock()  { InitializeCriticalSection(&cs); }
+      ~DdiLock() { DeleteCriticalSection(&cs); }
+    } ddiLock;
+
+    auto locked = [&] (auto fn) {
+      DdiCall call(&ddiLock.cs);
+      return fn();
+    };
+
+    // ---- creation, timed on the creating thread: the call itself, not the wait for the lock ----
+    std::vector<double> vertexMs, pixelMs;
+
+    auto create = [&] (Program& p) -> bool {
+      BC250_DXVK_SHADER_DESC desc = MakeDesc(p.ddi);
+      void* object = nullptr;
+      HRESULT hr;
+      double ms;
+
+      { DdiCall call(&ddiLock.cs);
+        double t0 = QpcMs();
+        hr = engine->CreateShader(&desc,
+          p.vertex ? __uuidof(ID3D11VertexShader) : __uuidof(ID3D11PixelShader), &object);
+        ms = QpcMs() - t0;
+      }
+
+      if (FAILED(hr)) {
+        std::printf("FAIL  shader bench: CreateShader %s: hr=0x%08lX\n", p.name.c_str(), static_cast<unsigned long>(hr));
+        g_failures++;
+        return false;
+      }
+
+      // Both stage interfaces derive from ID3D11DeviceChild alone
+      p.object.Attach(static_cast<ID3D11DeviceChild*>(object));
+      (p.vertex ? vertexMs : pixelMs).push_back(ms);
+
+      if (!p.vertex)
+        return true;
+
+      // The program's own inputs, packed; the zeroed vertices fit any of them
+      std::vector<BC250_DXVK_VERTEX_ATTRIBUTE> attrs;
+      UINT attrOffset = 0u;
+      DdiCall call(&ddiLock.cs);
+
+      for (const auto& e : p.ddi.input) {
+        if (e.SystemValue)   // vertex and instance IDs come from the input assembler
+          continue;
+
+        VkFormat format = VK_FORMAT_UNDEFINED;
+        UINT size = 0u;
+
+        if (FAILED(engine->GetVertexFormat(InputFormat(e), &format, &size)))
+          return false;
+
+        attrs.push_back({ e.Register, 0u, format, attrOffset });
+        attrOffset += size;
+      }
+
+      BC250_DXVK_VERTEX_BINDING binding = { 0u, VertexStride, VK_VERTEX_INPUT_RATE_VERTEX, 0u };
+      BC250_DXVK_INPUT_LAYOUT layoutDesc = { UINT(attrs.size()), attrs.data(), 1u, &binding };
+      hr = engine->CreateInputLayout(&layoutDesc, &p.layout);
+
+      if (FAILED(hr)) {
+        std::printf("FAIL  shader bench: input layout of %s: hr=0x%08lX\n", p.name.c_str(), static_cast<unsigned long>(hr));
+        g_failures++;
+        return false;
+      }
+
+      return true;
+    };
+
+    // ---- frames, with a frame latency of 3 as DXGI's default ----
+    std::vector<double> presentMs;
+    double lastPresent = 0.0;
+    UINT frameIndex = 0u;   // written under the lock: the loading thread reads it
+    const float clear[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+
+    auto beginFrame = [&] () -> HRESULT {
+      if (frameIndex >= Latency) {
+        ID3D11Query* event = events[frameIndex % Latency].Get();
+        ULONGLONG deadline = GetTickCount64() + 60000u;   // GPU or lock waits
+        BOOL done = FALSE;
+        HRESULT hr;
+
+        while ((hr = locked([&] { return ctx->GetData(event, &done, sizeof(done), 0u); })) == S_FALSE) {
+          if (GetTickCount64() > deadline)
+            return E_FAIL;
+
+          YieldProcessor();
+        }
+
+        if (FAILED(hr))
+          return hr;
+      }
+
+      locked([&] { ctx->ClearRenderTargetView(rtv.Get(), clear); });
+      return S_OK;
+    };
+
+    auto draw = [&] (const std::pair<size_t, size_t>& pair) {
+      Program& v = programs[pair.first];
+      locked([&] { ctx->IASetInputLayout(v.layout.Get()); });
+      locked([&] { ctx->VSSetShader(static_cast<ID3D11VertexShader*>(v.object.Get()), nullptr, 0u); });
+      locked([&] { ctx->PSSetShader(static_cast<ID3D11PixelShader*>(programs[pair.second].object.Get()), nullptr, 0u); });
+      locked([&] { ctx->Draw(3u, 0u); });
+    };
+
+    auto endFrame = [&] () -> HRESULT {
+      HRESULT hr = locked([&] {
+        ctx->End(events[frameIndex % Latency].Get());
+        HRESULT result = engine->SubmitForPresent(rt.Get(), 0u);
+        frameIndex++;
+        return result;
+      });
+
+      double now = QpcMs();
+      presentMs.push_back(now - lastPresent);
+      lastPresent = now;
+      return hr;
+    };
+
+    // Stream and loader: a pair is drawn first once both of its programs exist and are Lag frames old, up to
+    // newLimit new pairs a frame; then the steady part of the frame, pairs drawn before
+    std::vector<bool> drawn(pairs.size(), false);
+    size_t drawnCount = 0u, oldPair = 0u;
+
+    auto drawPairs = [&] (size_t created, size_t newLimit) {
+      for (size_t j = 0u; j < pairs.size() && newLimit; j++) {
+        const auto& pair = pairs[j];
+
+        if (drawn[j] || pair.first >= created || pair.second >= created
+         || frameIndex < programs[pair.first].createFrame + Lag
+         || frameIndex < programs[pair.second].createFrame + Lag)
+          continue;
+
+        draw(pair);
+        drawn[j] = true;
+        drawnCount++;
+        newLimit--;
+      }
+
+      for (UINT k = 0u; k < OldPairsPerFrame && drawnCount; k++) {
+        while (!drawn[oldPair % pairs.size()])
+          oldPair++;
+
+        draw(pairs[oldPair++ % pairs.size()]);
+      }
+    };
+
+    const PipelineKinds kindsBefore = g_pipelineKinds;
+    PipelineKinds loaderKinds;
+    double tStart = QpcMs(), cpuStart = ProcessCpuMs(), tCreated = 0.0;
+    double drawWaitBefore = t_ddiWaitMs, loaderWaitMs = 0.0;
+    HRESULT hr = S_OK;
+
+    if (pattern == "load") {
+      for (auto& p : programs) {
+        if (!create(p))
+          return;
+      }
+
+      tCreated = QpcMs();
+      lastPresent = tCreated;
+
+      for (size_t first = 0u; first < pairs.size() && SUCCEEDED(hr); first += NewPairsPerFrame) {
+        hr = beginFrame();
+
+        for (size_t j = first; j < std::min(pairs.size(), first + NewPairsPerFrame) && SUCCEEDED(hr); j++)
+          draw(pairs[j]);
+
+        if (SUCCEEDED(hr))
+          hr = endFrame();
+      }
+    } else if (pattern == "stream") {
+      size_t created = 0u;
+      lastPresent = tStart;
+
+      while (drawnCount < pairs.size() && SUCCEEDED(hr)) {
+        for (UINT c = 0u; c < CreatesPerFrame && created < programs.size(); c++, created++) {
+          programs[created].createFrame = frameIndex;
+
+          if (!create(programs[created]))
+            return;
+        }
+
+        if (created == programs.size() && tCreated == 0.0)
+          tCreated = QpcMs();
+
+        hr = beginFrame();
+
+        if (SUCCEEDED(hr)) {
+          drawPairs(created, SIZE_MAX);
+          hr = endFrame();
+        }
+      }
+    } else {
+      // Under the lock: programs[0, created) exist (their createFrame and objects are set), or the loader failed
+      size_t created = 0u;
+      bool loaderFailed = false;
+      lastPresent = tStart;
+
+      std::thread loader([&] {
+        t_secondCaller = true;
+        t_pipelineKinds = &loaderKinds;
+
+        for (auto& p : programs) {
+          bool ok;
+
+          { DdiCall call(&ddiLock.cs);
+            p.createFrame = frameIndex;
+            ok = create(p);
+            created += ok ? 1u : 0u;
+            loaderFailed = !ok;
+          }
+
+          if (!ok)
+            break;
+
+          // The thread's own work per program, outside the engine (reading, decompressing), which also lets
+          // the drawing thread in: a critical section is not fair to a waiter woken while its owner re-enters
+          for (double until = QpcMs() + LoaderGapMs; QpcMs() < until; )
+            YieldProcessor();
+        }
+
+        tCreated = QpcMs();
+        loaderWaitMs = t_ddiWaitMs;
+      });
+
+      while (SUCCEEDED(hr)) {
+        size_t available = 0u;
+        bool failed = false;
+
+        locked([&] {
+          available = created;
+          failed = loaderFailed;
+        });
+
+        if (failed || drawnCount == pairs.size())
+          break;
+
+        hr = beginFrame();
+
+        if (SUCCEEDED(hr)) {
+          drawPairs(available, NewPairsPerFrame);
+          hr = endFrame();
+        }
+      }
+
+      loader.join();
+
+      if (loaderFailed)
+        return;
+    }
+
+    double tFrames = QpcMs();
+
+    if (SUCCEEDED(hr))
+      hr = engine->WaitForResourceIdle(rt.Get());
+
+    double tEnd = QpcMs(), cpuEnd = ProcessCpuMs();
+
+    if (!CheckHr(hr, "shader bench: frames"))
+      return;
+
+    PrintSpread("CreateShader vertex", SpreadOf(vertexMs));
+    PrintSpread("CreateShader pixel", SpreadOf(pixelMs));
+    PrintSpread("present to present", SpreadOf(presentMs));
+
+    std::printf("      end to end %.1f ms (programs created at %.1f ms, last frame submitted at %.1f ms), %u frames, "
+      "process CPU %.1f ms\n", tEnd - tStart, tCreated - tStart, tFrames - tStart, frameIndex, cpuEnd - cpuStart);
+
+    auto printKinds = [] (const char* thread, const PipelineKinds& now, const PipelineKinds& before) {
+      std::printf("      driver pipeline creation on the %s thread: %u libraries %.1f ms, %u fast links %.1f ms, "
+        "%u optimized %.1f ms\n", thread,
+        now.libraries - before.libraries, now.libraryMs - before.libraryMs,
+        now.fastLinks - before.fastLinks, now.linkMs - before.linkMs,
+        now.optimized - before.optimized, now.optimizedMs - before.optimizedMs);
+    };
+
+    if (pattern == "loader") {
+      printKinds("drawing", g_pipelineKinds, kindsBefore);
+      printKinds("loading", loaderKinds, PipelineKinds());
+      std::printf("      waits for the other thread to leave the engine: drawing thread %.1f ms, loading thread %.1f ms\n",
+        t_ddiWaitMs - drawWaitBefore, loaderWaitMs);
+    } else {
+      printKinds("calling", g_pipelineKinds, kindsBefore);
+    }
   }
 
   // ---- Vulkan -------------------------------------------------------------------------------------
@@ -1053,27 +1727,75 @@ namespace {
 int main(int argc, char** argv) {
   if (argc < 2) {
     std::printf("usage: amdgpu_wddm_dxvk_engine_test <amdgpu_wddm_dxvk.dll> [adapter substring] [--icd <path>]"
-                " [--bench] [--bench-tiling]\n");
+                " [--bench] [--bench-tiling] [--bench-shaders <dir> [--bench-pattern load|stream|loader]]"
+                " [--keep-shader-cache]\n");
     return 2;
   }
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   const char* adapterFilter = nullptr;
   const char* icdPath = nullptr;
-  bool bench = false, benchTiling = false;
+  const char* benchShaders = nullptr;
+  std::string benchPattern = "load";
+  bool bench = false, benchTiling = false, keepShaderCache = false;
 
   for (int i = 2; i < argc; i++) {
     if (!std::strcmp(argv[i], "--bench"))
       bench = true;
     else if (!std::strcmp(argv[i], "--bench-tiling"))
       benchTiling = true;
-    else if (!std::strcmp(argv[i], "--icd") && i + 1 < argc)
-      icdPath = argv[++i];
-    else if (!std::strcmp(argv[i], "--icd")) {
-      std::printf("FAIL  --icd needs a path\n");
+    else if (!std::strcmp(argv[i], "--keep-shader-cache"))
+      keepShaderCache = true;
+    else if ((!std::strcmp(argv[i], "--icd") || !std::strcmp(argv[i], "--bench-shaders")
+           || !std::strcmp(argv[i], "--bench-pattern")) && i + 1 >= argc) {
+      std::printf("FAIL  %s needs a value\n", argv[i]);
       return 2;
-    } else
+    } else if (!std::strcmp(argv[i], "--icd"))
+      icdPath = argv[++i];
+    else if (!std::strcmp(argv[i], "--bench-shaders"))
+      benchShaders = argv[++i];
+    else if (!std::strcmp(argv[i], "--bench-pattern"))
+      benchPattern = argv[++i];
+    else
       adapterFilter = argv[i];
+  }
+
+  if (benchPattern != "load" && benchPattern != "stream" && benchPattern != "loader") {
+    std::printf("FAIL  --bench-pattern is load or stream\n");
+    return 2;
+  }
+
+  // The engine's shader cache (r9) is per user and per executable. Before the engine reads the variable (once
+  // per process), keep it beside the test unless DXVK_SHADER_CACHE_PATH names a place, and start cold there.
+  {
+    char path[MAX_PATH] = { };
+
+    if (!GetEnvironmentVariableA("DXVK_SHADER_CACHE_PATH", path, MAX_PATH)) {
+      std::string dir(MAX_PATH, '\0');
+      dir.resize(GetModuleFileNameA(nullptr, dir.data(), MAX_PATH));
+      dir = dir.substr(0u, dir.find_last_of("\\/")) + "\\shader-cache";
+      SetEnvironmentVariableA("DXVK_SHADER_CACHE_PATH", dir.c_str());
+
+      uint32_t deleted = 0u;
+
+      for (const char* pattern : { "\\*.dxvk.lut", "\\*.dxvk.bin" }) {
+        WIN32_FIND_DATAA found = { };
+        HANDLE find = keepShaderCache ? INVALID_HANDLE_VALUE : FindFirstFileA((dir + pattern).c_str(), &found);
+
+        if (find == INVALID_HANDLE_VALUE)
+          continue;
+
+        do {
+          deleted += DeleteFileA((dir + "\\" + found.cFileName).c_str()) ? 1u : 0u;
+        } while (FindNextFileA(find, &found));
+
+        FindClose(find);
+      }
+
+      std::printf("shader cache: %s (%s, %u files deleted)\n", dir.c_str(), keepShaderCache ? "kept" : "cold", deleted);
+    } else {
+      std::printf("shader cache: %s (DXVK_SHADER_CACHE_PATH, left as it is)\n", path);
+    }
   }
 
   // ---- Vulkan instance and device, owned by the "shell" ----
@@ -1313,7 +2035,7 @@ int main(int argc, char** argv) {
 
   // Arms the engine's out-of-memory injection (test switch outside the ABI) for the ABI 1.4 cases. It costs an
   // environment lookup per allocation, so benchmark runs leave it off.
-  const bool injectOutOfMemory = !bench && !benchTiling;
+  const bool injectOutOfMemory = !bench && !benchTiling && !benchShaders;
 
   if (injectOutOfMemory)
     SetEnvironmentVariableA("BC250DXVK_TEST_OOM", "1");
@@ -1327,6 +2049,13 @@ int main(int argc, char** argv) {
   std::printf("      %.1f ms\n", nowMs() - tCreate);
 
   Check(shell.logLines.load() > 0u, "CreateDevice's own lines (device import) reach the shell's Log");
+
+  // An r9 engine names its shader cache decision at creation; an older one starts no thread at all (E2)
+  const bool r9 = HasLine(shell.lines, "amdgpu_wddm_dxvk: Shader cache in ")
+               || HasLine(shell.lines, "amdgpu_wddm_dxvk: No shader cache: ");
+  const bool cacheOn = HasLine(shell.lines, "amdgpu_wddm_dxvk: Shader cache in ");
+  std::printf("      engine %s, shader cache %s, translation on workers %s\n", r9 ? "r9 or later" : "before r9",
+    cacheOn ? "on" : "off", r9 && !TranslationOnWorkersOff() ? "on" : "off");
 
   Microsoft::WRL::ComPtr<ID3D11Device> d3d;
   Microsoft::WRL::ComPtr<ID3D11DeviceContext> ctx;
@@ -2916,27 +3645,48 @@ int main(int argc, char** argv) {
       RunTilingBench(vk, physDev, device, memProps, engine2.Get(), d3d.Get(), ctx.Get());
   }
 
+  if (benchShaders)
+    RunShaderBench(engine, d3d.Get(), ctx.Get(), benchShaders, benchPattern);
+
   // ---- threads and submissions ----
   // A start module only ever proves a thread is the engine's: a std::thread starts in ucrtbase.dll, and
-  // loaders and layers start their own. The Vulkan call census after teardown is the E2 criterion.
+  // loaders and layers start their own. The Vulkan call census after teardown is the E2 criterion. Since r9 the
+  // engine runs threads that make no Vulkan call: DXVK's pipeline workers, which translate shaders (dxvk-shader-*),
+  // and the shader cache's writer (dxvk-cache). None of them may outlive the final Release (below).
   std::set<DWORD> threadsAfter = ProcessThreads();
-  uint32_t engineThreads = 0u;
+  uint32_t engineThreads = 0u, otherEngineThreads = 0u;
+  std::map<std::string, uint32_t> engineThreadNames;
 
   for (DWORD tid : threadsAfter) {
     if (threadsBefore.count(tid))
       continue;
 
     std::string module = ModuleOf(ThreadStartAddress(tid));
-    std::printf("      new thread %lu starts in %s\n", static_cast<unsigned long>(tid), module.c_str());
 
-    if (_stricmp(module.c_str(), "amdgpu_wddm_dxvk.dll") == 0)
-      engineThreads++;
+    if (_stricmp(module.c_str(), "amdgpu_wddm_dxvk.dll") != 0) {
+      std::printf("      new thread %lu starts in %s\n", static_cast<unsigned long>(tid), module.c_str());
+      continue;
+    }
+
+    std::string name = ThreadName(tid);
+    engineThreads++;
+    engineThreadNames[name]++;
+
+    if (name.rfind("dxvk-shader-", 0u) != 0u && name != "dxvk-cache")
+      otherEngineThreads++;
   }
+
+  for (const auto& entry : engineThreadNames)
+    std::printf("      new threads in amdgpu_wddm_dxvk.dll named \"%s\": %u\n", entry.first.c_str(), entry.second);
 
   std::printf("      queue lock calls %u, from other threads %u\n", shell.lockCalls.load(), shell.foreignCalls.load());
   Check(shell.lockCalls.load() > 0u, "the engine brackets queue submissions with QueueLock");
   Check(shell.foreignCalls.load() == 0u, "every QueueLock call came from the calling thread (E2)");
-  Check(engineThreads == 0u, "no new thread starts in amdgpu_wddm_dxvk.dll");
+
+  if (r9)
+    Check(otherEngineThreads == 0u, "the engine's own threads are shader translation workers and the cache writer (r9)");
+  else
+    Check(engineThreads == 0u, "no new thread starts in amdgpu_wddm_dxvk.dll");
 
   // ---- teardown (E4, E5) ----
   rtv.Reset();
@@ -2963,6 +3713,133 @@ int main(int argc, char** argv) {
 
   ULONG remaining = engine->Release();
   Check(remaining == 0u, "final engine Release reports no leaked D3D11 references (E4)");
+  const uint32_t linesAtRelease = shell.logLines.load();
+
+  // ---- r9: translation on workers, the shader cache, and the engine's threads ----
+  auto printShaderLines = [] (const Shell& s) {
+    for (const auto& line : s.lines) {
+      if (line.find("amdgpu_wddm_dxvk: Shader stats:") != std::string::npos
+       || line.find("Shader cache closed:") != std::string::npos)
+        std::printf("      %s\n", line.c_str());
+    }
+  };
+
+  printShaderLines(shell);
+
+  if (r9) {
+    const long long translated = StatValue(shell.lines, "amdgpu_wddm_dxvk: Shader stats:", "translated");
+    const long long queued     = StatValue(shell.lines, "amdgpu_wddm_dxvk: Shader stats:", "queued");
+    const long long onWorkers  = StatValue(shell.lines, "amdgpu_wddm_dxvk: Shader stats:", "on_workers");
+    const long long errors     = StatValue(shell.lines, "amdgpu_wddm_dxvk: Shader stats:", "errors");
+    const long long cacheHits  = cacheOn ? StatValue(shell.lines, "Shader cache closed:", "hits") : 0;
+
+    if (TranslationOnWorkersOff()) {
+      Check(queued == 0, "dxvk.translateShadersOnWorkers = False: no translation goes to a worker");
+    } else if (translated == 0 && cacheHits > 0) {
+      std::printf("      every shader came from the shader cache (a warm start): nothing to translate\n");
+    } else {
+      Check(queued > 0 && onWorkers > 0, "CreateShader leaves the translation to a pipeline worker");
+    }
+
+    Check(errors == 0, "no translation or deferred library compile failed");
+
+    if (cacheOn) {
+      const long long written = StatValue(shell.lines, "Shader cache closed:", "written");
+      const long long hits    = StatValue(shell.lines, "Shader cache closed:", "hits");
+      Check(written > 0 || hits > 0, "the shader cache wrote this run's shaders or found them");
+    }
+  }
+
+  Check(EngineThreadsSince(threadsBefore).empty(), "no thread of amdgpu_wddm_dxvk.dll outlives the final Release");
+
+  // A second device of the process finds the first device's shaders in the cache: no translation, same pixels
+  if (r9 && cacheOn) {
+    const long long translatedBefore = StatValue(shell.lines, "amdgpu_wddm_dxvk: Shader stats:", "translated");
+
+    Shell warm;
+    InitializeCriticalSection(&warm.queueLock);
+    warm.mainThread = GetCurrentThreadId();
+
+    BC250_DXVK_SHELL_SERVICES warmServices = services;
+    warmServices.Shell = &warm;
+
+    BC250_DXVK_DEVICE_CREATE_INFO warmInfo = createInfo;
+    warmInfo.Services = &warmServices;
+
+    IBc250DxvkDevice* engineWarm = nullptr;
+
+    if (CheckHr(funcs.CreateDevice(&warmInfo, &engineWarm), "second device: CreateDevice")) {
+      Microsoft::WRL::ComPtr<ID3D11Device> d3dWarm;
+      Microsoft::WRL::ComPtr<ID3D11DeviceContext> ctxWarm;
+      Microsoft::WRL::ComPtr<ID3D11VertexShader> vsWarm;
+      Microsoft::WRL::ComPtr<ID3D11PixelShader> psWarm;
+      Microsoft::WRL::ComPtr<ID3D11InputLayout> layoutWarm;
+      Microsoft::WRL::ComPtr<ID3D11Buffer> vbWarm;
+      Microsoft::WRL::ComPtr<ID3D11Texture2D> rtWarm, stagingWarm;
+      Microsoft::WRL::ComPtr<ID3D11RenderTargetView> rtvWarm;
+
+      D3D11_TEXTURE2D_DESC rtWarmDesc = stDesc;
+      rtWarmDesc.Usage          = D3D11_USAGE_DEFAULT;
+      rtWarmDesc.BindFlags      = D3D11_BIND_RENDER_TARGET;
+      rtWarmDesc.CPUAccessFlags = 0u;
+
+      bool ready = SUCCEEDED(engineWarm->GetD3D11Device(IID_PPV_ARGS(&d3dWarm)))
+                && SUCCEEDED(engineWarm->GetImmediateContext(IID_PPV_ARGS(&ctxWarm)))
+                && SUCCEEDED(engineWarm->CreateShader(&vsDesc, IID_PPV_ARGS(&vsWarm)))
+                && SUCCEEDED(engineWarm->CreateShader(&psDesc, IID_PPV_ARGS(&psWarm)))
+                && SUCCEEDED(engineWarm->CreateInputLayout(&layoutDesc, &layoutWarm))
+                && SUCCEEDED(d3dWarm->CreateBuffer(&vbDesc, &vbData, &vbWarm))
+                && SUCCEEDED(d3dWarm->CreateTexture2D(&rtWarmDesc, nullptr, &rtWarm))
+                && SUCCEEDED(d3dWarm->CreateRenderTargetView(rtWarm.Get(), nullptr, &rtvWarm))
+                && SUCCEEDED(d3dWarm->CreateTexture2D(&stDesc, nullptr, &stagingWarm));
+      Check(ready, "second device: shaders, input layout, vertices and target");
+
+      if (ready) {
+        ID3D11Buffer* vbsWarm[] = { vbWarm.Get() };
+        ctxWarm->ClearRenderTargetView(rtvWarm.Get(), clear);
+        ctxWarm->IASetInputLayout(layoutWarm.Get());
+        ctxWarm->IASetVertexBuffers(0u, 1u, vbsWarm, &stride, &offset);
+        ctxWarm->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        ctxWarm->VSSetShader(vsWarm.Get(), nullptr, 0u);
+        ctxWarm->PSSetShader(psWarm.Get(), nullptr, 0u);
+        ctxWarm->RSSetViewports(1u, &viewport);
+        ctxWarm->OMSetRenderTargets(1u, rtvWarm.GetAddressOf(), nullptr);
+        ctxWarm->Draw(3u, 0u);
+        CheckHr(engineWarm->SubmitForPresent(rtWarm.Get(), 0u), "second device: draw and SubmitForPresent");
+        ctxWarm->CopyResource(stagingWarm.Get(), rtWarm.Get());
+
+        if (CheckHr(ctxWarm->Map(stagingWarm.Get(), 0u, D3D11_MAP_READ, 0u, &mapped), "second device: Map staging")) {
+          Check(similar(pixel(W - 1u, H - 1u), cr, cg, cb, 1) && pixel(0u, 0u)[0] > 230 && pixel(0u, 0u)[1] < 25,
+            "second device: the same clear and triangle from the cached shaders");
+          ctxWarm->Unmap(stagingWarm.Get(), 0u);
+        }
+      }
+
+      vsWarm.Reset();
+      psWarm.Reset();
+      layoutWarm.Reset();
+      vbWarm.Reset();
+      rtvWarm.Reset();
+      rtWarm.Reset();
+      stagingWarm.Reset();
+      ctxWarm.Reset();
+      d3dWarm.Reset();
+      Check(engineWarm->Release() == 0u, "second device: final Release reports no leaked D3D11 references");
+    }
+
+    printShaderLines(warm);
+
+    const long long hits = StatValue(warm.lines, "Shader cache closed:", "hits");
+    const long long misses = StatValue(warm.lines, "Shader cache closed:", "misses");
+    const long long translatedAfter = StatValue(warm.lines, "amdgpu_wddm_dxvk: Shader stats:", "translated");
+
+    Check(hits >= 2 && misses == 0, "second device: both shaders come from the shader cache");
+    Check(translatedBefore >= 0 && translatedAfter == translatedBefore, "second device: no shader translated");
+    Check(warm.foreignLogs.load() == 0u && warm.foreignCalls.load() == 0u,
+      "second device: every Log and QueueLock call came from the calling thread (E2)");
+    Check(EngineThreadsSince(threadsBefore).empty(), "no thread of amdgpu_wddm_dxvk.dll outlives the second device");
+    DeleteCriticalSection(&warm.queueLock);
+  }
 
   // ---- Vulkan call census, including teardown (E2) ----
   uint32_t hookedCalls = 0u, foreignCalls = 0u;
@@ -2987,7 +3864,6 @@ int main(int argc, char** argv) {
   Check(foreignCalls == 0u, "every hooked Vulkan call of the engine ran on the calling thread (E2)");
 
   // ---- Log service ----
-  uint32_t linesAtRelease = shell.logLines.load();
   std::printf("      %u log lines, %zu at level 1\n", linesAtRelease, shell.errors.size());
   Check(shell.foreignLogs.load() == 0u, "every Log call came from the calling thread (E2)");
   Check(shell.malformedLogs.load() == 0u, "every Log line has level 1-4 and no newline");
