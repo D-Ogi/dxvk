@@ -355,7 +355,10 @@ namespace dxvk {
     if (stagingMemoryInFlight > MaxMemoryInFlight) {
       ExecuteFlushLocked();
 
-      m_stagingSignal->wait(stats.allocatedTotal - MaxMemoryInFlight);
+      // Through the device: with inline execution no finish thread exists, so a
+      // plain wait on the signal never returns (a game creating many initialized
+      // textures at load hung here); waitForFence retires submissions itself.
+      m_device->waitForFence(*m_stagingSignal, stats.allocatedTotal - MaxMemoryInFlight);
     } else if (m_transferCommands >= MaxCommandsPerSubmission || stats.allocatedSinceLastReset >= MaxMemoryPerSubmission) {
       // Flush pending commands if there are a lot of updates in flight
       // to keep both execution time and staging memory in check.
