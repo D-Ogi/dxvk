@@ -40,9 +40,10 @@ namespace dxvk {
 
     determineShaderOptions();
 
+    // With inline execution too: the cache's writer thread makes no Vulkan call
     if (env::getEnvVar("DXVK_SHADER_CACHE") != "0" && DxvkShader::getShaderDumpPath().empty()
-     && !m_hostOptions.disableShaderCache && !m_hostOptions.inlineExecution)
-      m_shaderCache = DxvkShaderCache::getInstance();
+     && !m_hostOptions.disableShaderCache)
+      m_shaderCache = DxvkShaderCache::getInstance(m_hostOptions.shaderCacheDirectory);
 
     logBindingModel();
   }

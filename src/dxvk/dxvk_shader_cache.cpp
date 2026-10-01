@@ -9,14 +9,18 @@ namespace dxvk {
 
   DxvkShaderCache::Instance DxvkShaderCache::s_instance;
 
-  DxvkShaderCache::DxvkShaderCache()
-  : m_filePaths(getDefaultFilePaths()) {
+  DxvkShaderCache::DxvkShaderCache(const std::string& directory)
+  : m_filePaths(getDefaultFilePaths(directory)) {
 
   }
 
 
   DxvkShaderCache::~DxvkShaderCache() {
     if (m_writer.joinable()) {
+      // Write what is translated, skip the rest: this runs when the
+      // last device goes away, on a thread inside the application.
+      m_stopping.store(true);
+
       { std::unique_lock lock(m_writeMutex);
         m_writeQueue.push(nullptr);
         m_writeCond.notify_one();
@@ -24,14 +28,24 @@ namespace dxvk {
 
       m_writer.join();
     }
+
+    if (m_status.load() != Status::Uninitialized) {
+      Logger::info(str::format("Shader cache closed: hits=", m_lookupHits.load(), " misses=", m_lookupMisses.load(),
+        " written=", m_written.load(), " skipped=", m_skipped.load()));
+    }
   }
 
 
   Rc<DxvkIrShader> DxvkShaderCache::lookupShader(
     const std::string&                name,
     const DxvkIrShaderCreateInfo&     options) {
-    if (!ensureStatus(Status::OpenReadWrite))
+    if (!ensureStatus(Status::OpenReadWrite)) {
+      // A new or discarded cache: nothing to find, but the shader will be written
+      if (m_status.load() == Status::OpenWriteOnly)
+        m_lookupMisses += 1u;
+
       return nullptr;
+    }
 
     LutKey k = { };
     k.name = name;
@@ -43,6 +57,7 @@ namespace dxvk {
       if (Logger::logLevel() <= LogLevel::Debug)
         Logger::debug(str::format("Shader cache miss: ", name));
 
+      m_lookupMisses += 1u;
       return nullptr;
     }
 
@@ -63,6 +78,9 @@ namespace dxvk {
         Logger::warn(str::format("Failed to re-initialize shader cache ", name));
 
       m_status.store(Status::OpenWriteOnly);
+      m_lookupMisses += 1u;
+    } else {
+      m_lookupHits += 1u;
     }
 
     return shader;
@@ -79,12 +97,26 @@ namespace dxvk {
 
     if (m_lut.find(k) == m_lut.end()) {
       std::unique_lock lock(m_writeMutex);
+
+      if (!m_queuedKeys.insert(std::move(k)).second)
+        return;
+
       m_writeQueue.push(std::move(shader));
       m_writeCond.notify_one();
 
       if (!m_writer.joinable())
         m_writer = dxvk::thread([this] { runWriter(); });
     }
+  }
+
+
+  DxvkShaderCacheStats DxvkShaderCache::getStats() const {
+    DxvkShaderCacheStats result = { };
+    result.lookupHits   = m_lookupHits.load();
+    result.lookupMisses = m_lookupMisses.load();
+    result.written      = m_written.load();
+    result.skipped      = m_skipped.load();
+    return result;
   }
 
 
@@ -164,7 +196,7 @@ namespace dxvk {
     m_lutFile.open(path + m_filePaths.lutFile, flags);
 
     if (!m_binFile || !m_lutFile) {
-      if (!env::createDirectory(m_filePaths.directory)) {
+      if (!createDirectories(m_filePaths.directory)) {
         Logger::warn(str::format("Failed to create directory: ", m_filePaths.directory));
         return false;
       }
@@ -215,19 +247,32 @@ namespace dxvk {
       return false;
     }
 
+    auto cacheSize = m_binFile.size();
+
     while (offset < size) {
       LutKey k;
       LutEntry e;
 
-      if (!readShaderLutEntry(k, e, offset)) {
-        Logger::warn("Failed to parse cache look-up table.");
-        return false;
+      size_t entryOffset = offset;
+
+      // An entry cut short, or one whose data is not in the binary file: the
+      // process or the system died while writing. Keep the entries before it.
+      if (!readShaderLutEntry(k, e, offset)
+       || e.offset + e.binarySize + e.metadataSize > cacheSize) {
+        Logger::warn(str::format("Cache look-up table ends in an incomplete entry, dropping ",
+          size - entryOffset, " bytes."));
+
+        if (!m_lutFile.truncate(entryOffset)) {
+          Logger::warn("Failed to parse cache look-up table.");
+          m_lut.clear();
+          return false;
+        }
+
+        break;
       }
 
       m_lut.insert_or_assign(k, e);
     }
-
-    auto cacheSize = m_binFile.size();;
 
     std::stringstream message;
     message << "Cache: " << m_lut.size() << " shaders (";
@@ -472,48 +517,84 @@ namespace dxvk {
 
 
   void DxvkShaderCache::runWriter() {
-    small_vector<Rc<DxvkIrShader>, 32u> localQueue;
-
     env::setThreadName("dxvk-cache");
 
+    // A log sink may only be called inside an engine call, see Logger.
+    // Translations here are off the application's threads, as on workers.
+    Logger::deferThreadLines();
+    DxvkIrShader::setWorkerThread();
+
     bool stop = false;
+    bool dirty = false;
 
     while (!stop) {
-      std::unique_lock lock(m_writeMutex);
+      Rc<DxvkIrShader> shader;
 
-      m_writeCond.wait(lock, [this] {
-        return !m_writeQueue.empty();
-      });
+      { std::unique_lock lock(m_writeMutex);
 
-      auto entry = std::move(m_writeQueue.front());
-      m_writeQueue.pop();
+        // Flush once the queue runs dry, not after every shader of a burst
+        if (dirty && m_writeQueue.empty()) {
+          lock.unlock();
 
-      lock.unlock();
+          std::unique_lock fileLock(m_fileMutex);
+          m_binFile.flush();
+          m_lutFile.flush();
+          dirty = false;
 
-      stop = !entry;
-      bool drain = stop;
-
-      if (entry) {
-        localQueue.push_back(std::move(entry));
-        drain = localQueue.size() == localQueue.capacity();
-      }
-
-      if (drain) {
-        std::unique_lock fileLock(m_fileMutex);
-
-        for (const auto& shader : localQueue) {
-          if (!writeShaderToCache(*shader)) {
-            Logger::err("Failed to write cache file.");
-            m_status = Status::CacheDisabled;
-            return;
-          }
+          fileLock.unlock();
+          lock.lock();
         }
 
-        localQueue.clear();
+        m_writeCond.wait(lock, [this] {
+          return !m_writeQueue.empty();
+        });
 
-        m_binFile.flush();
-        m_lutFile.flush();
+        shader = std::move(m_writeQueue.front());
+        m_writeQueue.pop();
       }
+
+      if (!shader) {
+        stop = true;
+        continue;
+      }
+
+      // Translate outside the file lock, which lookups take. Pipeline workers
+      // usually got there first, or are at it, and this waits for them. When
+      // the cache closes, untranslated shaders are left for the next run.
+      if (!shader->isCompileDone() && m_stopping.load()) {
+        m_skipped += 1u;
+        continue;
+      }
+
+      try {
+        shader->compile();
+      } catch (const DxvkError& e) {
+        Logger::warn(str::format("Shader cache: Not writing ", shader->debugName(), ": ", e.message()));
+      } catch (const std::exception& e) {
+        Logger::warn(str::format("Shader cache: Not writing ", shader->debugName(), ": ", e.what()));
+      }
+
+      if (!shader->isConverted()) {
+        m_skipped += 1u;
+        continue;
+      }
+
+      std::unique_lock fileLock(m_fileMutex);
+
+      if (!writeShaderToCache(*shader)) {
+        Logger::err("Failed to write cache file.");
+        m_status = Status::CacheDisabled;
+        return;
+      }
+
+      m_written += 1u;
+      dirty = true;
+    }
+
+    if (dirty) {
+      std::unique_lock fileLock(m_fileMutex);
+      m_binFile.flush();
+      m_lutFile.flush();
     }
   }
 
@@ -608,8 +689,11 @@ namespace dxvk {
   }
 
 
-  DxvkShaderCache::FilePaths DxvkShaderCache::getDefaultFilePaths() {
-    std::string cachePath = env::getEnvVar("DXVK_SHADER_CACHE_PATH");
+  DxvkShaderCache::FilePaths DxvkShaderCache::getDefaultFilePaths(const std::string& directory) {
+    std::string cachePath = directory;
+
+    if (cachePath.empty())
+      cachePath = env::getEnvVar("DXVK_SHADER_CACHE_PATH");
 
     if (cachePath.empty()) {
       #ifdef _WIN32
@@ -667,28 +751,45 @@ namespace dxvk {
   }
 
 
-  Rc<DxvkShaderCache> DxvkShaderCache::getInstance() {
+  Rc<DxvkShaderCache> DxvkShaderCache::getInstance(const std::string& directory) {
     std::lock_guard lock(s_instance.mutex);
 
     if (!s_instance.instance)
-      s_instance.instance = new DxvkShaderCache();
+      s_instance.instance = new DxvkShaderCache(directory);
 
     return s_instance.instance;
   }
 
 
-  void DxvkShaderCache::freeInstance() {
+  void DxvkShaderCache::releaseInstance() {
+    // The ref count only goes from 0 to 1 in getInstance and from 1 to 0
+    // here, both under the lock, so nothing can revive the object between
+    // the last release and its destruction. Upstream decrements outside the
+    // lock and tests the opposite condition, so an unused cache is never
+    // freed and its writer thread outlives the last device, inside a DLL
+    // that the host may unload then.
     std::lock_guard lock(s_instance.mutex);
 
-    // The ref count can only be incremented from 0 to 1 inside a locked
-    // context, so this check is safe. Don't destroy the object if another
-    // thread has essentially revived it.
-    if (m_useCount.load() || s_instance.instance != this) {
+    if (m_useCount.fetch_sub(1u) == 1u) {
       if (s_instance.instance == this)
         s_instance.instance = nullptr;
 
       delete this;
     }
+  }
+
+
+  bool DxvkShaderCache::createDirectories(const std::string& path) {
+    // Every parent first: the default directory is two levels below the user's profile
+    for (size_t i = path.find_first_of("/\\", 1u); i != std::string::npos; i = path.find_first_of("/\\", i + 1u)) {
+      // Skip a drive root such as C:\ and a doubled separator
+      if (path[i - 1u] == ':' || path[i - 1u] == '/' || path[i - 1u] == '\\')
+        continue;
+
+      env::createDirectory(path.substr(0u, i));
+    }
+
+    return env::createDirectory(path);
   }
 
 

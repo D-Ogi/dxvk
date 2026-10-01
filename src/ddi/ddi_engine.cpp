@@ -81,6 +81,115 @@ namespace dxvk::ddi {
     }
 
 
+    // Where the on-disk shader cache goes in this process, if anywhere.
+    struct ShaderCachePolicy {
+      bool        enable = false;
+      std::string directory;
+      std::string reason;
+    };
+
+
+    // Why the process's token rules the cache out, or nullptr. The router's allowlist decides which
+    // processes reach this engine; this does not rely on it. Only an ordinary user account has a profile
+    // of its own to write to: service, desktop (DWM) and font driver (UMFD) accounts do not, and neither do
+    // sandboxed tokens or integrity levels below medium, which must not leave files behind.
+    const char* TokenRulesOutCache() {
+      HANDLE token = nullptr;
+
+      if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
+        return "process token not readable";
+
+      const char* reason = nullptr;
+      DWORD size = 0u;
+
+      alignas(TOKEN_USER) std::array<BYTE, sizeof(TOKEN_USER) + SECURITY_MAX_SID_SIZE> user = { };
+
+      if (!GetTokenInformation(token, TokenUser, user.data(), DWORD(user.size()), &size)) {
+        reason = "token user not readable";
+      } else {
+        // S-1-5-21-* (local and domain accounts) and S-1-12-1-* (Entra ID accounts)
+        PSID sid = reinterpret_cast<const TOKEN_USER*>(user.data())->User.Sid;
+        const BYTE* authority = GetSidIdentifierAuthority(sid)->Value;
+        UCHAR subCount = *GetSidSubAuthorityCount(sid);
+        DWORD first = subCount ? *GetSidSubAuthority(sid, 0u) : 0u;
+
+        bool zeroHigh = !authority[0] && !authority[1] && !authority[2] && !authority[3] && !authority[4];
+        bool local = zeroHigh && authority[5] == 5u && first == SECURITY_NT_NON_UNIQUE;
+        bool entra = zeroHigh && authority[5] == 12u && first == 1u;
+
+        if (!local && !entra)
+          reason = "not a user account (service, desktop or font driver host)";
+      }
+
+      DWORD appContainer = 0u;
+
+      if (!reason && (!GetTokenInformation(token, TokenIsAppContainer, &appContainer, sizeof(appContainer), &size)
+                   || appContainer))
+        reason = "AppContainer";
+
+      if (!reason && IsTokenRestricted(token))
+        reason = "restricted token";
+
+      alignas(TOKEN_MANDATORY_LABEL) std::array<BYTE, sizeof(TOKEN_MANDATORY_LABEL) + SECURITY_MAX_SID_SIZE> label = { };
+
+      if (!reason) {
+        if (!GetTokenInformation(token, TokenIntegrityLevel, label.data(), DWORD(label.size()), &size)) {
+          reason = "integrity level not readable";
+        } else {
+          PSID sid = reinterpret_cast<const TOKEN_MANDATORY_LABEL*>(label.data())->Label.Sid;
+          UCHAR subCount = *GetSidSubAuthorityCount(sid);
+          DWORD rid = subCount ? *GetSidSubAuthority(sid, subCount - 1u) : 0u;
+
+          if (rid < SECURITY_MANDATORY_MEDIUM_RID)
+            reason = "integrity level below medium";
+          else if (rid >= SECURITY_MANDATORY_SYSTEM_RID)
+            reason = "system integrity level";
+        }
+      }
+
+      CloseHandle(token);
+      return reason;
+    }
+
+
+    // Decided once per process: the token does not change, and the cache is one per process.
+    // DXVK_SHADER_CACHE=0 turns it off, DXVK_SHADER_CACHE_PATH moves it (DXVK's own variables);
+    // the default is %LOCALAPPDATA%\amdgpu-wddm\dxvk, the user's own, never one that needs elevation.
+    const ShaderCachePolicy& GetShaderCachePolicy() {
+      static const ShaderCachePolicy policy = [] {
+        ShaderCachePolicy p;
+
+        if (env::getEnvVar("DXVK_SHADER_CACHE") == "0") {
+          p.reason = "DXVK_SHADER_CACHE=0";
+          return p;
+        }
+
+        if (const char* reason = TokenRulesOutCache()) {
+          p.reason = reason;
+          return p;
+        }
+
+        p.directory = env::getEnvVar("DXVK_SHADER_CACHE_PATH");
+
+        if (p.directory.empty()) {
+          std::string base = env::getEnvVar("LOCALAPPDATA");
+
+          if (base.empty()) {
+            p.reason = "no LOCALAPPDATA";
+            return p;
+          }
+
+          p.directory = base + "\\amdgpu-wddm\\dxvk";
+        }
+
+        p.enable = true;
+        return p;
+      } ();
+
+      return policy;
+    }
+
+
     HRESULT APIENTRY QueryDeviceRequirements(
       const BC250_DXVK_VULKAN_INSTANCE*       vk,
             BC250_DXVK_DEVICE_REQUIREMENTS*   out) {
@@ -258,7 +367,9 @@ namespace dxvk::ddi {
         deviceInfo.extensionNames = const_cast<const char**>(info->Device->ExtensionNames);
         deviceInfo.features       = info->Device->Features;
 
-        // E2, E3: everything on the calling thread; no second kernel device; no cache writer.
+        // E2, E3: every Vulkan call on the calling thread; no second kernel device. Threads that make no
+        // Vulkan call may run: shader translation on DXVK's pipeline workers (dxvk.translateShadersOnWorkers)
+        // and the shader cache's writer, which both end with the last device.
         // BC250DXVK_MEASURE_WORKER_THREADS=1 is a measurement switch outside the ABI: DXVK's own worker
         // threads then call Vulkan, which breaks E2, to price inline execution against upstream threading.
         bool workerThreads = env::getEnvVar("BC250DXVK_MEASURE_WORKER_THREADS") == "1";
@@ -267,9 +378,17 @@ namespace dxvk::ddi {
           Logger::err("amdgpu_wddm_dxvk: BC250DXVK_MEASURE_WORKER_THREADS=1: DXVK worker threads call Vulkan, "
                       "E2 is broken");
 
-        deviceInfo.hostOptions.inlineExecution    = !workerThreads;
-        deviceInfo.hostOptions.disableKmt         = true;
-        deviceInfo.hostOptions.disableShaderCache = true;
+        const ShaderCachePolicy& cachePolicy = GetShaderCachePolicy();
+
+        if (cachePolicy.enable)
+          Logger::info(str::format("amdgpu_wddm_dxvk: Shader cache in ", cachePolicy.directory));
+        else
+          Logger::info(str::format("amdgpu_wddm_dxvk: No shader cache: ", cachePolicy.reason));
+
+        deviceInfo.hostOptions.inlineExecution      = !workerThreads;
+        deviceInfo.hostOptions.disableKmt           = true;
+        deviceInfo.hostOptions.disableShaderCache   = !cachePolicy.enable;
+        deviceInfo.hostOptions.shaderCacheDirectory = cachePolicy.directory;
 
         if (info->Services->QueueLock) {
           deviceInfo.queueCallback = [

@@ -4,7 +4,7 @@
  * UserModeDriverName DLL) and its DXVK engine ("engine", amdgpu_wddm_dxvk.dll, DXVK fork branch
  * amdgpu-wddm/ddi-engine).
  *
- * Revision r8, ABI 1.4. This file in the DXVK fork is the only copy; the shell includes it from the DXVK
+ * Revision r9, ABI 1.4. This file in the DXVK fork is the only copy; the shell includes it from the DXVK
  * source checkout it builds against, like its other DXVK-facing headers.
  *
  * Versions. A minor version adds and never changes: an engine of minor n serves a shell built for any minor
@@ -27,6 +27,12 @@
  *   1.4  r8: no interface change. GetAdapterInfo reports up to 12_1 (DXVK's own 12_0/12_1 checks: tiled
  *        resources tier 2, typed UAV loads, conservative rasterization, ROVs). A shell that requests at most
  *        11_1 is unaffected; a level above 11_1 needs the WDDM 2.0 D3D11 DDI in the shell.
+ *   1.4  r9: no interface change. E2 now allows engine threads that make no Vulkan call: DXVK's pipeline
+ *        workers translate shaders (DXBC to DXVK's IR), and DXVK's on-disk shader cache is on in processes of an
+ *        ordinary user account, with a writer thread. CreateShader returns before the translation; the shader's
+ *        pipeline library is compiled in a later engine call (SubmitForPresent, the first draw that needs it,
+ *        or a CreateShader where it holds up no presenting thread). Lines those threads log reach Services.Log
+ *        later, inside an engine call. A shell written for r8 needs no change.
  *
  * WDK-free by construction. DXVK's util_gdi.h declares private extern-C D3DKMT prototypes that collide with
  * the WDK's in one translation unit, so nothing here needs d3d10umddi.h or a DXVK header: windows.h, the SDK's
@@ -53,12 +59,17 @@
  *       returned extensions and features on one queue of the returned family.
  *   E2  Threads (ABI 1.0 = inline mode). Every Vulkan call the engine makes happens on the thread that is
  *       inside an engine call (a COM method of an engine object or an IBc250DxvkDevice method). The engine starts
- *       no thread that calls Vulkan: DXVK's CS, submit, finish, pipeline, descriptor, cache, presenter and adapter
- *       threads are not started in this mode. DXVK's fence thread starts only for
- *       ID3D11Fence::SetEventOnCompletion, which the shell does not call (DDI fences are the shell's). The shell
- *       calls the engine only from inside a DDI entry that holds the device's RuntimeDomain scope, so hosted RADV
- *       may use runtime callbacks throughout. The shell does not report D3D11DDICAPS_FREETHREADED; the runtime
- *       then enters one device from one thread at a time.
+ *       no thread that calls Vulkan: DXVK's CS, submit, finish, descriptor, presenter and adapter threads are not
+ *       started in this mode. DXVK's fence thread starts only for ID3D11Fence::SetEventOnCompletion, which the
+ *       shell does not call (DDI fences are the shell's). Since r9 two kinds of engine thread run that make no
+ *       Vulkan call and call no shell service: DXVK's pipeline workers translate shaders (CPU only; the Vulkan
+ *       part of a pipeline library stays on engine calls; dxvk.translateShadersOnWorkers = False turns this
+ *       off), and the on-disk shader cache's writer (file I/O; DXVK_SHADER_CACHE=0 turns the cache off). A
+ *       device's workers end in its final Release, the writer in the final Release of the process's last
+ *       device, so no engine thread runs when no engine device exists. The shell calls the engine only from
+ *       inside a DDI entry that holds the device's RuntimeDomain scope, so hosted RADV may use runtime callbacks
+ *       throughout. The shell does not report D3D11DDICAPS_FREETHREADED; the runtime then enters one device from
+ *       one thread at a time.
  *       A later minor version may add a broker mode; the engine will only use it when the shell asks for it.
  *   E3  Submission. ID3D11DeviceContext::Flush and IBc250DxvkDevice::SubmitForPresent return only after every
  *       command recorded before them was submitted to hosted RADV (vkQueueSubmit returned). Other entries may
@@ -152,7 +163,9 @@ struct BC250_DXVK_SHELL_SERVICES {
      * call that logs, with the engine's log lock held: it must not call the engine. The DXVK logger is per
      * process: while devices with a Log exist, every line goes to the Log of the oldest of them and no log
      * file is written. Lines logged with no such device (QueryDeviceRequirements, GetAdapterInfo) go to the
-     * file in DXVK_LOG_PATH, if set, or nowhere. */
+     * file in DXVK_LOG_PATH, if set, or nowhere. Lines of engine threads (E2) wait for a later engine call
+     * (CreateShader, SubmitForPresent, final Release) and arrive on its thread; past 256 waiting lines the
+     * rest is counted in one warning. */
     void (APIENTRY *Log)(void *shell, UINT32 level, const char *message);
 };
 
@@ -288,7 +301,13 @@ IBc250DxvkDevice : public IUnknown {
 
     /* A shader from a DDI token stream. riid names the stage interface (ID3D11VertexShader, ...,
      * ID3D11GeometryShader for stream output); it must match the version token. The engine builds a DXBC
-     * container with register-derived semantic names; names are consistent across stages and stream output. */
+     * container with register-derived semantic names; names are consistent across stages and stream output.
+     * Since r9 the engine validates the program here and translates it on a worker thread (E2), or loads it
+     * from the shader cache; a program that fails to translate fails at its first draw (TakeDeferredError)
+     * rather than here. On the thread that last called SubmitForPresent, or if that was over a second ago or
+     * never, each call first compiles, for up to dxvk.inlinePipelineBudget microseconds, pipeline libraries
+     * of earlier shaders whose translation has finished (dxvk.compileLibrariesOnCreate = True on any thread,
+     * False never). */
     virtual HRESULT STDMETHODCALLTYPE CreateShader(const BC250_DXVK_SHADER_DESC *desc, REFIID riid,
                                                    void **shader) = 0;
 
@@ -324,9 +343,10 @@ IBc250DxvkDevice : public IUnknown {
 
     /* DXGI PresentDXGI/Present1, before the shell's present ordering and pfnPresentCb: ends the engine frame
      * and submits everything recorded so far (E3). Does not wait for the GPU. After the submission it compiles
-     * optimized pipelines that draws deferred (E2 keeps them off the drawing thread; fast-linked pipelines serve
-     * until then), starting compiles for up to dxvk.inlinePipelineBudget microseconds (default 2000, 0 never
-     * compiles them). */
+     * pipeline libraries of translated shaders (r9), then optimized pipelines that draws deferred (E2 keeps
+     * them off the drawing thread; fast-linked pipelines serve until then), starting compiles for up to
+     * dxvk.inlinePipelineBudget microseconds (default 2000; 0 never compiles optimized pipelines, and leaves
+     * pipeline libraries to the first draw that needs them). */
     virtual HRESULT STDMETHODCALLTYPE SubmitForPresent(ID3D11Resource *source, UINT subresource) = 0;
 
     /* DXGI RotateResourceIdentities: resource i takes the storage of resource i + 1, the last one that of the

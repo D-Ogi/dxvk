@@ -6,6 +6,7 @@
 #include <queue>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "../util/thread.h"
@@ -17,6 +18,17 @@
 namespace dxvk {
 
   /**
+   * \brief Shader cache statistics
+   */
+  struct DxvkShaderCacheStats {
+    uint64_t lookupHits;      ///< Shaders loaded from the cache
+    uint64_t lookupMisses;    ///< Shaders not in the cache
+    uint64_t written;         ///< Shaders written to the cache
+    uint64_t skipped;         ///< Shaders not written: not translated at shutdown, or failed
+  };
+
+
+  /**
    * \brief Shader cache
    *
    * On-disk cache for shaders using the internal IR.
@@ -24,6 +36,10 @@ namespace dxvk {
    * The implementation creates two files that can trivially grow by appending
    * data to them: A binary blob that contains the actual serialized IR as well
    * as shader metadata, and a look-up table
+   *
+   * The writer thread makes no Vulkan call. It translates shaders that
+   * are not translated yet without holding the file lock, which lookups
+   * on application threads take, and skips them when the cache closes.
    */
   class DxvkShaderCache {
 
@@ -42,8 +58,7 @@ namespace dxvk {
     }
 
     void decRef() {
-      if (m_useCount.fetch_sub(1u) == 1u)
-        freeInstance();
+      releaseInstance();
     }
 
     /**
@@ -67,16 +82,37 @@ namespace dxvk {
     void addShader(Rc<DxvkIrShader> shader);
 
     /**
+     * \brief Queries statistics
+     * \returns Statistics of this cache instance
+     */
+    DxvkShaderCacheStats getStats() const;
+
+    /**
+     * \brief Queries the cache files
+     * \returns File paths
+     */
+    const FilePaths& getFilePaths() const {
+      return m_filePaths;
+    }
+
+    /**
      * \brief Determines cache file path based on current environment and executable
+     *
+     * \param [in] directory Cache directory chosen by the host, or empty
+     *    for DXVK_SHADER_CACHE_PATH or the per-user default
      * \returns File paths and file names for cache files
      */
-    static FilePaths getDefaultFilePaths();
+    static FilePaths getDefaultFilePaths(const std::string& directory = std::string());
 
     /**
      * \brief Initializes shader cache
+     *
+     * There is one instance per process while any device uses it.
+     * \param [in] directory See \ref getDefaultFilePaths; ignored if
+     *    the instance exists already
      * \returns Shader cache instance
      */
-    static Rc<DxvkShaderCache> getInstance();
+    static Rc<DxvkShaderCache> getInstance(const std::string& directory = std::string());
 
   private:
 
@@ -131,9 +167,19 @@ namespace dxvk {
     dxvk::condition_variable      m_writeCond;
     std::queue<Rc<DxvkIrShader>>  m_writeQueue;
 
+    // Keys queued for writing: devices of a process share the cache but not their shaders
+    std::unordered_set<LutKey, DxvkHash, DxvkEq> m_queuedKeys;
+
+    std::atomic<bool>             m_stopping = { false };
+
+    std::atomic<uint64_t>         m_lookupHits   = { 0ull };
+    std::atomic<uint64_t>         m_lookupMisses = { 0ull };
+    std::atomic<uint64_t>         m_written      = { 0ull };
+    std::atomic<uint64_t>         m_skipped      = { 0ull };
+
     dxvk::thread                  m_writer;
 
-    DxvkShaderCache();
+    DxvkShaderCache(const std::string& directory);
 
     bool ensureStatus(Status status);
 
@@ -157,7 +203,9 @@ namespace dxvk {
 
     void runWriter();
 
-    void freeInstance();
+    void releaseInstance();
+
+    static bool createDirectories(const std::string& path);
 
     static bool writeShaderXfbInfo(util::File& stream, const dxbc_spv::ir::IoXfbInfo& xfb);
 
