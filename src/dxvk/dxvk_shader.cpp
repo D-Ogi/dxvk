@@ -220,6 +220,8 @@ namespace dxvk {
     if (m_pipeline)
       return *m_pipeline;
 
+    m_manager->m_stats.numOnDemandLibraries += 1;
+
     m_pipeline = compileShaderPipelineLocked();
     return *m_pipeline;
   }
@@ -258,6 +260,16 @@ namespace dxvk {
       // Write back pipeline handle for future use
       m_pipeline = pipeline;
     }
+  }
+
+
+  bool DxvkShaderPipelineLibrary::isReadyToCompile() const {
+    for (uint32_t i = 0u; i < m_shaders.getShaderCount(); i++) {
+      if (!m_shaders.getShader(i)->isCompileDone())
+        return false;
+    }
+
+    return true;
   }
 
 

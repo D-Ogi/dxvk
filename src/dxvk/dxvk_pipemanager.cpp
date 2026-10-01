@@ -2,6 +2,7 @@
 
 #include "dxvk_device.h"
 #include "dxvk_pipemanager.h"
+#include "dxvk_shader_ir.h"
 
 namespace dxvk {
   
@@ -17,10 +18,41 @@ namespace dxvk {
   }
 
 
+  DxvkDeferredCompileStats DxvkPipelineWorkers::getDeferredStats() {
+    std::unique_lock lock(m_lock);
+
+    DxvkDeferredCompileStats result = { };
+    result.translationsQueued = m_translationsQueued;
+    result.librariesQueued    = m_librariesQueued;
+    result.librariesCompiled  = m_librariesCompiled;
+    result.compileErrors      = m_compileErrors.load();
+
+    for (const auto& bucket : m_buckets)
+      result.translationsPending += bucket.queue.size();
+
+    for (const auto& queue : m_readyLibraries)
+      result.librariesReady += queue.size();
+
+    return result;
+  }
+
+
+  bool DxvkPipelineWorkers::translatesOnWorkers() const {
+    return m_device->isInlineExecution()
+        && m_device->config().translateShadersOnWorkers;
+  }
+
+
   void DxvkPipelineWorkers::compilePipelineLibrary(
           DxvkShaderPipelineLibrary*      library,
           DxvkPipelinePriority            priority) {
     if (m_device->isInlineExecution()) {
+      if (translatesOnWorkers()) {
+        std::unique_lock lock(m_lock);
+        queueReadyLibraryLocked(library, priority);
+        return;
+      }
+
       m_tasksTotal += 1;
       library->compilePipeline();
       m_tasksCompleted += 1;
@@ -34,6 +66,34 @@ namespace dxvk {
 
     m_buckets[uint32_t(priority)].queue.emplace(library);
     notifyWorkers(priority);
+  }
+
+
+  void DxvkPipelineWorkers::compileShader(
+    const Rc<DxvkShader>&                 shader,
+          DxvkShaderPipelineLibrary*      library,
+          DxvkPipelinePriority            priority) {
+    std::unique_lock lock(m_lock);
+    this->startWorkers();
+
+    m_tasksTotal += 1;
+    m_translationsQueued += 1u;
+
+    m_buckets[uint32_t(priority)].queue.emplace(shader, library, priority);
+    notifyWorkers(priority);
+  }
+
+
+  void DxvkPipelineWorkers::queueReadyLibraryLocked(
+          DxvkShaderPipelineLibrary*      library,
+          DxvkPipelinePriority            priority) {
+    // Low priority does not occur for libraries; it shares the normal queue
+    uint32_t index = priority == DxvkPipelinePriority::High ? 0u : 1u;
+
+    m_tasksTotal += 1;
+    m_librariesQueued += 1u;
+
+    m_readyLibraries[index].push(library);
   }
 
 
@@ -68,13 +128,58 @@ namespace dxvk {
 
 
   size_t DxvkPipelineWorkers::compileDeferred(
-          std::chrono::microseconds       budget) {
+          std::chrono::microseconds       budget,
+          DxvkDeferredScope               scope) {
     auto t0 = dxvk::high_resolution_clock::now();
+
+    auto budgetLeft = [t0, budget] {
+      return dxvk::high_resolution_clock::now() - t0 < budget;
+    };
 
     std::unique_lock lock(m_lock);
 
+    // Libraries first: a draw that finds its library missing compiles it on
+    // the spot, while a missing optimized pipeline only costs GPU time.
+    for (auto& queue : m_readyLibraries) {
+      // Each entry is looked at once, so a library that went back is not retried
+      size_t count = queue.size();
+
+      while (count-- && budgetLeft()) {
+        DxvkShaderPipelineLibrary* library = queue.front();
+        queue.pop();
+
+        // Queued libraries are translated; never translate on this thread
+        if (!library->isReadyToCompile()) {
+          queue.push(library);
+          continue;
+        }
+
+        lock.unlock();
+
+        try {
+          library->compilePipeline();
+        } catch (const DxvkError& e) {
+          m_compileErrors += 1u;
+          Logger::err(str::format("DxvkPipelineWorkers: Deferred library: ", e.message()));
+        } catch (const std::exception& e) {
+          m_compileErrors += 1u;
+          Logger::err(str::format("DxvkPipelineWorkers: Deferred library: ", e.what()));
+        }
+
+        m_tasksCompleted += 1;
+
+        lock.lock();
+        m_librariesCompiled += 1u;
+      }
+    }
+
+    size_t pending = m_readyLibraries[0].size() + m_readyLibraries[1].size();
+
+    if (scope == DxvkDeferredScope::Libraries)
+      return pending;
+
     while (!m_deferred.empty()) {
-      if (dxvk::high_resolution_clock::now() - t0 >= budget)
+      if (!budgetLeft())
         break;
 
       PipelineEntry entry = m_deferred.front();
@@ -89,7 +194,7 @@ namespace dxvk {
       lock.lock();
     }
 
-    return m_deferred.size();
+    return pending + m_deferred.size();
   }
 
 
@@ -99,6 +204,9 @@ namespace dxvk {
       // Deferred pipelines may already be gone when this runs
       // from the destructor, so drop their entries untouched.
       m_deferred = { };
+
+      for (auto& queue : m_readyLibraries)
+        queue = { };
 
       if (!m_workersRunning)
         return;
@@ -113,6 +221,12 @@ namespace dxvk {
       worker.join();
 
     m_workers.clear();
+
+    // Drop queued translations, and the shader references they hold
+    std::unique_lock lock(m_lock);
+
+    for (auto& bucket : m_buckets)
+      bucket.queue = { };
   }
 
 
@@ -184,6 +298,10 @@ namespace dxvk {
     const uint32_t maxPriorityIndex = uint32_t(maxPriority);
     env::setThreadName(str::format("dxvk-shader-", suffixes.at(maxPriorityIndex)));
 
+    // A log sink may only be called inside an engine call, see Logger
+    Logger::deferThreadLines();
+    DxvkIrShader::setWorkerThread();
+
     while (true) {
       PipelineEntry entry;
 
@@ -213,7 +331,28 @@ namespace dxvk {
           break;
       }
 
-      if (entry.pipelineLibrary) {
+      if (entry.shader) {
+        // Translation only (inline execution): no Vulkan call on this thread
+        bool translated = false;
+
+        try {
+          entry.shader->compile();
+          translated = true;
+        } catch (const DxvkError& e) {
+          m_compileErrors += 1u;
+          Logger::err(str::format("DxvkPipelineWorkers: Translation: ", e.message()));
+        } catch (const std::exception& e) {
+          m_compileErrors += 1u;
+          Logger::err(str::format("DxvkPipelineWorkers: Translation: ", e.what()));
+        }
+
+        // A failed translation is left to the first draw that needs it,
+        // which fails the same way and reports it on the device
+        std::unique_lock lock(m_lock);
+
+        if (translated && m_workersRunning)
+          queueReadyLibraryLocked(entry.pipelineLibrary, entry.priority);
+      } else if (entry.pipelineLibrary) {
         entry.pipelineLibrary->compilePipeline();
       } else if (entry.graphicsPipeline) {
         entry.graphicsPipeline->compilePipeline(entry.graphicsState);
@@ -359,7 +498,14 @@ namespace dxvk {
     key.addShader(shader);
 
     auto library = createShaderPipelineLibrary(key);
-    m_workers.compilePipelineLibrary(library, DxvkPipelinePriority::Normal);
+
+    // With inline execution, the library's Vulkan part must stay on this
+    // thread, but the translation before it need not: a worker translates,
+    // and the library waits for compileDeferred or the first draw.
+    if (m_workers.translatesOnWorkers() && !shader->isCompileDone())
+      m_workers.compileShader(shader, library, DxvkPipelinePriority::Normal);
+    else
+      m_workers.compilePipelineLibrary(library, DxvkPipelinePriority::Normal);
   }
 
 
@@ -376,7 +522,12 @@ namespace dxvk {
 
     auto library = findPipelineLibrary(key);
 
-    if (library)
+    if (!library)
+      return;
+
+    if (m_workers.translatesOnWorkers() && !shader->isCompileDone())
+      m_workers.compileShader(shader, library, DxvkPipelinePriority::High);
+    else
       m_workers.compilePipelineLibrary(library, DxvkPipelinePriority::High);
   }
 

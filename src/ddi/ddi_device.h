@@ -8,6 +8,7 @@
 // The runtime has validated every argument already; this layer translates, it does not second-guess.
 
 #include <array>
+#include <atomic>
 #include <memory>
 #include <vector>
 
@@ -147,9 +148,22 @@ namespace dxvk::ddi {
     dxvk::mutex                                   m_viewFormatMutex;
     std::vector<std::unique_ptr<ViewFormatList>>  m_viewFormatLists;
 
+    // End of the last SubmitFrame on DXVK's clock, in nanoseconds (0 before the first), and its thread
+    std::atomic<int64_t>        m_lastPresent = { 0 };
+    std::atomic<DWORD>          m_presentThread = { 0u };
+
     HRESULT CheckDeviceStatus() const;
 
     void SubmitFrame();
+
+    // Deferred pipeline work within dxvk.inlinePipelineBudget; nothing if the budget is 0
+    void CompileDeferred(DxvkDeferredScope Scope);
+
+    // Whether CreateShader compiles pipeline libraries (dxvk.compileLibrariesOnCreate)
+    bool CompileLibrariesOnCreate() const;
+
+    // Info line with translation and deferred compile counts, at final release
+    void LogShaderStats();
 
     // Blt and Blt1; the whole source subresource without pSourceRect
     HRESULT BltRegion(

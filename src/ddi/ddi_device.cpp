@@ -95,10 +95,14 @@ namespace dxvk::ddi {
       Logger::err(str::format("amdgpu_wddm_dxvk: final release: ", e.message()));
     }
 
+    LogShaderStats();
+
     m_device  = nullptr;
     m_context = nullptr;
     m_dxvkDevice = nullptr;
 
+    // With the device go its translation workers and, with the last device, the shader cache's writer
+    // (both joined here, E2): no engine thread outlives the last device.
     D3D11DXGIDevice* container = m_container.ref();
     m_container = nullptr;
     leaked = container->Release();
@@ -106,7 +110,8 @@ namespace dxvk::ddi {
     if (leaked)
       Logger::err(str::format("amdgpu_wddm_dxvk: D3D11 device still has ", leaked, " references at final release"));
 
-    // The shell's Log service may go away with its device
+    // Their last lines, while the shell's Log service is still there: it may go away with its device
+    Logger::flushDeferred();
     m_logSink = nullptr;
 
     ReleasePrivate();
@@ -144,6 +149,15 @@ namespace dxvk::ddi {
       return E_INVALIDARG;
 
     *ppShader = nullptr;
+
+    // Lines of the translation workers; and, unless a frame would wait for it (CompileLibrariesOnCreate),
+    // the pipeline libraries of shaders they translated since the last call, compiled while the application
+    // creates shaders rather than at its first draw with them (DxvkPipelineWorkers::compileDeferred). The
+    // new shader's translation goes to a worker.
+    Logger::flushDeferred();
+
+    if (CompileLibrariesOnCreate())
+      CompileDeferred(DxvkDeferredScope::Libraries);
 
     uint32_t programType = GetProgramType(pDesc->Code);
 
@@ -962,11 +976,63 @@ namespace dxvk::ddi {
     m_context->EndFrameAndFlush();
 
     // Inline execution defers optimized pipelines to here (DxvkPipelineWorkers::compileDeferred): the
-    // frame is already on the GPU, and the drawing thread did not pay for them.
+    // frame is already on the GPU, and the drawing thread did not pay for them. Pipeline libraries of
+    // shaders translated on workers come first; a draw that needs one sooner compiles it itself.
+    CompileDeferred(DxvkDeferredScope::All);
+
+    m_presentThread.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    m_lastPresent.store(dxvk::high_resolution_clock::now().time_since_epoch().count(), std::memory_order_relaxed);
+
+    Logger::flushDeferred();
+  }
+
+
+  void Bc250DxvkDevice::CompileDeferred(DxvkDeferredScope Scope) {
     int32_t budget = m_dxvkDevice->config().inlinePipelineBudget;
 
     if (budget > 0)
-      m_dxvkDevice->compileDeferredPipelines(std::chrono::microseconds(budget));
+      m_dxvkDevice->compileDeferredPipelines(std::chrono::microseconds(budget), Scope);
+  }
+
+
+  bool Bc250DxvkDevice::CompileLibrariesOnCreate() const {
+    switch (m_dxvkDevice->config().compileLibrariesOnCreate) {
+      case Tristate::True:  return true;
+      case Tristate::False: return false;
+      default:              break;
+    }
+
+    // The runtime lets one thread into the device at a time (no FREETHREADED). On the thread that presents,
+    // a compile here comes out of that thread's own time, before or between its frames, as one at the first
+    // draw would, only sooner. On another thread, a loading thread, it holds the presenting thread up at its
+    // next call, a stall in the middle of a frame for shaders that thread may not draw for a while: then the
+    // libraries wait for SubmitFrame's budget or the draw that needs them. Unless nothing is presented: before
+    // the first frame, or after a second without one (a loading screen that does not present).
+    constexpr int64_t IdleNs = 1'000'000'000;
+
+    int64_t last = m_lastPresent.load(std::memory_order_relaxed);
+
+    return !last
+        || GetCurrentThreadId() == m_presentThread.load(std::memory_order_relaxed)
+        || dxvk::high_resolution_clock::now().time_since_epoch().count() - last > IdleNs;
+  }
+
+
+  void Bc250DxvkDevice::LogShaderStats() {
+    if (Logger::logLevel() > LogLevel::Info)
+      return;
+
+    // Translation counts are the process's, the rest this device's; the cache logs its own at its end
+    DxvkIrTranslationStats translation = DxvkIrShader::getTranslationStats();
+    DxvkDeferredCompileStats deferred = m_dxvkDevice->getDeferredCompileStats();
+
+    Logger::info(str::format("amdgpu_wddm_dxvk: Shader stats:",
+      " translated=", translation.count, " translate_ms=", translation.micros / 1000u,
+      " on_workers=", translation.workerCount, " workers_ms=", translation.workerMicros / 1000u,
+      " queued=", deferred.translationsQueued, " pending=", deferred.translationsPending,
+      " libraries_queued=", deferred.librariesQueued, " libraries_deferred=", deferred.librariesCompiled,
+      " libraries_ready=", deferred.librariesReady, " libraries_on_demand=", deferred.librariesOnDemand,
+      " errors=", deferred.compileErrors));
   }
 
 

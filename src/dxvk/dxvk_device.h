@@ -122,15 +122,25 @@ namespace dxvk {
     }
 
     /**
-     * \brief Compiles deferred optimized pipelines
+     * \brief Compiles deferred pipelines
      *
      * With inline execution, optimized pipelines wait for
-     * this call; see \ref DxvkPipelineWorkers::compileDeferred.
+     * this call, and so do the pipeline libraries of shaders
+     * translated on workers; see \ref DxvkPipelineWorkers::compileDeferred.
      * \param [in] budget Time budget
-     * \returns Number of pipelines still queued
+     * \param [in] scope What to compile
+     * \returns Number of pipelines still queued in scope
      */
-    size_t compileDeferredPipelines(std::chrono::microseconds budget) {
-      return m_objects.pipelineManager().compileDeferredPipelines(budget);
+    size_t compileDeferredPipelines(std::chrono::microseconds budget, DxvkDeferredScope scope) {
+      return m_objects.pipelineManager().compileDeferredPipelines(budget, scope);
+    }
+
+    /**
+     * \brief Queries deferred compile statistics
+     * \returns Statistics of this device
+     */
+    DxvkDeferredCompileStats getDeferredCompileStats() {
+      return m_objects.pipelineManager().getDeferredStats();
     }
 
     /**

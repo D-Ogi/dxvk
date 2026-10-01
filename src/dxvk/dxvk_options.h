@@ -29,6 +29,18 @@ namespace dxvk {
     /// fast-linked pipelines.
     int32_t inlinePipelineBudget = 0;
 
+    /// With inline execution: translate shaders on worker threads, which
+    /// make no Vulkan call, and compile their pipeline libraries later on
+    /// the calling thread. If false, both happen at shader creation.
+    bool translateShadersOnWorkers = true;
+
+    /// With shaders translated on workers: whether shader creation also
+    /// compiles pipeline libraries of translated shaders. Auto: on the
+    /// thread that presents, or while nothing is presented, never where it
+    /// would hold up the presenting thread. Read by the DDI engine; otherwise
+    /// libraries wait for frame submission or the first draw that needs them.
+    Tristate compileLibrariesOnCreate = Tristate::Auto;
+
     /// Enable descriptor heap
     Tristate enableDescriptorHeap = Tristate::Auto;
 

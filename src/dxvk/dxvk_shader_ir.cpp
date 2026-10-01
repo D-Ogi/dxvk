@@ -6,7 +6,19 @@
 
 #include "dxvk_shader_ir.h"
 
+#include "../util/util_time.h"
+
 namespace dxvk {
+
+  namespace {
+    // Set on pipeline worker threads, see DxvkIrShader::setWorkerThread
+    thread_local bool t_workerThread = false;
+  }
+
+  std::atomic<uint64_t> DxvkIrShader::s_convertCount  = { 0ull };
+  std::atomic<uint64_t> DxvkIrShader::s_convertMicros = { 0ull };
+  std::atomic<uint64_t> DxvkIrShader::s_workerCount   = { 0ull };
+  std::atomic<uint64_t> DxvkIrShader::s_workerMicros  = { 0ull };
 
   size_t DxvkIrShaderCreateInfo::hash() const {
     static_assert(std::is_trivially_copyable_v<DxvkShaderOptions>);
@@ -2187,6 +2199,10 @@ namespace dxvk {
     if (m_convertedIr.load())
       return;
 
+    // Translation is deterministic: do not pay for a failure twice
+    if (m_convertFailed.load())
+      throw DxvkError(str::format("Failed to translate shader: ", m_debugName));
+
     if (reason && Logger::logLevel() <= LogLevel::Debug)
       Logger::debug(str::format(m_debugName, ": Early compile: ", reason));
 
@@ -2195,7 +2211,17 @@ namespace dxvk {
     if (!dumpPath.empty())
       dumpSource(dumpPath);
 
-    convertShader();
+    auto t0 = dxvk::high_resolution_clock::now();
+
+    try {
+      convertShader();
+    } catch (...) {
+      countConversion(t0);
+      m_convertFailed.store(true);
+      throw;
+    }
+
+    countConversion(t0);
 
     // Destroy original converter, we no longer need it
     m_baseIr = nullptr;
@@ -2206,6 +2232,35 @@ namespace dxvk {
     // to SPIR-V itself will otherwise call into this method again
     if (!dumpPath.empty())
       dumpSpv(dumpPath);
+  }
+
+
+  void DxvkIrShader::setWorkerThread() {
+    t_workerThread = true;
+  }
+
+
+  DxvkIrTranslationStats DxvkIrShader::getTranslationStats() {
+    DxvkIrTranslationStats result;
+    result.count        = s_convertCount.load();
+    result.micros       = s_convertMicros.load();
+    result.workerCount  = s_workerCount.load();
+    result.workerMicros = s_workerMicros.load();
+    return result;
+  }
+
+
+  void DxvkIrShader::countConversion(high_resolution_clock::time_point t0) {
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+      dxvk::high_resolution_clock::now() - t0).count();
+
+    s_convertCount += 1u;
+    s_convertMicros += uint64_t(us);
+
+    if (t_workerThread) {
+      s_workerCount += 1u;
+      s_workerMicros += uint64_t(us);
+    }
   }
 
 
