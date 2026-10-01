@@ -6,7 +6,12 @@
 #include "../util_env.h"
 
 namespace dxvk {
-  
+
+  namespace {
+    // Set on worker threads whose lines must wait for Logger::flushDeferred
+    thread_local bool t_deferLines = false;
+  }
+
   Logger::Logger(const std::string& fileName)
   : m_minLevel(getMinLogLevel()), m_fileName(fileName) {
 
@@ -67,6 +72,35 @@ namespace dxvk {
   }
 
 
+  void Logger::deferThreadLines() {
+    t_deferLines = true;
+  }
+
+
+  void Logger::flushDeferred() {
+    std::lock_guard<dxvk::mutex> lock(s_instance.m_mutex);
+    auto& logger = s_instance;
+
+    if (logger.m_deferred.empty() && !logger.m_deferredDropped)
+      return;
+
+    if (!logger.m_sinks.empty()) {
+      const LogSink& sink = logger.m_sinks.front();
+
+      for (const auto& e : logger.m_deferred)
+        sink.fn(sink.context, e.level, e.line.c_str());
+
+      if (logger.m_deferredDropped) {
+        std::string line = str::format(logger.m_deferredDropped, " further lines of worker threads dropped");
+        sink.fn(sink.context, LogLevel::Warn, line.c_str());
+      }
+    }
+
+    logger.m_deferred.clear();
+    logger.m_deferredDropped = 0u;
+  }
+
+
   void Logger::emitMsg(LogLevel level, const std::string& message) {
     if (level >= m_minLevel) {
       std::lock_guard<dxvk::mutex> lock(m_mutex);
@@ -77,8 +111,14 @@ namespace dxvk {
         std::stringstream stream(message);
         std::string line;
 
-        while (std::getline(stream, line, '\n'))
-          sink.fn(sink.context, level, line.c_str());
+        while (std::getline(stream, line, '\n')) {
+          if (!t_deferLines)
+            sink.fn(sink.context, level, line.c_str());
+          else if (m_deferred.size() < MaxDeferredLines)
+            m_deferred.push_back({ level, std::move(line) });
+          else
+            m_deferredDropped += 1u;
+        }
 
         return;
       }
