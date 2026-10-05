@@ -1904,10 +1904,6 @@ namespace dxvk {
 
     void trackDrawBuffer();
 
-    bool tryInvalidateDeviceLocalBuffer(
-      const Rc<DxvkBuffer>&           buffer,
-            VkDeviceSize              copySize);
-
     Rc<DxvkImageView> ensureImageViewCompatibility(
       const Rc<DxvkImageView>&        view,
             VkImageUsageFlagBits      usage);
