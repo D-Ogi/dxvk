@@ -16,7 +16,7 @@ namespace dxvk {
     for (auto& s : m_signals) {
       if (s.first == signal) {
         s.second = std::max(s.second, value);
-        break;
+        return;
       }
     }
 
