@@ -4,6 +4,8 @@
 #include "d3d11_fence.h"
 #include "d3d11_texture.h"
 
+#include "../dxvk/hud/dxvk_hud.h"
+
 #include "../util/util_win32_compat.h"
 
 constexpr static uint32_t MinFlushIntervalUs = 750;
@@ -983,6 +985,85 @@ namespace dxvk {
       cFilter     = Filter
     ] (DxvkContext* ctx) {
       ctx->blitImageView(cDstView, cDstOffsets.data(), cSrcView, cSrcOffsets.data(), cFilter);
+    });
+  }
+
+
+  void D3D11ImmediateContext::RenderHud(
+    const Rc<hud::Hud>&                     Hud,
+    const Rc<DxvkImageView>&                DstView) {
+    D3D10DeviceLock lock = LockContext();
+
+    EmitCs([
+      cHud     = Hud,
+      cDstView = DstView
+    ] (DxvkContext* ctx) {
+      cHud->update();
+
+      // Ends the current batch: render passes end, deferred clears of shared images run and their layouts
+      // return to the default one. What the batch left behind is the layout the image is in now.
+      Rc<DxvkCommandList> cmd = ctx->beginExternalRendering();
+
+      Rc<DxvkImage> image = cDstView->image();
+      VkImageSubresourceRange range = cDstView->imageSubresources();
+      VkImageLayout layout = image->queryLayout(range);
+
+      // Diverging layouts, or an image nothing has written yet: no HUD this frame
+      if (layout == VK_IMAGE_LAYOUT_MAX_ENUM || layout == VK_IMAGE_LAYOUT_UNDEFINED
+       || layout == VK_IMAGE_LAYOUT_PREINITIALIZED)
+        return;
+
+      VkImageLayout renderLayout = cDstView->getLayout();
+
+      VkImageMemoryBarrier2 barrier = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+      barrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+      barrier.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+      barrier.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+      barrier.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+      barrier.oldLayout = layout;
+      barrier.newLayout = renderLayout;
+      barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.image = image->handle();
+      barrier.subresourceRange = range;
+
+      VkDependencyInfo depInfo = { VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+      depInfo.imageMemoryBarrierCount = 1;
+      depInfo.pImageMemoryBarriers = &barrier;
+
+      cmd->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &depInfo);
+
+      // The HUD blends over what the application drew
+      VkExtent3D extent = cDstView->mipLevelExtent(0u);
+
+      VkRenderingAttachmentInfo attachmentInfo = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
+      attachmentInfo.imageView = cDstView->handle();
+      attachmentInfo.imageLayout = renderLayout;
+      attachmentInfo.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+      attachmentInfo.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+
+      VkRenderingInfo renderInfo = { VK_STRUCTURE_TYPE_RENDERING_INFO };
+      renderInfo.renderArea.offset = { 0, 0 };
+      renderInfo.renderArea.extent = { extent.width, extent.height };
+      renderInfo.layerCount = 1u;
+      renderInfo.colorAttachmentCount = 1;
+      renderInfo.pColorAttachments = &attachmentInfo;
+
+      cmd->cmdBeginRendering(DxvkCmdBuffer::ExecBuffer, &renderInfo);
+      cHud->render(cmd, cDstView);
+      cmd->cmdEndRendering(DxvkCmdBuffer::ExecBuffer);
+
+      // Back to the layout the context tracks, the writes visible to whatever reads the image next
+      barrier.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+      barrier.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+      barrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+      barrier.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+      barrier.oldLayout = renderLayout;
+      barrier.newLayout = layout;
+
+      cmd->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &depInfo);
+
+      cmd->track(image, DxvkAccess::Write);
     });
   }
 

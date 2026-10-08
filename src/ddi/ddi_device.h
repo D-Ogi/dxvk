@@ -14,6 +14,8 @@
 #include "../d3d11/d3d11_device.h"
 #include "../d3d11/d3d11_context_imm.h"
 
+#include "../dxvk/hud/dxvk_hud.h"
+
 #include "bc250_dxvk_engine.h"
 
 namespace dxvk::ddi {
@@ -144,12 +146,21 @@ namespace dxvk::ddi {
     BC250_DXVK_SHELL_SERVICES   m_services = { };
     std::unique_ptr<ShellLogSink> m_logSink;
 
+    // The HUD of dxvk.hud (DXVK_HUD), drawn into each presented surface; null when no item is enabled
+    Rc<hud::Hud>                m_hud;
+    uint64_t                    m_hudFrames = 0u;
+
     dxvk::mutex                                   m_viewFormatMutex;
     std::vector<std::unique_ptr<ViewFormatList>>  m_viewFormatLists;
 
     HRESULT CheckDeviceStatus() const;
 
     void SubmitFrame();
+
+    // Draws the HUD into the surface the runtime presents next (SubmitForPresent)
+    void RenderHud(
+            ID3D11Resource*                   pSource,
+            UINT                              Subresource);
 
     // Blt and Blt1; the whole source subresource without pSourceRect
     HRESULT BltRegion(

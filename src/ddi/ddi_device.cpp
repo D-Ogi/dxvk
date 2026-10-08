@@ -47,6 +47,18 @@ namespace dxvk::ddi {
     m_device     = static_cast<D3D11Device*>(device.ptr());
     m_context    = m_device->GetContext();
     m_dxvkDevice = m_device->GetDXVKDevice();
+
+    // The HUD a DXVK swap chain would draw (DXVK_HUD, else dxvk.hud). The system DXGI owns the swap chain
+    // here, so SubmitForPresent draws it into the presented surface. The shell sets dxvk.hud through
+    // DXVK_CONFIG for its per-application PerformanceOverlay setting.
+    Rc<hud::Hud> hud = hud::Hud::createHud(m_dxvkDevice);
+
+    if (hud != nullptr && !hud->empty()) {
+      hud->addItem<hud::HudClientApiItem>("api", 1, "D3D11");
+      m_hud = std::move(hud);
+
+      Logger::info(str::format("amdgpu_wddm_dxvk: HUD on (", m_dxvkDevice->config().hud, ")"));
+    }
   }
 
 
@@ -93,6 +105,12 @@ namespace dxvk::ddi {
       m_dxvkDevice->waitForIdle();
     } catch (const DxvkError& e) {
       Logger::err(str::format("amdgpu_wddm_dxvk: final release: ", e.message()));
+    }
+
+    // The HUD holds Vulkan objects of the device: they go while the shell's VkDevice still exists
+    if (m_hud != nullptr) {
+      Logger::info(str::format("amdgpu_wddm_dxvk: HUD drawn into ", m_hudFrames, " presented surfaces"));
+      m_hud = nullptr;
     }
 
     m_device  = nullptr;
@@ -614,8 +632,63 @@ namespace dxvk::ddi {
   HRESULT STDMETHODCALLTYPE Bc250DxvkDevice::SubmitForPresent(
           ID3D11Resource*                   pSource,
           UINT                              Subresource) {
+    if (m_hud != nullptr && pSource)
+      RenderHud(pSource, Subresource);
+
     SubmitFrame();
     return CheckDeviceStatus();
+  }
+
+
+  void Bc250DxvkDevice::RenderHud(
+          ID3D11Resource*                   pSource,
+          UINT                              Subresource) {
+    D3D11_RESOURCE_DIMENSION dimension = D3D11_RESOURCE_DIMENSION_UNKNOWN;
+    pSource->GetType(&dimension);
+
+    if (dimension != D3D11_RESOURCE_DIMENSION_TEXTURE2D)
+      return;
+
+    D3D11CommonTexture* texture = GetCommonTexture(pSource);
+
+    if (!texture || texture->GetMapMode() != D3D11_COMMON_TEXTURE_MAP_MODE_NONE
+     || Subresource >= texture->CountSubresources())
+      return;
+
+    Rc<DxvkImage> image = texture->GetImage();
+
+    // The HUD draws as a color attachment: an image without that usage, multisampled or of a format that
+    // cannot be one presents without it
+    if (!(image->info().usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)
+     || image->info().sampleCount != VK_SAMPLE_COUNT_1_BIT)
+      return;
+
+    DxvkFormatFeatures features = m_dxvkDevice->getFormatFeatures(image->info().format);
+    VkFormatFeatureFlags2 tilingFeatures = image->info().tiling == VK_IMAGE_TILING_OPTIMAL
+      ? features.optimal : features.linear;
+
+    if (!(tilingFeatures & VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BLEND_BIT))
+      return;
+
+    VkImageSubresource subresource = texture->GetSubresourceFromIndex(VK_IMAGE_ASPECT_COLOR_BIT, Subresource);
+
+    DxvkImageViewKey key;
+    key.viewType   = VK_IMAGE_VIEW_TYPE_2D;
+    key.usage      = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    key.format     = image->info().format;
+    key.aspects    = VK_IMAGE_ASPECT_COLOR_BIT;
+    key.mipIndex   = subresource.mipLevel;
+    key.mipCount   = 1u;
+    key.layerIndex = subresource.arrayLayer;
+    key.layerCount = 1u;
+
+    m_context->RenderHud(m_hud, image->createView(key));
+
+    if (!m_hudFrames++) {
+      VkExtent3D extent = image->mipLevelExtent(subresource.mipLevel);
+      Logger::info(str::format("amdgpu_wddm_dxvk: HUD drawn into the first presented surface ",
+        extent.width, "x", extent.height, " format ", image->info().format));
+    }
   }
 
 

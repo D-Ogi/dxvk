@@ -9,9 +9,13 @@
 #include "d3d11_video.h"
 
 namespace dxvk {
-  
+
   class D3D11Buffer;
   class D3D11CommonTexture;
+
+  namespace hud {
+    class Hud;
+  }
 
   class D3D11ImmediateContext : public D3D11CommonContext<D3D11ImmediateContext> {
     friend class D3D11CommonContext<D3D11ImmediateContext>;
@@ -165,6 +169,21 @@ namespace dxvk {
       const Rc<DxvkImageView>&          SrcView,
       const VkOffset3D*                 pSrcOffsets,
             VkFilter                    Filter);
+
+    /**
+     * \brief Draws the HUD into an image that is about to be presented
+     *
+     * Used by a user-mode driver engine (amdgpu_wddm_dxvk), which has
+     * no DXVK swap chain: the system DXGI presents the image itself.
+     * Updates the HUD once and draws it over the image content, in
+     * command order. Does nothing if the subresources of the view
+     * are not all in one layout.
+     * \param [in] Hud The HUD
+     * \param [in] DstView Color attachment view of the image
+     */
+    void RenderHud(
+      const Rc<hud::Hud>&               Hud,
+      const Rc<DxvkImageView>&          DstView);
 
   private:
 

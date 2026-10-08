@@ -326,7 +326,9 @@ IBc250DxvkDevice : public IUnknown {
      * and submits everything recorded so far (E3). Does not wait for the GPU. After the submission it compiles
      * optimized pipelines that draws deferred (E2 keeps them off the drawing thread; fast-linked pipelines serve
      * until then), starting compiles for up to dxvk.inlinePipelineBudget microseconds (default 2000, 0 never
-     * compiles them). */
+     * compiles them). When DXVK_HUD or dxvk.hud enables HUD items, it first draws the HUD over subresource of
+     * source, a 2D color attachment texture; any other source presents without it. The source and subresource
+     * are otherwise not used. */
     virtual HRESULT STDMETHODCALLTYPE SubmitForPresent(ID3D11Resource *source, UINT subresource) = 0;
 
     /* DXGI RotateResourceIdentities: resource i takes the storage of resource i + 1, the last one that of the
