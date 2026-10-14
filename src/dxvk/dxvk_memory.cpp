@@ -819,10 +819,14 @@ namespace dxvk {
 
     // bc250: test switch outside the engine ABI. With BC250DXVK_TEST_OOM=1 at device creation, plain
     // allocations fail as out of memory while BC250DXVK_TEST_OOM_NOW=1 is set in the process.
+    // BD-167: fault injection is a lab tool. The release flavour has no lookup of either switch, and
+    // m_injectOutOfMemory keeps its initial false.
+#ifdef AMDGPU_WDDM_LAB_FLAVOUR
     m_injectOutOfMemory = env::getEnvVar("BC250DXVK_TEST_OOM") == "1";
 
     if (m_injectOutOfMemory)
       Logger::warn("amdgpu_wddm_dxvk: BC250DXVK_TEST_OOM=1: out-of-memory injection armed");
+#endif
 
     if (device->features().core.features.sparseBinding)
       m_sparseMemoryTypes = determineSparseMemoryTypes(device);
@@ -2799,7 +2803,11 @@ namespace dxvk {
 
 
   bool DxvkMemoryAllocator::isOutOfMemoryInjected() const {
+#ifdef AMDGPU_WDDM_LAB_FLAVOUR
     return env::getEnvVar("BC250DXVK_TEST_OOM_NOW") == "1";
+#else
+    return false;
+#endif
   }
 
 

@@ -1312,8 +1312,14 @@ int main(int argc, char** argv) {
   std::set<DWORD> threadsBefore = ProcessThreads();
 
   // Arms the engine's out-of-memory injection (test switch outside the ABI) for the ABI 1.4 cases. It costs an
-  // environment lookup per allocation, so benchmark runs leave it off.
-  const bool injectOutOfMemory = !bench && !benchTiling;
+  // environment lookup per allocation, so benchmark runs leave it off. A release-flavour engine has no
+  // injection (BD-167), so the release build of this test skips those cases.
+#ifdef AMDGPU_WDDM_LAB_FLAVOUR
+  const bool releaseEngine = false;
+#else
+  const bool releaseEngine = true;
+#endif
+  const bool injectOutOfMemory = !bench && !benchTiling && !releaseEngine;
 
   if (injectOutOfMemory)
     SetEnvironmentVariableA("BC250DXVK_TEST_OOM", "1");
@@ -1461,7 +1467,8 @@ int main(int argc, char** argv) {
       std::vector<uint8_t> upload(1u << 20, 0x5au);
 
       if (!injectOutOfMemory) {
-        std::printf("SKIP  injected out of memory (benchmark run)\n");
+        std::printf("SKIP  injected out of memory (%s)\n",
+          releaseEngine ? "release flavour: the engine has no injection" : "benchmark run");
       } else if (dyn && def) {
         SetEnvironmentVariableA("BC250DXVK_TEST_OOM_NOW", "1");
 

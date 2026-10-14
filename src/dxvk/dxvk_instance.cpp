@@ -165,18 +165,19 @@ namespace dxvk {
     if (m_extensionInfo.khrSurfaceMaintenance1.specVersion)
       m_extensionInfo.extSurfaceMaintenance1.specVersion = 0u;
 
+#ifdef AMDGPU_WDDM_LAB_FLAVOUR
     // Hide debug mode behind an environment variable since it adds
     // significant overhead, and some games will not work with it enabled.
     std::string debugEnv = env::getEnvVar("DXVK_DEBUG");
 
-#ifdef AMDGPU_WDDM_LAB_FLAVOUR
     bool capture = debugEnv.empty() && (
       env::getEnvVar("ENABLE_VULKAN_RENDERDOC_CAPTURE") == "1" ||
       env::getEnvVar("MESA_VK_TRACE") != "");
 #else
-    // BD-167: the release flavour of the driver writes no driver trace, so only RenderDoc asks for labels.
-    bool capture = debugEnv.empty() &&
-      env::getEnvVar("ENABLE_VULKAN_RENDERDOC_CAPTURE") == "1";
+    // BD-167: the release flavour has no debug mode switch (validation layer, markers, hang tracking) and
+    // writes no driver trace, so only RenderDoc asks for labels.
+    std::string debugEnv;
+    bool capture = env::getEnvVar("ENABLE_VULKAN_RENDERDOC_CAPTURE") == "1";
 #endif
 
     if (debugEnv == "validation")

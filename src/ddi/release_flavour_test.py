@@ -5,8 +5,9 @@
 The release flavour is the default build. Only a named lab build passes -Damdgpu-wddm-lab-flavour=true, which
 defines AMDGPU_WDDM_LAB_FLAVOUR=1 for every C and C++ unit, so a build that forgets the switch is the release
 flavour. A release driver must not let an environment variable redirect the shader cache, dump shaders,
-replace dxvk.conf or follow the driver trace switch, and the criterion is that the variable's name is absent
-from the binary: a lookup that is compiled out passes, a lookup that is only ignored at run time does not.
+replace dxvk.conf, follow the driver trace switch, turn on a debug mode or inject faults, and the criterion is
+that the variable's name is absent from the binary: a lookup that is compiled out passes, a lookup that is only
+ignored at run time does not.
 
 The test reads every C and C++ file under src/ (the engine test program excepted, no package ships it), blanks
 the comments, resolves only the conditionals on AMDGPU_WDDM_LAB_FLAVOUR (any other conditional keeps both
@@ -16,7 +17,7 @@ word:
   - lab (the macro defined): every forbidden name is still found, which shows that the scan reaches its
     lookup and that the lab build keeps it;
   - the option exists, is boolean with the value false, and meson.build adds -DAMDGPU_WDDM_LAB_FLAVOUR=1.
-The bc250-win gate tools/quality/release_flavour.py checks the same names in the built DLLs.
+The bc250-win gate tools/quality/flavour_gate.py checks the same names in the built DLLs.
 """
 import argparse
 import os
@@ -29,6 +30,9 @@ FORBIDDEN = (
     'DXVK_CONFIG_FILE',         # reads a configuration file from a path in place of dxvk.conf
     'XDG_CACHE_HOME',           # moves the cache of compiled shader code under another home directory
     'MESA_VK_TRACE',            # the driver trace switch: the release driver has none, so no label mode
+    'DXVK_DEBUG',               # debug modes: the validation layer, command markers, hang tracking
+    'BC250DXVK_TEST_OOM',       # arms the out-of-memory fault injection at device creation
+    'BC250DXVK_TEST_OOM_NOW',   # makes plain allocations fail as out of memory while it is set
 )
 SCAN = ('src',)
 EXTENSIONS = ('.c', '.cc', '.cpp', '.h', '.hpp')
