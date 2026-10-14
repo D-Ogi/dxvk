@@ -1016,6 +1016,14 @@ int main(int argc, char** argv) {
   SetEnvironmentVariableA("DXVK_SHADER_CACHE",nullptr);
   SetEnvironmentVariableA("DXVK_SHADER_CACHE_PATH",nullptr);
 
+  // Positive cache cases require an ordinary interactive process. A restricted test runner is
+  // itself a negative policy case, not a cache implementation failure and not a valid positive run.
+  if(selected!="policy" && !dxvk::ddi::ShaderCacheAccessAllowed()) {
+    std::cerr << "cache positive cases require an admitted process token; policy refusal: "
+      << dxvk::ddi::GetShaderCachePolicy().reason << std::endl;
+    return 2;
+  }
+
   auto shaders = loadShaders(dumps, limit);
 
   if (shaders.size()<2) {
