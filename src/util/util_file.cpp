@@ -1,4 +1,7 @@
+#include <filesystem>
 #include <fstream>
+#include <mutex>
+#include <system_error>
 
 #include "./com/com_include.h"
 
@@ -33,6 +36,8 @@ namespace dxvk::util {
 
         if (flags.test(FileFlag::Truncate))
           mode = CREATE_ALWAYS;
+        else if (flags.test(FileFlag::Create))
+          mode = OPEN_ALWAYS;
       }
 
       if (flags.test(FileFlag::Exclusive))
@@ -87,7 +92,7 @@ namespace dxvk::util {
       if (!GetFileSizeEx(m_file, &size))
         return 0u;
 
-      return size.QuadPart;
+      return size.QuadPart < 0 || uint64_t(size.QuadPart) > SIZE_MAX ? SIZE_MAX : size_t(size.QuadPart);
     }
 
     bool status() const {
@@ -96,6 +101,47 @@ namespace dxvk::util {
 
     bool flush() {
       return FlushFileBuffers(m_file);
+    }
+
+    bool truncate(size_t size) {
+      if (m_file == INVALID_HANDLE_VALUE)
+        return false;
+
+      return seek(size, FILE_BEGIN) && SetEndOfFile(m_file);
+    }
+
+    // The lock covers one byte beyond any possible content, so it never overlaps a read or a write and
+    // the file can grow under it. Windows releases a byte-range lock when the handle closes, so a process
+    // that is killed while it holds the lock does not block the next one.
+    bool lock(bool exclusive) {
+      if (m_file == INVALID_HANDLE_VALUE)
+        return false;
+
+      OVERLAPPED overlapped = { };
+      overlapped.Offset = 0xfffffffful;
+      overlapped.OffsetHigh = 0x7ffffffful;
+
+      const ULONGLONG start = GetTickCount64();
+      const DWORD flags = LOCKFILE_FAIL_IMMEDIATELY | (exclusive ? LOCKFILE_EXCLUSIVE_LOCK : 0u);
+      do {
+        if (LockFileEx(m_file, flags, 0u, 1u, 0u, &overlapped))
+          return true;
+        if (GetLastError() != ERROR_LOCK_VIOLATION)
+          return false;
+        Sleep(1u);
+      } while (GetTickCount64() - start < 250u);
+      return false;
+    }
+
+    void unlock() {
+      if (m_file == INVALID_HANDLE_VALUE)
+        return;
+
+      OVERLAPPED overlapped = { };
+      overlapped.Offset = 0xfffffffful;
+      overlapped.OffsetHigh = 0x7ffffffful;
+
+      UnlockFileEx(m_file, 0u, 1u, 0u, &overlapped);
     }
 
   private:
@@ -154,7 +200,8 @@ namespace dxvk::util {
 
   public:
 
-    StlFile(const std::string& path, FileFlags flags) {
+    StlFile(const std::string& path, FileFlags flags)
+    : m_path(path) {
       std::ios_base::openmode mode = std::ios_base::binary;
 
       if (flags.test(FileFlag::AllowRead))
@@ -165,6 +212,12 @@ namespace dxvk::util {
 
       if (flags.test(FileFlag::Truncate))
         mode |= std::ios_base::trunc;
+
+      // An in|out stream refuses a file that does not exist, so create an empty one first.
+      if (flags.test(FileFlag::Create) && !flags.test(FileFlag::Truncate)
+       && !std::filesystem::exists(std::filesystem::path(path))) {
+        std::ofstream create(path, std::ios_base::binary | std::ios_base::app);
+      }
 
       m_file.open(path, mode);
     }
@@ -229,12 +282,40 @@ namespace dxvk::util {
       return true;
     }
 
+    bool truncate(size_t size) {
+      if (!status())
+        return false;
+
+      m_file.flush();
+
+      std::error_code error;
+      std::filesystem::resize_file(std::filesystem::path(m_path), size, error);
+      return !error;
+    }
+
+    // No cross-process file lock on this platform: the lock holds between the threads of this process
+    // only. The one shipped target of this tree is Windows, where Win32File takes a byte-range lock.
+    bool lock(bool exclusive) {
+      (void)exclusive;
+      s_lock.lock();
+      return true;
+    }
+
+    void unlock() {
+      s_lock.unlock();
+    }
+
   private:
 
     FileFlags     m_flags = { };
+    std::string   m_path;
     std::fstream  m_file;
 
+    static std::mutex s_lock;
+
   };
+
+  std::mutex StlFile::s_lock;
 
   using FileImpl = StlFile;
 #endif
@@ -298,6 +379,19 @@ namespace dxvk::util {
 
   bool File::flush() {
     return m_impl && m_impl->flush();
+  }
+
+  bool File::truncate(size_t size) {
+    return m_impl && m_impl->truncate(size);
+  }
+
+  bool File::lock(bool exclusive) {
+    return m_impl && m_impl->lock(exclusive);
+  }
+
+  void File::unlock() {
+    if (m_impl)
+      m_impl->unlock();
   }
 
   File::operator bool () const {

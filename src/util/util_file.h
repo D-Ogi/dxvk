@@ -19,6 +19,10 @@ namespace dxvk::util {
     AllowWrite      = 1,
     Truncate        = 2,
     Exclusive       = 3,
+    /// Opens the file and creates it when it does not exist, keeping the content of an existing
+    /// one. Needed when the content may only be judged with the file lock held, which needs the
+    /// file open: a Truncate open would discard what another process is using.
+    Create          = 4,
   };
 
   using FileFlags = Flags<FileFlag>;
@@ -44,6 +48,30 @@ namespace dxvk::util {
     virtual bool status() const = 0;
 
     virtual bool flush() = 0;
+
+    /**
+     * \brief Shortens the file to the given size
+     *
+     * Everything beyond \c size is discarded. Used to drop the partial
+     * record that a process killed inside an append leaves behind.
+     * \param [in] size New file size, in bytes
+     * \returns \c true on success
+     */
+    virtual bool truncate(size_t size) = 0;
+
+    /**
+     * \brief Takes the file lock
+     *
+     * Serializes the processes that share this file. On Windows this is a
+     * byte-range lock and it holds across processes; elsewhere it holds
+     * between the threads of this process only. Windows acquisition retries
+     * for at most 250 ms. Nested calls on one file object are not allowed.
+     * \param [in] exclusive \c true for a writer, \c false for a reader
+     * \returns \c true if the lock is held
+     */
+    virtual bool lock(bool exclusive) = 0;
+
+    virtual void unlock() = 0;
 
     force_inline void incRef() {
       m_refCount.fetch_add(1u);
@@ -93,6 +121,12 @@ namespace dxvk::util {
     size_t size();
 
     bool flush();
+
+    bool truncate(size_t size);
+
+    bool lock(bool exclusive);
+
+    void unlock();
 
     explicit operator bool () const;
 

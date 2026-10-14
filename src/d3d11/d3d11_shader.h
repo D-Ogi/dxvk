@@ -308,7 +308,29 @@ namespace dxvk {
       DxvkShaderHash,
       D3D11CommonShader,
       DxvkHash, DxvkEq> m_modules;
-    
+
   };
-  
+
+
+  /**
+   * \brief Builds the shader converter of a DXBC shader
+   *
+   * The converter class itself has no declaration outside its translation unit. This function
+   * reaches it without a device, so that the host gate of the shader cache
+   * (src/ddi/shader_cache_test.cpp) converts its shaders with the shipped converter rather than
+   * with a copy of it that could drift from it.
+   * \param [in] ShaderKey Shader cache key
+   * \param [in] ModuleInfo Shader properties and compile options
+   * \param [in] pShaderBytecode DXBC container
+   * \param [in] BytecodeLength Container size, in bytes
+   * \param [in] LowerIcb Whether to lower the immediate constant buffer to a constant buffer
+   * \returns Shader converter
+   */
+  Rc<DxvkIrShaderConverter> CreateD3D11ShaderConverter(
+    const DxvkShaderHash&         ShaderKey,
+    const DxvkIrShaderCreateInfo& ModuleInfo,
+    const void*                   pShaderBytecode,
+          size_t                  BytecodeLength,
+          bool                    LowerIcb);
+
 }

@@ -17,6 +17,8 @@
 
 namespace dxvk {
 
+  class DxvkShaderCache;
+
   /**
    * \brief IR shader properties
    *
@@ -238,9 +240,21 @@ namespace dxvk {
      */
     std::string debugName();
 
+    /**
+     * \brief Names the cache this shader writes itself to
+     *
+     * The write happens at the end of the conversion, on the thread that performs it, so that the
+     * cache needs no thread of its own (contract E2 of bc250_dxvk_engine.h) and a shader that is
+     * never used is never converted and never written. The reference is dropped after the write.
+     * \param [in] cache Cache to write to, or \c nullptr for none
+     */
+    void setCacheSink(
+      const Rc<DxvkShaderCache>&      cache);
+
   private:
 
     Rc<DxvkIrShaderConverter>     m_baseIr;
+    Rc<DxvkShaderCache>           m_cacheSink;
     std::string                   m_debugName;
 
     DxvkIrShaderCreateInfo        m_info;

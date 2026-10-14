@@ -4,6 +4,7 @@
 
 #include <util/util_log.h>
 
+#include "dxvk_shader_cache.h"
 #include "dxvk_shader_ir.h"
 
 #include "../util/util_time.h"
@@ -2190,6 +2191,23 @@ namespace dxvk {
   }
 
 
+  void DxvkIrShader::setCacheSink(const Rc<DxvkShaderCache>& cache) {
+    { std::lock_guard lock(m_mutex);
+
+      // A shader that is not converted yet writes itself at the end of its conversion.
+      if (!m_convertedIr.load()) {
+        m_cacheSink = cache;
+        return;
+      }
+    }
+
+    // Already converted: it was converted before the caller got here, so write it now. The lock is
+    // released first, because the write reads the shader through its public methods.
+    if (cache)
+      cache->writeShader(*this);
+  }
+
+
   void DxvkIrShader::convertIr(const char* reason) {
     if (m_convertedIr.load())
       return;
@@ -2227,6 +2245,21 @@ namespace dxvk {
     m_baseIr = nullptr;
 
     m_convertedIr.store(true);
+
+    // The cache entry is written here, on the thread that just did the conversion, which is a thread
+    // inside an engine call: the cache needs no thread of its own. This must come after the store
+    // above, because the write reads the serialized IR through getSerializedIr().
+    //
+    // Nothing the cache does may fail the shader. The cache handles its own file errors, and this
+    // catch covers what it cannot, an allocation above all: a shader that converted correctly is
+    // then simply not cached.
+    if (m_cacheSink != nullptr) {
+      try {
+        m_cacheSink->writeShader(*this);
+      } catch (...) { }
+
+      m_cacheSink = nullptr;
+    }
 
     // Need to do this *after* marking the conversion as done since lowering
     // to SPIR-V itself will otherwise call into this method again

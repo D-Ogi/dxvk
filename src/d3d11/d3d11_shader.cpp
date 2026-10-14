@@ -213,7 +213,18 @@ namespace dxvk {
   };
 
 
-  
+  Rc<DxvkIrShaderConverter> CreateD3D11ShaderConverter(
+    const DxvkShaderHash&         ShaderKey,
+    const DxvkIrShaderCreateInfo& ModuleInfo,
+    const void*                   pShaderBytecode,
+          size_t                  BytecodeLength,
+          bool                    LowerIcb) {
+    return new D3D11ShaderConverter(ShaderKey, ModuleInfo,
+      pShaderBytecode, BytecodeLength, LowerIcb);
+  }
+
+
+
   D3D11CommonShader:: D3D11CommonShader() { }
   D3D11CommonShader::~D3D11CommonShader() { }
   

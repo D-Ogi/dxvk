@@ -481,7 +481,26 @@ namespace dxvk {
             VkImageUsageFlags         Usage);
 
     static D3D_FEATURE_LEVEL GetMaxFeatureLevel(const DxvkDevice& Device);
-    
+
+    // The shader cache key of a DXBC shader: a function of its arguments alone, and public so that
+    // the host gate of the shader cache (src/ddi/shader_cache_test.cpp) keys its shaders exactly as
+    // a device does, instead of with a copy of this code that could drift from it.
+    static DxvkShaderHash ComputeShaderKey(
+            VkShaderStageFlagBits   Stage,
+      const void*                   pShaderBytecode,
+            size_t                  BytecodeLength);
+
+    static DxvkShaderHash ComputeShaderKey(
+            VkShaderStageFlagBits   Stage,
+      const void*                   pShaderBytecode,
+            size_t                  BytecodeLength,
+      const D3D11_SO_DECLARATION_ENTRY* pSODeclaration,
+            UINT                    NumEntries,
+      const UINT*                   pBufferStrides,
+            UINT                    NumStrides,
+            UINT                    RasterizedStream);
+
+
     DxvkBarrierControlFlags GetOptionsBarrierControlFlags() {
       DxvkBarrierControlFlags barrierControl = 0u;
 
@@ -532,21 +551,6 @@ namespace dxvk {
       const void*                   pShaderBytecode,
             size_t                  BytecodeLength,
       const DxvkIrShaderCreateInfo& ModuleInfo);
-
-    DxvkShaderHash ComputeShaderKey(
-            VkShaderStageFlagBits   Stage,
-      const void*                   pShaderBytecode,
-            size_t                  BytecodeLength);
-
-    DxvkShaderHash ComputeShaderKey(
-            VkShaderStageFlagBits   Stage,
-      const void*                   pShaderBytecode,
-            size_t                  BytecodeLength,
-      const D3D11_SO_DECLARATION_ENTRY* pSODeclaration,
-            UINT                    NumEntries,
-      const UINT*                   pBufferStrides,
-            UINT                    NumStrides,
-            UINT                    RasterizedStream);
 
     HRESULT GetFormatSupportFlags(
             DXGI_FORMAT             Format,
