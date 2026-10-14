@@ -107,6 +107,10 @@ if platform == 'windows'
   lib_d3d11   = cpp.find_library('d3d11')
   lib_dxgi    = cpp.find_library('dxgi')
   lib_gdi32   = cpp.find_library('gdi32')
+  lib_advapi32 = cpp.find_library('advapi32')
+  lib_shell32 = cpp.find_library('shell32')
+  lib_ole32 = cpp.find_library('ole32')
+  lib_uuid = cpp.find_library('uuid')
   lib_version = cpp.find_library('version')
 
   if dxvk_is_msvc

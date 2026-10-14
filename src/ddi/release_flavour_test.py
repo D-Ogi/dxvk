@@ -26,6 +26,7 @@ import sys
 
 FORBIDDEN = (
     'DXVK_SHADER_DUMP_PATH',    # writes every shader to a directory
+    'DXVK_SHADER_CACHE',        # disables the persistent shader cache
     'DXVK_SHADER_CACHE_PATH',   # moves the cache of compiled shader code to a directory
     'DXVK_CONFIG_FILE',         # reads a configuration file from a path in place of dxvk.conf
     'XDG_CACHE_HOME',           # moves the cache of compiled shader code under another home directory
@@ -41,6 +42,7 @@ SCAN = ('src',)
 EXTENSIONS = ('.c', '.cc', '.cpp', '.h', '.hpp')
 SKIP = (
     (r'^src/ddi/engine_test', 'the engine host test program; no package ships it'),
+    (r'^src/ddi/shader_cache_test\.cpp$', 'the offline cache host test; no package ships it'),
 )
 MESON_OPTIONS = 'meson_options.txt'
 DEFAULT_ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'))

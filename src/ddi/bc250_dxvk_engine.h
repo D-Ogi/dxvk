@@ -4,7 +4,7 @@
  * UserModeDriverName DLL) and its DXVK engine ("engine", amdgpu_wddm_dxvk.dll, DXVK fork branch
  * amdgpu-wddm/ddi-engine).
  *
- * Revision r8, ABI 1.4. This file in the DXVK fork is the only copy; the shell includes it from the DXVK
+ * Revision r9, ABI 1.4. This file in the DXVK fork is the only copy; the shell includes it from the DXVK
  * source checkout it builds against, like its other DXVK-facing headers.
  *
  * Versions. A minor version adds and never changes: an engine of minor n serves a shell built for any minor
@@ -27,6 +27,8 @@
  *   1.4  r8: no interface change. GetAdapterInfo reports up to 12_1 (DXVK's own 12_0/12_1 checks: tiled
  *        resources tier 2, typed UAV loads, conservative rasterization, ROVs). A shell that requests at most
  *        11_1 is unaffected; a level above 11_1 needs the WDDM 2.0 D3D11 DDI in the shell.
+ *   1.4  r9: no interface change. E2 states the BD-165 CPU-only translation workers and the persistent
+ *        shader cache, which writes inline on the converting thread without a separate cache writer.
  *
  * WDK-free by construction. DXVK's util_gdi.h declares private extern-C D3DKMT prototypes that collide with
  * the WDK's in one translation unit, so nothing here needs d3d10umddi.h or a DXVK header: windows.h, the SDK's
@@ -53,9 +55,13 @@
  *       returned extensions and features on one queue of the returned family.
  *   E2  Threads (ABI 1.0 = inline mode). Every Vulkan call the engine makes happens on the thread that is
  *       inside an engine call (a COM method of an engine object or an IBc250DxvkDevice method). The engine starts
- *       no thread that calls Vulkan: DXVK's CS, submit, finish, pipeline, descriptor, cache, presenter and adapter
- *       threads are not started in this mode. DXVK's fence thread starts only for
- *       ID3D11Fence::SetEventOnCompletion, which the shell does not call (DDI fences are the shell's). The shell
+ *       no thread that calls Vulkan: DXVK's CS, submit, finish, descriptor, presenter and adapter threads are not
+ *       started in this mode. BD-165 pipeline workers may translate shader IR on the CPU and queue the result;
+ *       creation of Vulkan pipelines stays on the calling thread in RuntimeDomain. A persistent cache writes
+ *       the converted IR on the converting thread, including these CPU workers, with no separate cache writer.
+ *       Cache access requires an ordinary process profile and no thread impersonation; a failed policy or cache
+ *       operation falls back to conversion. Workers are joined before device teardown. DXVK's fence thread starts
+ *       only for ID3D11Fence::SetEventOnCompletion, which the shell does not call (DDI fences are the shell's). The shell
  *       calls the engine only from inside a DDI entry that holds the device's RuntimeDomain scope, so hosted RADV
  *       may use runtime callbacks throughout. The shell does not report D3D11DDICAPS_FREETHREADED; the runtime
  *       then enters one device from one thread at a time.

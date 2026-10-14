@@ -8,6 +8,7 @@
 #include "../dxvk/dxvk_adapter.h"
 
 #include "ddi_device.h"
+#include "shader_cache_policy.h"
 
 namespace dxvk {
   // A system driver lives in every process that opens the adapter: no log file unless DXVK_LOG_PATH names
@@ -258,7 +259,8 @@ namespace dxvk::ddi {
         deviceInfo.extensionNames = const_cast<const char**>(info->Device->ExtensionNames);
         deviceInfo.features       = info->Device->Features;
 
-        // E2, E3: everything on the calling thread; no second kernel device; no cache writer.
+        // E2, E3: Vulkan stays on the calling thread; BD-165 translation workers are CPU-only.
+        // The cache writes on the converting thread and adds no writer thread or second kernel device.
         // BC250DXVK_MEASURE_WORKER_THREADS=1 is a measurement switch outside the ABI: DXVK's own worker
         // threads then call Vulkan, which breaks E2, to price inline execution against upstream threading.
         // BD-167: a measurement is a lab tool. The release flavour has no lookup and always runs inline.
@@ -272,9 +274,17 @@ namespace dxvk::ddi {
         constexpr bool workerThreads = false;
 #endif
 
-        deviceInfo.hostOptions.inlineExecution    = !workerThreads;
-        deviceInfo.hostOptions.disableKmt         = true;
-        deviceInfo.hostOptions.disableShaderCache = true;
+        const ShaderCachePolicy cachePolicy = GetShaderCachePolicy();
+#ifdef AMDGPU_WDDM_LAB_FLAVOUR
+        // No profile or cache path is logged, including in the lab flavour.
+        if (!cachePolicy.enable)
+          Logger::info(str::format("amdgpu_wddm_dxvk: Shader cache unavailable: ", cachePolicy.reason));
+#endif
+        deviceInfo.hostOptions.inlineExecution          = !workerThreads;
+        deviceInfo.hostOptions.disableKmt               = true;
+        deviceInfo.hostOptions.disableShaderCache       = !cachePolicy.enable;
+        deviceInfo.hostOptions.shaderCacheDirectory     = cachePolicy.directory;
+        deviceInfo.hostOptions.shaderCacheAccessAllowed = ShaderCacheAccessAllowed;
 
         if (info->Services->QueueLock) {
           deviceInfo.queueCallback = [

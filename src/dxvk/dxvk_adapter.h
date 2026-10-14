@@ -108,6 +108,10 @@ namespace dxvk {
     bool disableKmt = false;
     /// Do not use the on-disk shader cache.
     bool disableShaderCache = false;
+    /// Authenticated per-user directory selected by the host, or empty for the ordinary DXVK default.
+    std::string shaderCacheDirectory;
+    /// Optional effective-token guard, checked before each cache I/O transaction.
+    bool (*shaderCacheAccessAllowed)() = nullptr;
   };
 
   /**
