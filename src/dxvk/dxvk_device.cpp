@@ -16,7 +16,8 @@ namespace dxvk {
     const DxvkQueueCallback&        queueCallback,
     const DxvkDeviceHostOptions&    hostOptions)
   : m_options           (instance->options()),
-    m_hostOptions       (hostOptions),
+    m_hostOptions       {hostOptions.inlineExecution, hostOptions.disableKmt,
+                         hostOptions.disableShaderCache, { }, hostOptions.shaderCacheAccessAllowed},
     m_instance          (instance),
     m_adapter           (adapter),
     m_vkd               (vkd),
@@ -42,14 +43,18 @@ namespace dxvk {
 
     // Cache writes run on the converting thread, including BD-165 CPU-only translation workers.
     // They start no writer thread and never call Vulkan. A dump still needs conversion rather than a hit.
+    try {
 #ifdef AMDGPU_WDDM_LAB_FLAVOUR
-    const bool cacheEnabled = env::getEnvVar("DXVK_SHADER_CACHE") != "0";
+      const bool cacheEnabled = env::getEnvVar("DXVK_SHADER_CACHE") != "0";
 #else
-    const bool cacheEnabled = true;
+      const bool cacheEnabled = true;
 #endif
-    if (cacheEnabled && DxvkShader::getShaderDumpPath().empty() && !m_hostOptions.disableShaderCache)
-      m_shaderCache = DxvkShaderCache::getInstance(m_hostOptions.shaderCacheDirectory,
-        m_hostOptions.shaderCacheAccessAllowed);
+      if (cacheEnabled && DxvkShader::getShaderDumpPath().empty() && !m_hostOptions.disableShaderCache)
+        m_shaderCache = DxvkShaderCache::getInstance(hostOptions.shaderCacheDirectory,
+          hostOptions.shaderCacheAccessAllowed);
+    } catch (...) {
+      // Cache setup is optional, including allocations for its path and lab settings.
+    }
 
     logBindingModel();
   }

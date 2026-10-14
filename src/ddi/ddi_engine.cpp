@@ -274,16 +274,20 @@ namespace dxvk::ddi {
         constexpr bool workerThreads = false;
 #endif
 
-        const ShaderCachePolicy cachePolicy = GetShaderCachePolicy();
+        ShaderCachePolicy cachePolicy = GetShaderCachePolicy();
 #ifdef AMDGPU_WDDM_LAB_FLAVOUR
         // No profile or cache path is logged, including in the lab flavour.
-        if (!cachePolicy.enable)
-          Logger::info(str::format("amdgpu_wddm_dxvk: Shader cache unavailable: ", cachePolicy.reason));
+        try {
+          if (!cachePolicy.enable)
+            Logger::info(str::format("amdgpu_wddm_dxvk: Shader cache unavailable: ", cachePolicy.reason));
+        } catch (...) {
+          // A diagnostic for an optional cache must not fail device creation.
+        }
 #endif
         deviceInfo.hostOptions.inlineExecution          = !workerThreads;
         deviceInfo.hostOptions.disableKmt               = true;
         deviceInfo.hostOptions.disableShaderCache       = !cachePolicy.enable;
-        deviceInfo.hostOptions.shaderCacheDirectory     = cachePolicy.directory;
+        deviceInfo.hostOptions.shaderCacheDirectory     = std::move(cachePolicy.directory);
         deviceInfo.hostOptions.shaderCacheAccessAllowed = ShaderCacheAccessAllowed;
 
         if (info->Services->QueueLock) {
