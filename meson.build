@@ -179,6 +179,12 @@ dxbc_spirv_dep = dxbc_spirv.get_variable('dxbc_spv_dep')
 
 dxvk_include_path = include_directories(dxvk_include_dirs)
 
+# amdgpu-wddm (BD-167): the lab flavour keeps the diagnostic variables and statistics. The default build is the
+# release flavour, which leaves them out of the binary.
+if get_option('amdgpu-wddm-lab-flavour')
+  add_project_arguments('-DAMDGPU_WDDM_LAB_FLAVOUR=1', language : ['c', 'cpp'])
+endif
+
 add_project_arguments(cpp.get_supported_arguments(compiler_args), language: 'cpp')
 add_project_arguments(cc.get_supported_arguments(compiler_args), language: 'c')
 add_project_link_arguments(cpp.get_supported_link_arguments(link_args), language: 'cpp')
