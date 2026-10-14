@@ -114,7 +114,11 @@ namespace dxvk {
 
   DxvkShaderCache::Status DxvkShaderCache::tryInitializeLocked() {
     if (m_filePaths.directory.empty() || m_filePaths.binFile.empty() || m_filePaths.lutFile.empty()) {
+#ifdef AMDGPU_WDDM_LAB_FLAVOUR
       Logger::warn("No path found for shader cache, consider setting DXVK_SHADER_CACHE_PATH.");
+#else
+      Logger::warn("No path found for shader cache.");
+#endif
       return Status::CacheDisabled;
     }
 
@@ -609,7 +613,11 @@ namespace dxvk {
 
 
   DxvkShaderCache::FilePaths DxvkShaderCache::getDefaultFilePaths() {
+#ifdef AMDGPU_WDDM_LAB_FLAVOUR
     std::string cachePath = env::getEnvVar("DXVK_SHADER_CACHE_PATH");
+#else
+    std::string cachePath;   // BD-167: the release flavour uses the default cache location only
+#endif
 
     if (cachePath.empty()) {
       #ifdef _WIN32

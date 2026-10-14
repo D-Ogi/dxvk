@@ -71,7 +71,11 @@ namespace dxvk {
 
 
   const std::string& DxvkShader::getShaderDumpPath() {
+#ifdef AMDGPU_WDDM_LAB_FLAVOUR
     static std::string s_path = env::getEnvVar("DXVK_SHADER_DUMP_PATH");
+#else
+    static const std::string s_path;   // BD-167: no shader dump override in the release flavour
+#endif
     return s_path;
   }
 

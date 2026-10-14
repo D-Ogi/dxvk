@@ -56,7 +56,9 @@ namespace dxvk {
     }
 
     // Shader dump path is only available via an environment variable
+#ifdef AMDGPU_WDDM_LAB_FLAVOUR
     this->shaderDumpPath = env::getEnvVar("DXVK_SHADER_DUMP_PATH");
+#endif // BD-167: no shader dump override in the release flavour
   }
   
 }

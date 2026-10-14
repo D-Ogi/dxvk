@@ -1755,7 +1755,11 @@ namespace dxvk {
     Config config;
 
     // Load either $DXVK_CONFIG_FILE or $PWD/dxvk.conf
+#ifdef AMDGPU_WDDM_LAB_FLAVOUR
     std::string filePath = env::getEnvVar("DXVK_CONFIG_FILE");
+#else
+    std::string filePath;   // BD-167: no config file override in the release flavour (dxvk.conf and DXVK_CONFIG stay)
+#endif
     std::string confLine = env::getEnvVar("DXVK_CONFIG");
 
     if (filePath == "")
