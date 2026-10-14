@@ -43,15 +43,8 @@ namespace dxvk::util {
       if (flags.test(FileFlag::Exclusive))
         share = 0u;
 
-      std::array<WCHAR, MAX_PATH + 1u> pathCvt;
-
-      size_t len = str::transcodeString(
-        pathCvt.data(), pathCvt.size(),
-        path.data(), path.size());
-
-      pathCvt[len] = '\0';
-
-      m_file = CreateFileW(pathCvt.data(),
+      const auto pathCvt = str::tows(path.c_str());
+      m_file = CreateFileW(pathCvt.c_str(),
         access, share, nullptr, mode, FILE_ATTRIBUTE_NORMAL, nullptr);
 
       if (!m_file)

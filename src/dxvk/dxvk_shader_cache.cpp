@@ -431,7 +431,8 @@ namespace dxvk {
     // Read push data blocks
     uint32_t pushDataMask = 0u;
 
-    if (!read(stream, offset, pushDataMask) || (pushDataMask & ~0x3fu))
+    if (!read(stream, offset, pushDataMask)
+     || (pushDataMask & ~((1u << DxvkPushDataBlock::MaxBlockCount) - 1u)))
       return false;
 
     for (uint32_t i = 0u; i < bit::popcnt(pushDataMask); i++) {
@@ -607,7 +608,7 @@ namespace dxvk {
   // the dxbc-spirv converter under subprojects, the compiler and its options. A version string
   // covers none of that reliably, and a constant that an engineer must raise by hand is forgotten.
   // The linker gives every link a new CodeView signature, so that signature answers the question
-  // exactly and by itself. A module without a CodeView build ID disables the cache. A module that cannot be found at all yields an empty string, which disables the cache.
+  // exactly and by itself. A module without a CodeView build ID disables the cache.
   std::string DxvkShaderCache::moduleBuildId() {
 #ifdef _WIN32
     HMODULE module = nullptr;
@@ -822,17 +823,9 @@ namespace dxvk {
     if (exePath.empty())
       return FilePaths();
 
-    size_t pathStart = exePath.find_last_of(env::PlatformDirSlash);
-
-    if (pathStart != std::string::npos)
-      pathStart = exePath.find_last_of(env::PlatformDirSlash, pathStart);
-
-    if (pathStart == std::string::npos)
-      pathStart = 0u;
-
     uint64_t hash = bit::fnv1a_init();
 
-    for (size_t i = pathStart; i < exePath.size(); i++)
+    for (size_t i = 0; i < exePath.size(); i++)
       hash = bit::fnv1a_iter(hash, uint8_t(exePath[i]));
 
     // The identity goes into the name as well as into the header: two driver builds then use two
