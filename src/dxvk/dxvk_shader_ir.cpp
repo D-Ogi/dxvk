@@ -2247,7 +2247,7 @@ namespace dxvk {
     m_convertedIr.store(true);
 
     // The cache entry is written here, on the thread that just did the conversion, which is a thread
-    // inside an engine call: the cache needs no thread of its own. This must come after the store
+    // used for CPU translation: the cache needs no thread of its own. This must come after the store
     // above, because the write reads the serialized IR through getSerializedIr().
     //
     // Nothing the cache does may fail the shader. The cache handles its own file errors, and this
