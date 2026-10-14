@@ -436,11 +436,27 @@ namespace dxvk {
      || (pushDataMask & ~((1u << DxvkPushDataBlock::MaxBlockCount) - 1u)))
       return false;
 
-    for (uint32_t i = 0u; i < bit::popcnt(pushDataMask); i++) {
+    for (auto index : bit::BitMask(pushDataMask)) {
       DxvkPushDataBlock block = { };
 
       if (!read(stream, offset, block) || !block.getStageMask()
        || (block.getStageMask() & ~allowedStages))
+        return false;
+
+      // addPushData merges masks with uint64 shifts by offset / 4. Validate
+      // the serialized block before that operation, rather than trusting a checksum.
+      const uint32_t alignment = block.getAlignment();
+      const uint32_t blockOffset = block.getOffset();
+      const uint32_t blockSize = block.getSize();
+      if (DxvkPushDataBlock::computeIndex(block.getStageMask()) != index
+       || alignment < sizeof(uint32_t) || alignment > DxvkLimits::MaxTotalPushDataSize
+       || (alignment & (alignment - 1u)) || (blockOffset % sizeof(uint32_t))
+       || !blockSize || (blockSize % alignment)
+       || blockOffset >= DxvkLimits::MaxTotalPushDataSize
+       || blockSize > DxvkLimits::MaxTotalPushDataSize - blockOffset)
+        return false;
+      const uint32_t dwordCount = blockSize / sizeof(uint32_t);
+      if (dwordCount < 64u && (block.getResourceDwordMask() >> dwordCount))
         return false;
 
       layout.addPushData(block);
@@ -455,7 +471,8 @@ namespace dxvk {
     for (uint32_t i = 0u; i < bindingCount; i++) {
       DxvkShaderDescriptor binding = { };
 
-      if (!read(stream, offset, binding))
+      if (!read(stream, offset, binding) || !binding.getStageMask()
+       || (binding.getStageMask() & ~allowedStages))
         return false;
 
       layout.addBindings(1u, &binding);
@@ -470,7 +487,8 @@ namespace dxvk {
     for (uint32_t i = 0u; i < samplerHeapCount; i++) {
       DxvkShaderBinding binding = { };
 
-      if (!read(stream, offset, binding))
+      if (!read(stream, offset, binding) || !binding.getStageMask()
+       || (binding.getStageMask() & ~allowedStages))
         return false;
 
       layout.addSamplerHeap(binding);
@@ -485,7 +503,8 @@ namespace dxvk {
     for (uint32_t i = 0u; i < specDataCount; i++) {
       DxvkShaderBinding binding = { };
 
-      if (!read(stream, offset, binding))
+      if (!read(stream, offset, binding) || !binding.getStageMask()
+       || (binding.getStageMask() & ~allowedStages))
         return false;
 
       layout.addSpecDataBuffer(binding);
