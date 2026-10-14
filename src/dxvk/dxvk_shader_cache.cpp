@@ -23,12 +23,13 @@ namespace dxvk {
 
   DxvkShaderCache::~DxvkShaderCache() {
 #ifdef AMDGPU_WDDM_LAB_FLAVOUR
-    auto stats = getStats();
-
-    if (stats.hits || stats.misses || stats.written || stats.rejected || stats.failed) {
-      Logger::info(str::format("Shader cache: ", stats.hits, " hits, ", stats.misses, " misses, ",
-        stats.written, " written, ", stats.rejected, " rejected, ", stats.failed, " failed writes"));
-    }
+    try {
+      auto stats = getStats();
+      if (stats.hits || stats.misses || stats.written || stats.rejected || stats.failed) {
+        Logger::info(str::format("Shader cache: ", stats.hits, " hits, ", stats.misses, " misses, ",
+          stats.written, " written, ", stats.rejected, " rejected, ", stats.failed, " failed writes"));
+      }
+    } catch (...) { }
 #endif
   }
 
