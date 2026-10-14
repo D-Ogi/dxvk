@@ -33,6 +33,7 @@ FORBIDDEN = (
     'DXVK_DEBUG',               # debug modes: the validation layer, command markers, hang tracking
     'BC250DXVK_TEST_OOM',       # arms the out-of-memory fault injection at device creation
     'BC250DXVK_TEST_OOM_NOW',   # makes plain allocations fail as out of memory while it is set
+    'BC250DXVK_MEASURE_WORKER_THREADS',  # hands Vulkan calls to DXVK's worker threads, a measurement arm
 )
 SCAN = ('src',)
 EXTENSIONS = ('.c', '.cc', '.cpp', '.h', '.hpp')

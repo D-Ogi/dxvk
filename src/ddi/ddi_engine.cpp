@@ -261,11 +261,16 @@ namespace dxvk::ddi {
         // E2, E3: everything on the calling thread; no second kernel device; no cache writer.
         // BC250DXVK_MEASURE_WORKER_THREADS=1 is a measurement switch outside the ABI: DXVK's own worker
         // threads then call Vulkan, which breaks E2, to price inline execution against upstream threading.
+        // BD-167: a measurement is a lab tool. The release flavour has no lookup and always runs inline.
+#ifdef AMDGPU_WDDM_LAB_FLAVOUR
         bool workerThreads = env::getEnvVar("BC250DXVK_MEASURE_WORKER_THREADS") == "1";
 
         if (workerThreads)
           Logger::err("amdgpu_wddm_dxvk: BC250DXVK_MEASURE_WORKER_THREADS=1: DXVK worker threads call Vulkan, "
                       "E2 is broken");
+#else
+        constexpr bool workerThreads = false;
+#endif
 
         deviceInfo.hostOptions.inlineExecution    = !workerThreads;
         deviceInfo.hostOptions.disableKmt         = true;

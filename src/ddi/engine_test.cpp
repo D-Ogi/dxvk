@@ -693,8 +693,12 @@ namespace {
     double wallUs = 1e6 * double(t1.QuadPart - t0.QuadPart) / double(freq.QuadPart) / Frames;
     double cpuUs  = 1e3 * (cpu1 - cpu0) / Frames;
 
+#ifdef AMDGPU_WDDM_LAB_FLAVOUR
     char mode[8] = { };
     bool workers = GetEnvironmentVariableA("BC250DXVK_MEASURE_WORKER_THREADS", mode, sizeof(mode)) && mode[0] == '1';
+#else
+    bool workers = false;  // BD-167: a release engine has no measurement switch and always runs inline
+#endif
 
     std::printf("      bench (%s): %u draws per frame, %u frames, latency %u: %.0f us wall, %.0f us process CPU "
       "per frame; %.2f us wall per draw\n", workers ? "DXVK worker threads" : "inline", DrawsPerFrame, Frames,
