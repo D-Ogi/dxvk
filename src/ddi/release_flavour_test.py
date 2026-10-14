@@ -4,9 +4,9 @@
 
 The release flavour is the default build. Only a named lab build passes -Damdgpu-wddm-lab-flavour=true, which
 defines AMDGPU_WDDM_LAB_FLAVOUR=1 for every C and C++ unit, so a build that forgets the switch is the release
-flavour. A release driver must not let an environment variable redirect the shader cache, dump shaders or
-replace dxvk.conf, and the criterion is that the variable's name is absent from the binary: a lookup that is
-compiled out passes, a lookup that is only ignored at run time does not.
+flavour. A release driver must not let an environment variable redirect the shader cache, dump shaders,
+replace dxvk.conf or follow the driver trace switch, and the criterion is that the variable's name is absent
+from the binary: a lookup that is compiled out passes, a lookup that is only ignored at run time does not.
 
 The test reads every C and C++ file under src/ (the engine test program excepted, no package ships it), blanks
 the comments, resolves only the conditionals on AMDGPU_WDDM_LAB_FLAVOUR (any other conditional keeps both
@@ -27,6 +27,8 @@ FORBIDDEN = (
     'DXVK_SHADER_DUMP_PATH',    # writes every shader to a directory
     'DXVK_SHADER_CACHE_PATH',   # moves the cache of compiled shader code to a directory
     'DXVK_CONFIG_FILE',         # reads a configuration file from a path in place of dxvk.conf
+    'XDG_CACHE_HOME',           # moves the cache of compiled shader code under another home directory
+    'MESA_VK_TRACE',            # the driver trace switch: the release driver has none, so no label mode
 )
 SCAN = ('src',)
 EXTENSIONS = ('.c', '.cc', '.cpp', '.h', '.hpp')

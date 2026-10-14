@@ -624,8 +624,10 @@ namespace dxvk {
       cachePath = env::getEnvVar("LOCALAPPDATA");
       #endif
 
+#ifdef AMDGPU_WDDM_LAB_FLAVOUR
       if (cachePath.empty())
         cachePath = env::getEnvVar("XDG_CACHE_HOME");
+#endif
 
       if (cachePath.empty()) {
         cachePath = env::getEnvVar("HOME");
