@@ -143,6 +143,12 @@ namespace {
     return std::string(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
   }
 
+  // The amdgpu-wddm release flavour of the engine reads no DXVK_LOG_PATH and writes no log file (BD-167); the
+  // name is absent from its DLL, which is what the bc250-win flavour gate checks.
+  bool EngineReadsLogPath(const char* dllPath) {
+    return ReadFileText(dllPath).find("DXVK_LOG_PATH") != std::string::npos;
+  }
+
   // ---- Vulkan call census -------------------------------------------------------------------------
 
   // The engine resolves every Vulkan entry point through the vkGetInstanceProcAddr the shell hands it,
@@ -1179,6 +1185,10 @@ int main(int argc, char** argv) {
   }
 
   // ---- engine ----
+  // A log file of an earlier run would hide whether this engine writes one.
+  if (!EngineLogFile().empty())
+    DeleteFileA(EngineLogFile().c_str());
+
   HMODULE engineDll = LoadLibraryA(argv[1]);
 
   if (!engineDll) {
@@ -3013,11 +3023,17 @@ int main(int argc, char** argv) {
   std::string logFile = EngineLogFile();
 
   if (!logFile.empty()) {
-    std::string text = ReadFileText(logFile);
-    Check(text.find("info:") != std::string::npos
-       && text.find("Importing device") == std::string::npos
-       && text.find("90 or 270") == std::string::npos,
-      "the log file holds the device-less lines only");
+    if (EngineReadsLogPath(argv[1])) {
+      std::string text = ReadFileText(logFile);
+      Check(text.find("info:") != std::string::npos
+         && text.find("Importing device") == std::string::npos
+         && text.find("90 or 270") == std::string::npos,
+        "the log file holds the device-less lines only");
+    } else {
+      Check(GetFileAttributesA(logFile.c_str()) == INVALID_FILE_ATTRIBUTES,
+        "a release flavour engine writes no log file, DXVK_LOG_PATH set or not");
+    }
+
     std::ofstream sinkFile(logFile.substr(0u, logFile.find_last_of('/')) + "/engine_sink.log");
 
     for (const auto& line : shell.lines)

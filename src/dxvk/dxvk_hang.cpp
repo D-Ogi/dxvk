@@ -322,6 +322,11 @@ namespace dxvk {
 
 
   void DxvkCheckpointBuffer::dumpDeviceFaultInfo() {
+#ifndef AMDGPU_WDDM_LAB_FLAVOUR
+    // BD-167: the release flavour writes no file next to the game. It has no hang tracking either (no
+    // DXVK_DEBUG), so the device fault features stay off and this is not reached there.
+    Logger::err("Device fault debug info: not written to a file in this build.");
+#else
     auto vk = m_device->vkd();
 
     VkDeviceFaultDebugInfoKHR debugInfo = { VK_STRUCTURE_TYPE_DEVICE_FAULT_DEBUG_INFO_KHR };
@@ -363,6 +368,7 @@ namespace dxvk {
 
     file.append(debugData.size(), debugData.data());
     Logger::err(str::format("Dumped device fault debug info to ", path));
+#endif
   }
 
 

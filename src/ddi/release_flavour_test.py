@@ -5,9 +5,9 @@
 The release flavour is the default build. Only a named lab build passes -Damdgpu-wddm-lab-flavour=true, which
 defines AMDGPU_WDDM_LAB_FLAVOUR=1 for every C and C++ unit, so a build that forgets the switch is the release
 flavour. A release driver must not let an environment variable redirect the shader cache, dump shaders,
-replace dxvk.conf, follow the driver trace switch, turn on a debug mode or inject faults, and the criterion is
-that the variable's name is absent from the binary: a lookup that is compiled out passes, a lookup that is only
-ignored at run time does not.
+replace dxvk.conf, follow the driver trace switch, turn on a debug mode, inject faults, write a log file to a path
+or set the log level, and the criterion is that the variable's name is absent from the binary: a lookup that is
+compiled out passes, a lookup that is only ignored at run time does not.
 
 The test reads every C and C++ file under src/ (the engine test program excepted, no package ships it), blanks
 the comments, resolves only the conditionals on AMDGPU_WDDM_LAB_FLAVOUR (any other conditional keeps both
@@ -34,6 +34,8 @@ FORBIDDEN = (
     'BC250DXVK_TEST_OOM',       # arms the out-of-memory fault injection at device creation
     'BC250DXVK_TEST_OOM_NOW',   # makes plain allocations fail as out of memory while it is set
     'BC250DXVK_MEASURE_WORKER_THREADS',  # hands Vulkan calls to DXVK's worker threads, a measurement arm
+    'DXVK_LOG_PATH',            # writes the log and the device fault dump to any path (lead decision 4)
+    'DXVK_LOG_LEVEL',           # its companion: the log level
 )
 SCAN = ('src',)
 EXTENSIONS = ('.c', '.cc', '.cpp', '.h', '.hpp')

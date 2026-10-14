@@ -52,6 +52,7 @@ namespace dxvk {
      *
      * For a DLL loaded as a system driver into every process: the
      * default file in the working directory would land anywhere.
+     * The amdgpu-wddm release flavour creates no file at all.
      */
     Logger(const std::string& file_name, bool requireLogPath);
 

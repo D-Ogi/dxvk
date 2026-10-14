@@ -156,8 +156,15 @@ namespace dxvk {
   
   
   std::string Logger::getFileName(const std::string& base) {
+#ifndef AMDGPU_WDDM_LAB_FLAVOUR
+    // BD-167: the release flavour writes no log file, to no path. The DLL lives in every process that opens
+    // the adapter, and a file named after the executable lands next to the game; the engine's lines go to
+    // the shell's sink, which writes the game log of the control application's switch.
+    (void)base;
+    return std::string();
+#else
     std::string path = env::getEnvVar("DXVK_LOG_PATH");
-    
+
     if (path == "none" || (path.empty() && m_requireLogPath))
       return std::string();
 
@@ -173,10 +180,12 @@ namespace dxvk {
     std::string exeName = env::getExeBaseName();
     path += exeName + "_" + base;
     return path;
+#endif
   }
 
 
   LogLevel Logger::getMinLogLevel() {
+#ifdef AMDGPU_WDDM_LAB_FLAVOUR
     const std::array<std::pair<const char*, LogLevel>, 6> logLevels = {{
       { "trace", LogLevel::Trace },
       { "debug", LogLevel::Debug },
@@ -192,7 +201,8 @@ namespace dxvk {
       if (logLevelStr == pair.first)
         return pair.second;
     }
-    
+#endif
+    // BD-167: the release flavour has no level switch; it logs at the default level, as with the variable unset.
     return LogLevel::Info;
   }
   

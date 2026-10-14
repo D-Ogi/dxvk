@@ -11,7 +11,7 @@
 
 namespace dxvk {
   // A system driver lives in every process that opens the adapter: no log file unless DXVK_LOG_PATH names
-  // a directory.
+  // a directory, and in the release flavour none at all (Logger::getFileName).
   Logger Logger::s_instance("amdgpu_wddm_dxvk.log", true);
 }
 
