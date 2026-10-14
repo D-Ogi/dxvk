@@ -34,6 +34,7 @@
 #include <random>
 #include <string>
 #include <vector>
+#include <windows.h>
 #include <psapi.h>
 #include <winioctl.h>
 
@@ -396,9 +397,9 @@ namespace {
     uint32_t rejected = 0u;
   };
 
-  Answers readCache(const std::vector<Shader>& shaders) {
+  Answers readCache(const std::vector<Shader>& shaders, Rc<DxvkShaderCache> cache=nullptr) {
     auto info = testCreateInfo();
-    auto cache = reopenCache();
+    if(cache==nullptr) cache = reopenCache();
     Answers answers = { };
 
     for (const auto& shader : shaders) {
@@ -561,9 +562,13 @@ namespace {
       if (arm>=2) put<uint64_t>(damaged,frame+4u,
         bit::fnv1a_hash(damaged.data()+frame+12u,payload));
       if (!patchFile(paths.lut,0,damaged.data(),damaged.size())) return false;
+      const auto key=D3D11Device::ComputeShaderKey(shaders[0].stage,shaders[0].dxbc.data(),shaders[0].dxbc.size());
       const auto before=privateBytes();
-      auto answers=readCache(shaders);
+      auto probe=reopenCache();
+      probe->lookupShader(key.toString(),testCreateInfo());
       const auto after=privateBytes();
+      auto answers=readCache(shaders,probe);
+      probe=nullptr;
       const bool bounded=before && after && (after<=before || after-before<32u*1024u*1024u);
       std::cout << "      framed damage " << arm << ": " << answers.hits << " hits, "
         << answers.rejected << " rejected, bounded=" << bounded << std::endl;
