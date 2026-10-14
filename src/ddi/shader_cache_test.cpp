@@ -353,6 +353,27 @@ namespace {
       std::memcpy(data.data()+offset, &value, sizeof(T));
   }
 
+  template<typename T> void append(std::vector<uint8_t>& data, const T& value) {
+    const auto begin=reinterpret_cast<const uint8_t*>(&value);
+    data.insert(data.end(),begin,begin+sizeof(T));
+  }
+
+  size_t shaderIoSize(const DxvkShaderIo& io) {
+    size_t size=sizeof(uint8_t);
+    for(uint32_t i=0;i<io.getVarCount();i++) {
+      const auto& var=io.getVar(i);
+      size+=sizeof(var.builtIn)+sizeof(var.location)+sizeof(var.componentIndex)+sizeof(var.componentCount)
+        +sizeof(var.isPatchConstant)+sizeof(var.semanticIndex)+sizeof(uint16_t)+var.semanticName.size();
+    }
+    return size;
+  }
+
+  size_t shaderMetadataSize(const DxvkShaderMetadata& meta) {
+    return sizeof(meta.stage)+sizeof(meta.flags)+sizeof(meta.specConstantMask)
+      +shaderIoSize(meta.inputs)+shaderIoSize(meta.outputs)+sizeof(meta.inputTopology)+sizeof(meta.outputTopology)
+      +sizeof(meta.flatShadingInputs)+sizeof(meta.rasterizedStream)+sizeof(meta.patchVertexCount)+sizeof(meta.xfbStrides);
+  }
+
   size_t privateBytes() {
     PROCESS_MEMORY_COUNTERS_EX counters{};
     counters.cb=sizeof(counters);
@@ -584,6 +605,47 @@ namespace {
     const auto metadataAnswers=readCache(shaders);
     passed=metadataAnswers.misses==1u && metadataAnswers.rejected && !metadataAnswers.wrong && passed;
     restore();
+
+    // Preserve real converted IR and metadata, then append a malformed layout. Both checksums
+    // are correct, so these cases reach the structural parser instead of the corruption check.
+    const auto& first=shaders[0];
+    const auto firstKey=D3D11Device::ComputeShaderKey(first.stage,first.dxbc.data(),first.dxbc.size());
+    auto converter=CreateD3D11ShaderConverter(firstKey,testCreateInfo(),first.dxbc.data(),first.dxbc.size(),false);
+    Rc<DxvkIrShader> fresh=new DxvkIrShader(testCreateInfo(),converter);
+    fresh->compile();
+    const auto prefixSize=field<uint32_t>(goodLut,entry+8u)+shaderMetadataSize(fresh->getShaderMetadata());
+    const auto baseOffset=field<uint64_t>(goodLut,entry);
+    if(baseOffset>goodBin.size() || prefixSize>goodBin.size()-baseOffset) return false;
+    for(unsigned arm=0;arm<2;arm++) {
+      std::vector<uint8_t> blob(goodBin.begin()+size_t(baseOffset),goodBin.begin()+size_t(baseOffset)+prefixSize);
+      append(blob,VkShaderStageFlags(first.stage));
+      if(arm==0) {
+        append(blob,uint32_t(1u<<DxvkPushDataBlock::computeIndex(first.stage)));
+        append(blob,DxvkPushDataBlock(first.stage,256u,4u,4u,1u));
+        append(blob,uint32_t(0));
+      } else {
+        append(blob,uint32_t(0));
+        append(blob,uint32_t(1));
+        DxvkBindingInfo binding{};
+        binding.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        binding.descriptorCount=1;
+        binding.access=VK_ACCESS_SHADER_READ_BIT;
+        append(blob,DxvkShaderDescriptor(binding,0x80u));
+      }
+      append(blob,uint32_t(0));append(blob,uint32_t(0));
+      auto lut=goodLut;
+      put<uint64_t>(lut,entry,goodBin.size());
+      put<uint32_t>(lut,entry+12u,uint32_t(blob.size()-field<uint32_t>(goodLut,entry+8u)));
+      put<uint64_t>(lut,entry+16u,bit::fnv1a_hash(blob.data(),blob.size()));
+      put<uint64_t>(lut,frame+4u,bit::fnv1a_hash(lut.data()+frame+12u,payload));
+      if(!patchFile(paths.bin,goodBin.size(),blob.data(),blob.size())
+        || !patchFile(paths.lut,0,lut.data(),lut.size())) return false;
+      const auto answers=readCache(shaders);
+      std::cout << "      checksummed layout " << arm << ": " << answers.misses << " misses, "
+        << answers.rejected << " rejected" << std::endl;
+      passed=answers.misses==1u && answers.rejected && !answers.wrong && passed;
+      restore();
+    }
     return passed;
   }
 
