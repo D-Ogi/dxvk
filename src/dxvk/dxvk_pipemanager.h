@@ -32,11 +32,33 @@ namespace dxvk {
     std::atomic<uint32_t> numGraphicsPipelines  = { 0u };
     std::atomic<uint32_t> numGraphicsLibraries  = { 0u };
     std::atomic<uint32_t> numComputePipelines   = { 0u };
+    std::atomic<uint32_t> numOnDemandLibraries  = { 0u };
   };
 
   struct DxvkPipelineWorkerStats {
     uint64_t tasksCompleted;
     uint64_t tasksTotal;
+  };
+
+  /**
+   * \brief Deferred work statistics in inline mode
+   */
+  struct DxvkDeferredCompileStats {
+    uint64_t translationsQueued;    ///< Translations handed to worker threads
+    uint64_t translationsPending;   ///< Of those, not started yet
+    uint64_t librariesQueued;       ///< Libraries queued for \c compileDeferred
+    uint64_t librariesCompiled;     ///< Of those, compiled by \c compileDeferred
+    uint64_t librariesReady;        ///< Of those, still queued
+    uint64_t librariesOnDemand;     ///< Libraries compiled when a draw or dispatch needed them
+    uint64_t compileErrors;         ///< Translations or compiles that threw
+  };
+
+  /**
+   * \brief Scope of a deferred compile slice
+   */
+  enum class DxvkDeferredScope : uint32_t {
+    Libraries = 0,  ///< Shader pipeline libraries only
+    All       = 1,  ///< Libraries, then optimized pipelines
   };
 
   /**
@@ -77,15 +99,50 @@ namespace dxvk {
     }
 
     /**
+     * \brief Queries deferred work statistics
+     * \returns Statistics
+     */
+    DxvkDeferredCompileStats getDeferredStats();
+
+    /**
+     * \brief Checks whether shaders are translated on workers
+     *
+     * With inline execution, unless the configuration says no.
+     * \returns \c true if \ref compileShader may be used
+     */
+    bool translatesOnWorkers() const;
+
+    /**
      * \brief Compiles a pipeline library
      *
      * Asynchronously compiles a basic variant of
      * the pipeline with default compile arguments.
      * Note that pipeline libraries are high priority.
+     *
+     * With inline execution and translation on workers, the
+     * library is queued for \ref compileDeferred instead, once
+     * its shaders are translated; a draw that needs it earlier
+     * compiles it on demand.
      * \param [in] library The pipeline library
      * \param [in] priority Pipeline priority
      */
     void compilePipelineLibrary(
+            DxvkShaderPipelineLibrary*      library,
+            DxvkPipelinePriority            priority);
+
+    /**
+     * \brief Translates a shader on a worker thread
+     *
+     * Inline execution only. The worker runs \c DxvkShader::compile,
+     * which makes no Vulkan call, and then queues the library for
+     * \ref compileDeferred. Whoever needs the shader first translates
+     * it, or waits for the translation that is running.
+     * \param [in] shader The shader
+     * \param [in] library The shader's own pipeline library
+     * \param [in] priority Priority
+     */
+    void compileShader(
+      const Rc<DxvkShader>&                 shader,
             DxvkShaderPipelineLibrary*      library,
             DxvkPipelinePriority            priority);
 
@@ -101,18 +158,23 @@ namespace dxvk {
             DxvkPipelinePriority            priority);
 
     /**
-     * \brief Compiles deferred optimized pipelines
+     * \brief Compiles deferred pipelines
      *
      * With inline execution, optimized pipelines are not
-     * compiled on the thread that draws. They are queued
-     * until this runs them on the calling thread. Starts
-     * compiles until the budget is used up, so a single
-     * compile may exceed it.
+     * compiled on the thread that draws, and with translation
+     * on workers, shader pipeline libraries are not compiled
+     * on the thread that creates the shader. They are queued
+     * until this runs them on the calling thread: libraries
+     * whose shaders are translated first, then, if the scope
+     * says so, optimized pipelines. Starts compiles until the
+     * budget is used up, so a single compile may exceed it.
      * \param [in] budget Time budget
-     * \returns Number of pipelines still queued
+     * \param [in] scope What to compile
+     * \returns Number of pipelines still queued in scope
      */
     size_t compileDeferred(
-            std::chrono::microseconds       budget);
+            std::chrono::microseconds       budget,
+            DxvkDeferredScope               scope);
 
     /**
      * \brief Stops all worker threads
@@ -134,9 +196,16 @@ namespace dxvk {
       PipelineEntry(DxvkGraphicsPipeline* p, const DxvkGraphicsPipelineStateInfo& s)
       : pipelineLibrary(nullptr), graphicsPipeline(p), graphicsState(s) { }
 
+      PipelineEntry(Rc<DxvkShader> s, DxvkShaderPipelineLibrary* l, DxvkPipelinePriority p)
+      : pipelineLibrary(l), graphicsPipeline(nullptr), shader(std::move(s)), priority(p) { }
+
       DxvkShaderPipelineLibrary*    pipelineLibrary;
       DxvkGraphicsPipeline*         graphicsPipeline;
       DxvkGraphicsPipelineStateInfo graphicsState;
+
+      // Translation only: the worker compiles the shader and queues pipelineLibrary
+      Rc<DxvkShader>                shader;
+      DxvkPipelinePriority          priority = DxvkPipelinePriority::Normal;
     };
 
     struct PipelineBucket {
@@ -154,8 +223,20 @@ namespace dxvk {
     std::array<PipelineBucket, 3>     m_buckets;
     std::queue<PipelineEntry>         m_deferred;
 
+    // Libraries whose shaders are translated, for compileDeferred: high, then normal priority
+    std::array<std::queue<DxvkShaderPipelineLibrary*>, 2> m_readyLibraries;
+
+    uint64_t                          m_translationsQueued = 0ull;
+    uint64_t                          m_librariesQueued    = 0ull;
+    uint64_t                          m_librariesCompiled  = 0ull;
+    std::atomic<uint64_t>             m_compileErrors      = { 0ull };
+
     bool                              m_workersRunning = false;
     std::vector<dxvk::thread>         m_workers;
+
+    void queueReadyLibraryLocked(
+            DxvkShaderPipelineLibrary*      library,
+            DxvkPipelinePriority            priority);
 
     void notifyWorkers(DxvkPipelinePriority priority);
 
@@ -293,14 +374,25 @@ namespace dxvk {
     }
 
     /**
-     * \brief Compiles deferred optimized pipelines
+     * \brief Compiles deferred pipelines
      *
      * See \ref DxvkPipelineWorkers::compileDeferred.
      * \param [in] budget Time budget
-     * \returns Number of pipelines still queued
+     * \param [in] scope What to compile
+     * \returns Number of pipelines still queued in scope
      */
-    size_t compileDeferredPipelines(std::chrono::microseconds budget) {
-      return m_workers.compileDeferred(budget);
+    size_t compileDeferredPipelines(std::chrono::microseconds budget, DxvkDeferredScope scope) {
+      return m_workers.compileDeferred(budget, scope);
+    }
+
+    /**
+     * \brief Queries deferred work statistics
+     * \returns Statistics
+     */
+    DxvkDeferredCompileStats getDeferredStats() {
+      DxvkDeferredCompileStats result = m_workers.getDeferredStats();
+      result.librariesOnDemand = m_stats.numOnDemandLibraries.load();
+      return result;
     }
 
     /**

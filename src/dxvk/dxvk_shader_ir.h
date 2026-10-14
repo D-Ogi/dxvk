@@ -13,6 +13,7 @@
 #include "dxvk_shader.h"
 
 #include "../util/thread.h"
+#include "../util/util_time.h"
 
 namespace dxvk {
 
@@ -111,6 +112,20 @@ namespace dxvk {
 
 
   /**
+   * \brief Translation statistics of the process
+   *
+   * Counts translations to the internal IR, whether they
+   * succeeded or not, and the time they took.
+   */
+  struct DxvkIrTranslationStats {
+    uint64_t count;         ///< Translations
+    uint64_t micros;        ///< Their time
+    uint64_t workerCount;   ///< Of those, on pipeline workers or the cache writer
+    uint64_t workerMicros;  ///< Their time
+  };
+
+
+  /**
    * \brief DXBC-SPIRV IR shader
    */
   class DxvkIrShader : public DxvkShader {
@@ -153,6 +168,39 @@ namespace dxvk {
      * \brief Compiles shader to internal IR
      */
     void compile();
+
+    /**
+     * \brief Checks whether translation to the internal IR has ended
+     *
+     * Never blocks. Also \c true after a translation that threw;
+     * every later call that needs the IR throws without translating.
+     * \returns \c true if a call to \ref compile would not translate
+     */
+    bool isCompileDone() const override {
+      return m_convertedIr.load() || m_convertFailed.load();
+    }
+
+    /**
+     * \brief Checks whether the internal IR is available
+     * \returns \c true if the shader has been translated
+     */
+    bool isConverted() const {
+      return m_convertedIr.load();
+    }
+
+    /**
+     * \brief Marks the calling thread as a background thread
+     *
+     * Pipeline workers and the shader cache's writer. Translations
+     * on such a thread are counted separately.
+     */
+    static void setWorkerThread();
+
+    /**
+     * \brief Queries translation statistics of the process
+     * \returns Statistics
+     */
+    static DxvkIrTranslationStats getTranslationStats();
 
     /**
      * \brief Patches code using given info
@@ -202,12 +250,20 @@ namespace dxvk {
 
     std::vector<uint8_t>          m_ir;
     std::atomic<bool>             m_convertedIr = { false };
+    std::atomic<bool>             m_convertFailed = { false };
 
     DxvkShaderMetadata            m_metadata = { };
+
+    static std::atomic<uint64_t>  s_convertCount;
+    static std::atomic<uint64_t>  s_convertMicros;
+    static std::atomic<uint64_t>  s_workerCount;
+    static std::atomic<uint64_t>  s_workerMicros;
 
     void convertIr(const char* reason);
 
     void convertShader();
+
+    static void countConversion(high_resolution_clock::time_point t0);
 
     void serializeIr(const dxbc_spv::ir::Builder& builder);
 

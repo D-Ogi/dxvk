@@ -312,6 +312,17 @@ namespace dxvk {
     virtual void compile() = 0;
 
     /**
+     * \brief Checks whether compile has finished
+     *
+     * Never blocks. Also \c true after a failed compile; calling
+     * \ref compile again then throws the error again.
+     * \returns \c true if \ref compile would not have to wait
+     */
+    virtual bool isCompileDone() const {
+      return true;
+    }
+
+    /**
      * \brief Retrieves SPIR-V code for the given shader
      *
      * Creates the final shader binary with the given binding
@@ -623,6 +634,16 @@ namespace dxvk {
      * main thread.
      */
     void compilePipeline();
+
+    /**
+     * \brief Checks whether the shaders are translated
+     *
+     * Never blocks. \c false while a pipeline worker still
+     * translates one of the shaders, so that compiling the
+     * library now would wait for it.
+     * \returns \c true if the library can compile without waiting
+     */
+    bool isReadyToCompile() const;
 
   private:
 
