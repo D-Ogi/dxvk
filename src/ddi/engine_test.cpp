@@ -14,9 +14,9 @@
 // the calling thread and the frames (see RunShaderBench).
 // --icd loads that Vulkan driver DLL directly, as the UMD shell loads its bc250radv.dll, instead of going
 // through the Vulkan loader (vulkan-1.dll). Either way the "icd:" lines name every loaded driver and its SHA-256.
-// The engine's shader cache (r9) goes to DXVK_SHADER_CACHE_PATH; if that is not set, the test sets it to
-// shader-cache beside itself and deletes the cache files there first (a cold start), unless --keep-shader-cache
-// asks for a warm one. Run at the default log level: the r9 checks read the engine's info lines.
+// --cache-root <absolute directory> is required. The harness stubs only the loaded engine's
+// LocalAppData service to keep cache files there, and observes its unchanged file I/O. The shipped
+// policy and cache execute in both flavours; cache checks never depend on a log line.
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -31,6 +31,7 @@
 #include <psapi.h>
 #include <d3d11_4.h>
 #include <d3dcompiler.h>
+#include <KnownFolders.h>
 #include <vulkan/vulkan.h>
 
 #include "bc250_dxvk_engine.h"
@@ -44,6 +45,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <filesystem>
 #include <iterator>
 #include <map>
 #include <set>
@@ -79,6 +81,122 @@ namespace {
     std::printf("ok    %s\n", what);
     return true;
   }
+
+  // Process-local OS dependency stub for the unmodified shipped engine. Only its LocalAppData
+  // lookup is redirected; token admission remains production code. File observers delegate every
+  // operation unchanged and count only handles below this test's directory. No registry/profile
+  // mutation, cache override in the driver, or log-dependent test admission is involved.
+  struct CacheProbe {
+    struct Import { ULONG_PTR* slot; ULONG_PTR saved; };
+    std::vector<Import> imports;
+    std::filesystem::path root;
+    static inline CacheProbe* active = nullptr;
+    static inline std::atomic<uint64_t> binReadBytes{0}, writeBytes{0}, folders{0};
+    using FolderFn = HRESULT (WINAPI*)(REFGUID,DWORD,HANDLE,PWSTR*);
+    using ReadFn = BOOL (WINAPI*)(HANDLE,LPVOID,DWORD,LPDWORD,LPOVERLAPPED);
+    using WriteFn = BOOL (WINAPI*)(HANDLE,LPCVOID,DWORD,LPDWORD,LPOVERLAPPED);
+    static inline FolderFn folder = nullptr;
+    static inline ReadFn read = nullptr;
+    static inline WriteFn write = nullptr;
+
+    static HRESULT WINAPI Folder(REFGUID id,DWORD flags,HANDLE token,PWSTR* path) {
+      if (!IsEqualGUID(id,FOLDERID_LocalAppData)) return folder(id,flags,token,path);
+      if (!active || !path || !token || token==INVALID_HANDLE_VALUE) return E_INVALIDARG;
+      const auto value=active->root.wstring();
+      *path=static_cast<PWSTR>(CoTaskMemAlloc((value.size()+1)*sizeof(wchar_t)));
+      if (!*path) return E_OUTOFMEMORY;
+      std::memcpy(*path,value.c_str(),(value.size()+1)*sizeof(wchar_t));
+      ++folders;return S_OK;
+    }
+    static bool IsCache(HANDLE handle,bool binary) {
+      wchar_t name[32768];
+      DWORD size=GetFinalPathNameByHandleW(handle,name,DWORD(std::size(name)),FILE_NAME_NORMALIZED);
+      if (!active || !size || size>=std::size(name)) return false;
+      std::wstring value(name,size);
+      if (value.rfind(L"\\\\?\\",0)==0) value.erase(0,4);
+      auto prefix=active->root.wstring()+L"\\";
+      if (value.size()<prefix.size() || _wcsnicmp(value.c_str(),prefix.c_str(),prefix.size())) return false;
+      const std::wstring suffix=binary ? L".dxvk.bin" : L".dxvk.";
+      return binary ? value.size()>=suffix.size() && value.compare(value.size()-suffix.size(),suffix.size(),suffix)==0
+                    : value.find(suffix)!=std::wstring::npos;
+    }
+    static BOOL WINAPI Read(HANDLE h,LPVOID p,DWORD n,LPDWORD done,LPOVERLAPPED ov) {
+      BOOL result=read(h,p,n,done,ov);DWORD error=GetLastError();
+      if (result && done && IsCache(h,true)) binReadBytes+=*done;
+      SetLastError(error);return result;
+    }
+    static BOOL WINAPI Write(HANDLE h,LPCVOID p,DWORD n,LPDWORD done,LPOVERLAPPED ov) {
+      BOOL result=write(h,p,n,done,ov);DWORD error=GetLastError();
+      if (result && done && IsCache(h,false)) writeBytes+=*done;
+      SetLastError(error);return result;
+    }
+    bool install(HMODULE module,const std::filesystem::path& directory) {
+      root=std::filesystem::absolute(directory).lexically_normal();
+      if (root==root.root_path()) return false;
+      active=this;
+      auto base=reinterpret_cast<BYTE*>(module);
+      auto dos=reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+      auto nt=reinterpret_cast<IMAGE_NT_HEADERS*>(base+dos->e_lfanew);
+      auto desc=reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(base+nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress);
+      for (;desc->Name;++desc) {
+        if (!desc->OriginalFirstThunk) continue;
+        auto names=reinterpret_cast<IMAGE_THUNK_DATA*>(base+desc->OriginalFirstThunk);
+        auto values=reinterpret_cast<IMAGE_THUNK_DATA*>(base+desc->FirstThunk);
+        for (;names->u1.AddressOfData;++names,++values) {
+          if (IMAGE_SNAP_BY_ORDINAL(names->u1.Ordinal)) continue;
+          auto name=reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(base+names->u1.AddressOfData)->Name;
+          ULONG_PTR replacement=0;
+          if (!std::strcmp(reinterpret_cast<char*>(name),"SHGetKnownFolderPath")) {
+            folder=reinterpret_cast<FolderFn>(values->u1.Function);replacement=reinterpret_cast<ULONG_PTR>(&Folder);
+          } else if (!std::strcmp(reinterpret_cast<char*>(name),"ReadFile")) {
+            read=reinterpret_cast<ReadFn>(values->u1.Function);replacement=reinterpret_cast<ULONG_PTR>(&Read);
+          } else if (!std::strcmp(reinterpret_cast<char*>(name),"WriteFile")) {
+            write=reinterpret_cast<WriteFn>(values->u1.Function);replacement=reinterpret_cast<ULONG_PTR>(&Write);
+          }
+          if (!replacement) continue;
+          DWORD old=0,unused=0;
+          if (!VirtualProtect(&values->u1.Function,sizeof(ULONG_PTR),PAGE_READWRITE,&old)) return false;
+          imports.push_back({&values->u1.Function,values->u1.Function});
+          values->u1.Function=replacement;
+          if (!VirtualProtect(&values->u1.Function,sizeof(ULONG_PTR),old,&unused)) return false;
+        }
+      }
+      return folder && read && write && imports.size()==3;
+    }
+    bool restore() {
+      bool good=true;
+      for (auto it=imports.rbegin();it!=imports.rend();++it) {
+        DWORD old=0,unused=0;
+        if (!VirtualProtect(it->slot,sizeof(ULONG_PTR),PAGE_READWRITE,&old)) { good=false;continue; }
+        *it->slot=it->saved;
+        good=VirtualProtect(it->slot,sizeof(ULONG_PTR),old,&unused)!=FALSE && good;
+      }
+      imports.clear();active=nullptr;return good;
+    }
+    ~CacheProbe() { restore(); }
+    static void resetCounts() { binReadBytes=0;writeBytes=0; }
+    std::vector<std::filesystem::path> files(const char* extension) const {
+      std::vector<std::filesystem::path> result;
+      if (!std::filesystem::exists(root)) return result;
+      for (const auto& item:std::filesystem::recursive_directory_iterator(root))
+        if (item.is_regular_file() && item.path().extension()==extension) result.push_back(item.path());
+      return result;
+    }
+    bool damageBins() const {
+      auto bins=files(".bin");
+      if (bins.empty()) return false;
+      for (const auto& path:bins) {
+        auto size=std::filesystem::file_size(path);
+        if (!size || size>384ull*1024*1024) return false;
+        std::fstream f(path,std::ios::binary|std::ios::in|std::ios::out);
+        std::array<char,4096> bad;
+        bad.fill(static_cast<char>(static_cast<unsigned char>(0xa5u)));
+        while(size) { auto n=std::min<uint64_t>(size,bad.size());f.write(bad.data(),std::streamsize(n));size-=n; }
+        if (!f) return false;
+      }
+      return true;
+    }
+  };
 
   // ---- shell services -------------------------------------------------------------------------
 
@@ -1747,6 +1865,7 @@ int main(int argc, char** argv) {
   const char* icdPath = nullptr;
   const char* benchShaders = nullptr;
   std::string benchPattern = "load";
+  std::filesystem::path cacheRoot;
   bool bench = false, benchTiling = false, keepShaderCache = false;
 
   for (int i = 2; i < argc; i++) {
@@ -1754,6 +1873,8 @@ int main(int argc, char** argv) {
       bench = true;
     else if (!std::strcmp(argv[i], "--bench-tiling"))
       benchTiling = true;
+    else if (!std::strcmp(argv[i], "--cache-root") && i+1<argc)
+      cacheRoot=argv[++i];
     else if (!std::strcmp(argv[i], "--keep-shader-cache"))
       keepShaderCache = true;
     else if ((!std::strcmp(argv[i], "--icd") || !std::strcmp(argv[i], "--bench-shaders")
@@ -1775,38 +1896,26 @@ int main(int argc, char** argv) {
     return 2;
   }
 
-  // The engine's shader cache (r9) is per user and per executable. Before the engine reads the variable (once
-  // per process), keep it beside the test unless DXVK_SHADER_CACHE_PATH names a place, and start cold there.
-  {
-    char path[MAX_PATH] = { };
-
-    if (!GetEnvironmentVariableA("DXVK_SHADER_CACHE_PATH", path, MAX_PATH)) {
-      std::string dir(MAX_PATH, '\0');
-      dir.resize(GetModuleFileNameA(nullptr, dir.data(), MAX_PATH));
-      dir = dir.substr(0u, dir.find_last_of("\\/")) + "\\shader-cache";
-      SetEnvironmentVariableA("DXVK_SHADER_CACHE_PATH", dir.c_str());
-
-      uint32_t deleted = 0u;
-
-      for (const char* pattern : { "\\*.dxvk.lut", "\\*.dxvk.bin" }) {
-        WIN32_FIND_DATAA found = { };
-        HANDLE find = keepShaderCache ? INVALID_HANDLE_VALUE : FindFirstFileA((dir + pattern).c_str(), &found);
-
-        if (find == INVALID_HANDLE_VALUE)
-          continue;
-
-        do {
-          deleted += DeleteFileA((dir + "\\" + found.cFileName).c_str()) ? 1u : 0u;
-        } while (FindNextFileA(find, &found));
-
-        FindClose(find);
-      }
-
-      std::printf("shader cache: %s (%s, %u files deleted)\n", dir.c_str(), keepShaderCache ? "kept" : "cold", deleted);
-    } else {
-      std::printf("shader cache: %s (DXVK_SHADER_CACHE_PATH, left as it is)\n", path);
-    }
+  if (cacheRoot.empty() || !cacheRoot.is_absolute() || cacheRoot==cacheRoot.root_path()) {
+    std::printf("FAIL  --cache-root must name an absolute test directory\n");
+    return 2;
   }
+  cacheRoot=cacheRoot.lexically_normal();
+  std::filesystem::create_directories(cacheRoot);
+  const auto cacheFiles=cacheRoot/"amdgpu-wddm"/"dxvk";
+  if (!keepShaderCache && std::filesystem::exists(cacheFiles)) {
+    for (const auto& file:std::filesystem::directory_iterator(cacheFiles))
+      if (file.is_regular_file() && (file.path().extension()==".lut" || file.path().extension()==".bin"))
+        std::filesystem::remove(file.path());
+  }
+#ifdef AMDGPU_WDDM_LAB_FLAVOUR
+  SetEnvironmentVariableA("DXVK_SHADER_CACHE",nullptr);
+  SetEnvironmentVariableA("DXVK_SHADER_CACHE_PATH",nullptr);
+#else
+  // Release must stay enabled at the OS-chosen location even with forbidden override names set.
+  SetEnvironmentVariableA("DXVK_SHADER_CACHE","0");
+  SetEnvironmentVariableA("DXVK_SHADER_CACHE_PATH",(cacheRoot/"forbidden-override").string().c_str());
+#endif
 
   // ---- Vulkan instance and device, owned by the "shell" ----
   Vk vk;
@@ -1915,6 +2024,12 @@ int main(int argc, char** argv) {
 
   if (!engineDll) {
     std::printf("FAIL  LoadLibrary %s: %lu\n", argv[1], GetLastError());
+    return 1;
+  }
+
+  CacheProbe cacheProbe;
+  if (!cacheProbe.install(engineDll,cacheRoot)) {
+    std::printf("FAIL  cache test could not bind exactly the three OS dependency imports\n");
     return 1;
   }
 
@@ -2071,13 +2186,7 @@ int main(int argc, char** argv) {
 
   Check(shell.logLines.load() > 0u, "CreateDevice's own lines (device import) reach the shell's Log");
 
-  // An r9 engine names its shader cache decision at creation. An engine with translation on workers but without
-  // the shader cache (the BD-165 engine) says so only in its stats line at the final release (below).
-  const bool r9 = HasLine(shell.lines, "amdgpu_wddm_dxvk: Shader cache in ")
-               || HasLine(shell.lines, "amdgpu_wddm_dxvk: No shader cache: ");
-  const bool cacheOn = HasLine(shell.lines, "amdgpu_wddm_dxvk: Shader cache in ");
-  std::printf("      engine %s, shader cache %s\n", r9 ? "r9 or later" : "without the r9 shader cache",
-    cacheOn ? "on" : "off");
+  Check(CacheProbe::folders.load()>0,"cache policy queried the process-token LocalAppData service");
 
   Microsoft::WRL::ComPtr<ID3D11Device> d3d;
   Microsoft::WRL::ComPtr<ID3D11DeviceContext> ctx;
@@ -3695,7 +3804,7 @@ int main(int argc, char** argv) {
     engineThreads++;
     engineThreadNames[name]++;
 
-    if (name.rfind("dxvk-shader-", 0u) != 0u && name != "dxvk-cache")
+    if (name.rfind("dxvk-shader-", 0u) != 0u)
       otherEngineThreads++;
   }
 
@@ -3709,7 +3818,7 @@ int main(int argc, char** argv) {
   // An engine without translation on workers starts no thread at all; one with them starts only those (and, r9,
   // the cache writer). The Vulkan call census is the E2 criterion either way.
   std::printf("      %u new threads in amdgpu_wddm_dxvk.dll\n", engineThreads);
-  Check(otherEngineThreads == 0u, "the engine's own threads are shader translation workers and the cache writer");
+  Check(otherEngineThreads == 0u, "the engine's own threads are shader translation workers; no cache writer thread");
 
   // ---- teardown (E4, E5) ----
   rtv.Reset();
@@ -3752,12 +3861,12 @@ int main(int argc, char** argv) {
   // Translation on workers logs its stats line at the final release, with or without the r9 shader cache
   const bool workers = HasLine(shell.lines, "amdgpu_wddm_dxvk: Shader stats:");
 
-  if (r9 || workers) {
+  if (workers) {
     const long long translated = StatValue(shell.lines, "amdgpu_wddm_dxvk: Shader stats:", "translated");
     const long long queued     = StatValue(shell.lines, "amdgpu_wddm_dxvk: Shader stats:", "queued");
     const long long onWorkers  = StatValue(shell.lines, "amdgpu_wddm_dxvk: Shader stats:", "on_workers");
     const long long errors     = StatValue(shell.lines, "amdgpu_wddm_dxvk: Shader stats:", "errors");
-    const long long cacheHits  = cacheOn ? StatValue(shell.lines, "Shader cache closed:", "hits") : 0;
+    const long long cacheHits = StatValue(shell.lines, "Shader cache closed:", "hits");
 
     if (TranslationOnWorkersOff()) {
       Check(queued == 0, "dxvk.translateShadersOnWorkers = False: no translation goes to a worker");
@@ -3769,18 +3878,23 @@ int main(int argc, char** argv) {
 
     Check(errors == 0, "no translation or deferred library compile failed");
 
-    if (cacheOn) {
-      const long long written = StatValue(shell.lines, "Shader cache closed:", "written");
-      const long long hits    = StatValue(shell.lines, "Shader cache closed:", "hits");
-      Check(written > 0 || hits > 0, "the shader cache wrote this run's shaders or found them");
-    }
+
   }
 
   Check(EngineThreadsSince(threadsBefore).empty(), "no thread of amdgpu_wddm_dxvk.dll outlives the final Release");
 
   // A second device of the process finds the first device's shaders in the cache: no translation, same pixels
-  if (r9 && cacheOn) {
-    const long long translatedBefore = StatValue(shell.lines, "amdgpu_wddm_dxvk: Shader stats:", "translated");
+  Check(!cacheProbe.files(".lut").empty() && !cacheProbe.files(".bin").empty(),
+    "cache created: both flavours produce the persistent LUT and binary");
+  Check(CacheProbe::writeBytes.load()>0 || CacheProbe::binReadBytes.load()>0,
+    "cache active: cold writes or warm binary reads observed without log detection");
+#ifndef AMDGPU_WDDM_LAB_FLAVOUR
+  Check(!std::filesystem::exists(cacheRoot/"forbidden-override"),
+    "release ignores the environment cache directory and disable switch");
+#endif
+  for (unsigned cachePass=0;cachePass<2;++cachePass) {
+    if (cachePass) Check(cacheProbe.damageBins(),"cache rejection: corrupt the serialized binary entries");
+    CacheProbe::resetCounts();
 
     Shell warm;
     InitializeCriticalSection(&warm.queueLock);
@@ -3855,12 +3969,11 @@ int main(int argc, char** argv) {
 
     printShaderLines(warm);
 
-    const long long hits = StatValue(warm.lines, "Shader cache closed:", "hits");
-    const long long misses = StatValue(warm.lines, "Shader cache closed:", "misses");
-    const long long translatedAfter = StatValue(warm.lines, "amdgpu_wddm_dxvk: Shader stats:", "translated");
-
-    Check(hits >= 2 && misses == 0, "second device: both shaders come from the shader cache");
-    Check(translatedBefore >= 0 && translatedAfter == translatedBefore, "second device: no shader translated");
+    Check(CacheProbe::binReadBytes.load()>0,"cache readback: the engine read serialized binary entries");
+    if (!cachePass)
+      Check(CacheProbe::writeBytes.load()==0,"warm cache: no cache entry was converted and appended again");
+    else
+      Check(CacheProbe::writeBytes.load()>0,"rejected cache: damaged entries were replaced after correct rendering");
     Check(warm.foreignLogs.load() == 0u && warm.foreignCalls.load() == 0u,
       "second device: every Log and QueueLock call came from the calling thread (E2)");
     Check(EngineThreadsSince(threadsBefore).empty(), "no thread of amdgpu_wddm_dxvk.dll outlives the second device");
@@ -3944,6 +4057,8 @@ int main(int argc, char** argv) {
   funcs.FreeDeviceRequirements(&req);
   vk.destroyInstance(instance, nullptr);
 
+  Check(cacheProbe.restore(),"cache test restored the three imports before unloading the engine");
+  FreeLibrary(engineDll);
   std::printf("%s: %d failure(s)\n", g_failures ? "FAILED" : "PASSED", g_failures);
   return g_failures ? 1 : 0;
 }
