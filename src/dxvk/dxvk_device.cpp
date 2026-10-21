@@ -703,6 +703,14 @@ namespace dxvk {
   }
 
 
+  void DxvkDevice::retireCompletedSubmissions() {
+    if (m_hostOptions.inlineExecution) {
+      while (m_submissionQueue.finishInline(false))
+        continue;
+    }
+  }
+
+
   void DxvkDevice::waitForResource(const DxvkPagedResource& resource, DxvkAccess access) {
     if (resource.isInUse(access)) {
       auto t0 = dxvk::high_resolution_clock::now();

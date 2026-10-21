@@ -817,6 +817,18 @@ namespace dxvk {
     void waitForResource(const DxvkPagedResource& resource, DxvkAccess access);
     
     /**
+     * \brief Retires submissions that the GPU has completed
+     *
+     * With inline execution no finish thread exists, and a
+     * submission is otherwise retired only when the calling
+     * thread submits or waits. A caller that polls for GPU
+     * progress calls this first, so that what it reads, such
+     * as submission fences and resource use, is current.
+     * Does not wait. Does nothing with worker threads.
+     */
+    void retireCompletedSubmissions();
+
+    /**
      * \brief Waits until the device becomes idle
      * 
      * Waits for the GPU to complete the execution of all

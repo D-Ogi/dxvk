@@ -1263,6 +1263,14 @@ namespace dxvk {
     if (DebugLazyBinding == Tristate::True)
       ApplyDirtyNullBindings();
 
+    // A synchronization request comes from a poll that the application may repeat
+    // without submitting anything else (GetData, Map with DO_NOT_WAIT). In inline
+    // mode nothing else retires completed submissions then, and the submission
+    // fence below would keep the GPU busy forever: the heuristic would never flush
+    // the commands the application waits for (BD-214).
+    if (FlushType == GpuFlushType::ImplicitSynchronization)
+      m_device->retireCompletedSubmissions();
+
     uint64_t chunkId = GetCurrentSequenceNumber();
     uint64_t submissionId = m_submissionFence->value();
 
