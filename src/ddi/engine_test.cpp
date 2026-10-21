@@ -48,6 +48,7 @@
 #include <filesystem>
 #include <iterator>
 #include <map>
+#include <mutex>
 #include <set>
 #include <string>
 #include <thread>
@@ -474,12 +475,73 @@ namespace {
     return vr;
   }
 
+  // BD-214: a GPU that is behind while the engine looks. While the hold is on, the engine reads no timeline
+  // semaphore value above the one it read last before the hold, so the GPU work it submits then looks unfinished
+  // to it; the true values come back with the end of the hold. The engine's queue reads these values to retire
+  // submissions without waiting (finishInline); its waits stay real.
+  struct CounterHold {
+    std::mutex                      mutex;
+    bool                            on = false;
+    std::map<VkSemaphore, uint64_t> seen;
+    std::map<VkSemaphore, uint64_t> held;
+  };
+
+  CounterHold g_counterHold;
+  PFN_vkGetSemaphoreCounterValue g_hookedGetSemaphoreCounterValue = nullptr;
+  PFN_vkGetSemaphoreCounterValue g_hookedGetSemaphoreCounterValueKHR = nullptr;
+
+  void HoldCounters(bool on) {
+    std::lock_guard lock(g_counterHold.mutex);
+
+    if (on)
+      g_counterHold.held = g_counterHold.seen;
+
+    g_counterHold.on = on;
+  }
+
+  VkResult HeldCounterValue(PFN_vkGetSemaphoreCounterValue fn, VkDevice device, VkSemaphore semaphore, uint64_t* value) {
+    VkResult vr = fn(device, semaphore, value);
+
+    if (vr != VK_SUCCESS)
+      return vr;
+
+    std::lock_guard lock(g_counterHold.mutex);
+
+    if (g_counterHold.on) {
+      auto entry = g_counterHold.held.find(semaphore);
+      *value = std::min(*value, entry != g_counterHold.held.end() ? entry->second : 0u);
+    } else {
+      g_counterHold.seen[semaphore] = *value;
+    }
+
+    return vr;
+  }
+
+  VkResult VKAPI_CALL HeldGetSemaphoreCounterValue(VkDevice device, VkSemaphore semaphore, uint64_t* value) {
+    return HeldCounterValue(g_hookedGetSemaphoreCounterValue, device, semaphore, value);
+  }
+
+  VkResult VKAPI_CALL HeldGetSemaphoreCounterValueKHR(VkDevice device, VkSemaphore semaphore, uint64_t* value) {
+    return HeldCounterValue(g_hookedGetSemaphoreCounterValueKHR, device, semaphore, value);
+  }
+
   PFN_vkVoidFunction HookVkClassified(const char* name, PFN_vkVoidFunction fn) {
     fn = HookVk(name, fn);
 
     if (fn && name && !std::strcmp(name, "vkCreateGraphicsPipelines")) {
       g_hookedCreateGraphicsPipelines = reinterpret_cast<PFN_vkCreateGraphicsPipelines>(fn);
       return reinterpret_cast<PFN_vkVoidFunction>(&ClassifyGraphicsPipelines);
+    }
+
+    // The census hook stays in the chain: the held value goes through it, so E2 still counts these calls
+    if (fn && name && !std::strcmp(name, "vkGetSemaphoreCounterValue")) {
+      g_hookedGetSemaphoreCounterValue = reinterpret_cast<PFN_vkGetSemaphoreCounterValue>(fn);
+      return reinterpret_cast<PFN_vkVoidFunction>(&HeldGetSemaphoreCounterValue);
+    }
+
+    if (fn && name && !std::strcmp(name, "vkGetSemaphoreCounterValueKHR")) {
+      g_hookedGetSemaphoreCounterValueKHR = reinterpret_cast<PFN_vkGetSemaphoreCounterValue>(fn);
+      return reinterpret_cast<PFN_vkVoidFunction>(&HeldGetSemaphoreCounterValueKHR);
     }
 
     return fn;
@@ -2707,6 +2769,106 @@ int main(int argc, char** argv) {
   if (drawLinks) {
     Check(g_pipelineKinds.optimized - kindsBefore.optimized == g_pipelineKinds.fastLinks - kindsBefore.fastLinks,
       "the deferred compiles caught up: one optimized pipeline per fast-linked one");
+  }
+
+  // ---- BD-214: a poll sees the GPU progress that no submission retired ----
+  // GOG Galaxy hung at login on the system driver: Qt WebEngine's ANGLE ends an event query in glFinish and polls
+  // GetData until S_OK (Renderer11::finish: flags 0 on every 100th call, DONOTFLUSH on the others, a yield after
+  // each S_FALSE), with nothing else to submit. In its dump the End was still in the pending CS chunk, and the
+  // engine had two submissions in its queue that the GPU had completed: in inline mode nothing retired them, so
+  // the flush heuristic counted two submissions in flight for ever and never submitted the End. The counter hold
+  // makes the GPU look two submissions behind while they are made, as on the lab; then the GPU finishes them
+  // and the hold ends, with no further submission. A Map with DO_NOT_WAIT of a copy in such a submission, and
+  // IsResourceBusy, which the shell's staging-busy query polls, wait for the same retirement.
+  {
+    auto deviceWaitIdle = reinterpret_cast<PFN_vkDeviceWaitIdle>(vk.getDeviceProcAddr(device, "vkDeviceWaitIdle"));
+    constexpr double BoundMs = 2000.0;
+
+    // Two submissions the engine sees unfinished, then the GPU finishes them. The test's own vkDeviceWaitIdle is
+    // not one of the engine's calls; the engine is inline, so nothing else uses its queue meanwhile.
+    auto submitBehind = [&] (ID3D11Resource* copyTo) {
+      ctx->Flush();
+      CheckHr(engine->WaitForResourceIdle(rt.Get()), "BD-214: the target idle before the counter hold");
+      HoldCounters(true);
+
+      for (UINT i = 0u; i < 2u; i++) {
+        const float color[4] = { 0.25f * float(i), 0.5f, 0.75f, 1.0f };
+        ctx->ClearRenderTargetView(rtv.Get(), color);
+
+        if (copyTo && i == 0u)
+          ctx->CopyResource(copyTo, rt.Get());
+
+        ctx->Flush();
+      }
+
+      Check(deviceWaitIdle && deviceWaitIdle(device) == VK_SUCCESS, "BD-214: the GPU completed both submissions");
+      HoldCounters(false);
+    };
+
+    submitBehind(nullptr);
+
+    D3D11_QUERY_DESC eventDesc = { D3D11_QUERY_EVENT, 0u };
+    Microsoft::WRL::ComPtr<ID3D11Query> event;
+
+    if (CheckHr(d3d->CreateQuery(&eventDesc, &event), "BD-214: CreateQuery (event)")) {
+      ctx->End(event.Get());
+
+      HRESULT hr = S_FALSE;
+      uint32_t calls = 0u;
+      const double t0 = QpcMs();
+
+      while (hr == S_FALSE && QpcMs() - t0 < BoundMs) {
+        UINT flags = calls % 100u ? D3D11_ASYNC_GETDATA_DONOTFLUSH : 0u;
+        calls++;
+        hr = ctx->GetData(event.Get(), nullptr, 0u, flags);
+
+        if (hr == S_FALSE)
+          std::this_thread::yield();
+      }
+
+      std::printf("      event query: hr=0x%08lX after %u GetData calls, %.1f ms\n",
+        static_cast<unsigned long>(hr), calls, QpcMs() - t0);
+      Check(hr == S_OK, "BD-214: the event query ended after two unretired submissions completes in ANGLE's glFinish loop");
+    }
+
+    submitBehind(staging.Get());
+
+    HRESULT hr = DXGI_ERROR_WAS_STILL_DRAWING;
+    uint32_t calls = 0u;
+    const double t0 = QpcMs();
+
+    while (hr == DXGI_ERROR_WAS_STILL_DRAWING && QpcMs() - t0 < BoundMs) {
+      calls++;
+      hr = ctx->Map(staging.Get(), 0u, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+
+      if (hr == DXGI_ERROR_WAS_STILL_DRAWING)
+        std::this_thread::yield();
+    }
+
+    if (hr == S_OK)
+      ctx->Unmap(staging.Get(), 0u);
+
+    std::printf("      Map DO_NOT_WAIT: hr=0x%08lX after %u calls, %.1f ms\n",
+      static_cast<unsigned long>(hr), calls, QpcMs() - t0);
+    Check(hr == S_OK, "BD-214: Map with DO_NOT_WAIT of a copy in an unretired completed submission succeeds");
+
+    submitBehind(nullptr);
+
+    hr = S_FALSE;
+    calls = 0u;
+    const double t1 = QpcMs();
+
+    while (hr == S_FALSE && QpcMs() - t1 < BoundMs) {
+      calls++;
+      hr = engine->IsResourceBusy(rt.Get(), 0u);
+
+      if (hr == S_FALSE)
+        std::this_thread::yield();
+    }
+
+    std::printf("      IsResourceBusy: hr=0x%08lX after %u calls, %.1f ms\n",
+      static_cast<unsigned long>(hr), calls, QpcMs() - t1);
+    Check(hr == S_OK, "BD-214: IsResourceBusy reports idle for a target whose submissions completed unretired");
   }
 
   // ---- RotateResourceIdentities: storage moves, views follow ----
