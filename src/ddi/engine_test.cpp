@@ -618,16 +618,34 @@ namespace {
     return result;
   }
 
+  // The name of an engine thread. A DXVK thread names itself when it first runs (the pipeline workers at the
+  // lowest priority), so a census can see a new thread before it has a name. Under full CPU load a ready thread
+  // can wait some seconds for the CPU; Windows boosts a starved ready thread after about 4 s. One census waits
+  // for its names until one shared deadline of 10 s; an empty result after that is a thread without a name.
+  std::string EngineThreadName(DWORD tid, ULONGLONG deadline) {
+    std::string result = ThreadName(tid);
+
+    while (result.empty() && GetTickCount64() < deadline) {
+      Sleep(10);
+      result = ThreadName(tid);
+    }
+
+    return result;
+  }
+
+  constexpr ULONGLONG ThreadNameWaitMs = 10000u;
+
   // Threads that started in the engine DLL since a census, by name
   std::vector<std::string> EngineThreadsSince(const std::set<DWORD>& before) {
     std::vector<std::string> result;
+    const ULONGLONG deadline = GetTickCount64() + ThreadNameWaitMs;
 
     for (DWORD tid : ProcessThreads()) {
       if (before.count(tid))
         continue;
 
       if (_stricmp(ModuleOf(ThreadStartAddress(tid)).c_str(), "amdgpu_wddm_dxvk.dll") == 0)
-        result.push_back(ThreadName(tid));
+        result.push_back(EngineThreadName(tid, deadline));
     }
 
     return result;
@@ -3950,6 +3968,7 @@ int main(int argc, char** argv) {
   std::set<DWORD> threadsAfter = ProcessThreads();
   uint32_t engineThreads = 0u, otherEngineThreads = 0u;
   std::map<std::string, uint32_t> engineThreadNames;
+  const ULONGLONG nameDeadline = GetTickCount64() + ThreadNameWaitMs;
 
   for (DWORD tid : threadsAfter) {
     if (threadsBefore.count(tid))
@@ -3962,7 +3981,7 @@ int main(int argc, char** argv) {
       continue;
     }
 
-    std::string name = ThreadName(tid);
+    std::string name = EngineThreadName(tid, nameDeadline);
     engineThreads++;
     engineThreadNames[name]++;
 
@@ -4035,7 +4054,13 @@ int main(int argc, char** argv) {
     } else if (translated == 0 && cacheHits > 0) {
       std::printf("      every shader came from the shader cache (a warm start): nothing to translate\n");
     } else {
-      Check(queued > 0 && onWorkers > 0, "CreateShader leaves the translation to a pipeline worker");
+      // on_workers counts only the translations that a worker did itself. A draw that needs a shader before a
+      // worker has run translates it on the calling thread, so on_workers can be 0 under full CPU load.
+      Check(queued > 0, "CreateShader leaves the translation to a pipeline worker");
+      std::printf("      translations on workers: %lld of %lld queued\n", onWorkers, queued);
+
+      if (onWorkers == 0)
+        std::printf("      the workers did not run before the draws needed the shaders\n");
     }
 
     Check(errors == 0, "no translation or deferred library compile failed");
