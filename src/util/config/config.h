@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <string>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 namespace dxvk {
 
@@ -85,6 +87,16 @@ namespace dxvk {
      * to the log for debugging purposes. 
      */
     void logOptions() const;
+
+    /**
+     * \brief Options with a name prefix
+     *
+     * \param [in] prefix Start of the option names
+     * \returns The name and value of every option whose
+     *    name starts with \c prefix, sorted by name
+     */
+    std::vector<std::pair<std::string, std::string>> getOptions(
+      const std::string& prefix) const;
 
     /**
      * \brief Retrieves default options for an app
