@@ -1,3 +1,7 @@
+> **amdgpu-wddm fork.** This branch, `amdgpu-wddm/main`, is the dxvk source of the Direct3D 11 engine `amdgpu_wddm_dxvk.dll` (x64 and x86) in the amdgpu-wddm tester release 0.7.216.105-tester.33: commit [`acb78320`](https://github.com/D-Ogi/dxvk/commit/acb783204e2637d892a9f3a7a34926af35c83b8b), plus this note. The driver project is https://github.com/D-Ogi/amdgpu-wddm. The other `amdgpu-wddm/*` branches hold work in progress and older release lines. The upstream project is https://github.com/doitsujin/dxvk; its README follows unchanged.
+
+---
+
 # DXVK
 
 A Vulkan-based translation layer for Direct3D 8/9/10/11 which allows running 3D applications on Linux using Wine.
