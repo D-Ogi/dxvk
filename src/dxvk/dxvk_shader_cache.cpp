@@ -565,8 +565,9 @@ namespace dxvk {
   // still counts as recently used. Only names of the exact cache pattern are counted or deleted.
   void DxvkShaderCache::evictLocked() {
     const std::string suffixes[] = { ".dxvk.lut", ".dxvk.bin" };
-    uint32_t removed = 0u;
-    uint32_t removedForLimit = 0u;
+    // Only the lab flavour logs the two counts.
+    [[maybe_unused]] uint32_t removed = 0u;
+    [[maybe_unused]] uint32_t removedForLimit = 0u;
 
     try {
       // The part of the name before the identity, which names this executable alone.
