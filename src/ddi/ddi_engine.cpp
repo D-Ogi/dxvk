@@ -363,9 +363,9 @@ extern "C" HRESULT APIENTRY Bc250DxvkEngineGetAppOptions(
     return E_NOINTERFACE;
 
   try {
-    // The configuration of DxvkInstance (dxvk_instance.cpp): the user's options first, then the app profile.
-    Config config = Config::getUserConfig();
-    config.merge(Config::getAppConfig(env::getExePath()));
+    // The configuration of DxvkInstance (dxvk_instance.cpp): the user's options, the machine profile file, then
+    // the built-in profiles.
+    Config config = Config::getProcessConfig(env::getExePath());
 
     auto options = config.getOptions("dxgi.");
 

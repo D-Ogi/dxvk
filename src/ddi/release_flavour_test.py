@@ -37,6 +37,7 @@ FORBIDDEN = (
     'BC250DXVK_MEASURE_WORKER_THREADS',  # hands Vulkan calls to DXVK's worker threads, a measurement arm
     'DXVK_LOG_PATH',            # writes the log and the device fault dump to any path (lead decision 4)
     'DXVK_LOG_LEVEL',           # its companion: the log level
+    'AMDGPU_WDDM_PROFILE_DIR',  # reads the machine profile file (dxvk.conf) from another directory
 )
 SCAN = ('src',)
 EXTENSIONS = ('.c', '.cc', '.cpp', '.h', '.hpp')
