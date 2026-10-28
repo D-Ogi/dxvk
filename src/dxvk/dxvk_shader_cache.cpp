@@ -9,6 +9,7 @@
 #endif
 
 #include "dxvk_shader_cache.h"
+#include "dxvk_shader_cache_quota.h"
 
 #include "../util/util_time.h"
 
@@ -552,12 +553,20 @@ namespace dxvk {
 
   // The caches that other builds of the driver wrote for this executable. They can never be read by
   // this build, because the identity is part of the file name, so they are pure waste and go here.
-  // Nothing else is deleted: the name also carries the hash of the executable path, so no other
-  // application's cache and no unrelated file matches the pattern. A file that a process of another
+  // The name also carries the hash of the executable path, so no other application's cache and no
+  // unrelated file matches this pattern. A file that a process of another
   // build still holds open simply fails to be deleted, which costs only the space.
+  //
+  // Then the limit on the whole directory (dxvk_shader_cache_quota.h): when the cache files of all
+  // executables together are larger than the limit, the files of other executables go, the one
+  // used longest ago first. The cache files are opened without FILE_SHARE_DELETE, so the files of a
+  // game that runs now cannot be deleted. The look-up table of this executable gets the current
+  // time as its last write time first, so that a game whose cache is complete and is only read
+  // still counts as recently used. Only names of the exact cache pattern are counted or deleted.
   void DxvkShaderCache::evictLocked() {
     const std::string suffixes[] = { ".dxvk.lut", ".dxvk.bin" };
     uint32_t removed = 0u;
+    uint32_t removedForLimit = 0u;
 
     try {
       // The part of the name before the identity, which names this executable alone.
@@ -566,14 +575,29 @@ namespace dxvk {
       if (prefix.empty())
         return;
 
+      const auto directory = std::filesystem::u8path(m_filePaths.directory);
+      std::error_code touchError;
+      std::filesystem::last_write_time(directory / std::filesystem::u8path(m_filePaths.lutFile),
+        std::filesystem::file_time_type::clock::now(), touchError);
+
+      std::vector<shader_cache_quota::File> cacheFiles;
       size_t visited = 0;
-      for (const auto& item : std::filesystem::directory_iterator(
-          std::filesystem::u8path(m_filePaths.directory))) {
+      for (const auto& item : std::filesystem::directory_iterator(directory)) {
         if (++visited > 4096u) break;
         if (!item.is_regular_file())
           continue;
 
         auto name = item.path().filename().string();
+
+        if (shader_cache_quota::isCacheFileName(name)) {
+          std::error_code error;
+          const auto size = item.file_size(error);
+          const auto written = item.last_write_time(error);
+          if (!error) {
+            cacheFiles.push_back({ name, uint64_t(size),
+              int64_t(written.time_since_epoch().count()) });
+          }
+        }
 
         if (name.compare(0u, prefix.size(), prefix))
           continue;
@@ -594,8 +618,19 @@ namespace dxvk {
 
         std::error_code error;
 
-        if (std::filesystem::remove(item.path(), error))
+        if (std::filesystem::remove(item.path(), error)) {
           removed += 1u;
+          // Removed files no longer count against the directory limit.
+          cacheFiles.erase(std::remove_if(cacheFiles.begin(), cacheFiles.end(),
+            [&name] (const shader_cache_quota::File& f) { return f.name == name; }), cacheFiles.end());
+        }
+      }
+
+      for (const auto& name : shader_cache_quota::selectDeletions(cacheFiles, prefix)) {
+        std::error_code error;
+
+        if (std::filesystem::remove(directory / std::filesystem::u8path(name), error))
+          removedForLimit += 1u;
       }
     } catch (const std::exception&) {
       return;
@@ -604,6 +639,9 @@ namespace dxvk {
 #ifdef AMDGPU_WDDM_LAB_FLAVOUR
     if (removed)
       Logger::info(str::format("Shader cache: removed ", removed, " file(s) of other driver builds."));
+    if (removedForLimit)
+      Logger::info(str::format("Shader cache: removed ", removedForLimit,
+        " file(s) of other executables for the directory limit."));
 #endif
   }
 

@@ -42,6 +42,11 @@ executable('amdgpu_wddm_dxvk_app_options_test', 'app_options_test.cpp',
   install             : false,
 )
 
+# Host test of the cache directory limit (a pure function; no file system, no GPU).
+executable('amdgpu_wddm_dxvk_cache_quota_test', 'cache_quota_test.cpp',
+  install             : false,
+)
+
 # Offline positive control: plays the UMD shell against the DLL on any Vulkan 1.3 GPU (engine_test.cpp).
 # It uses only the ABI header, never DXVK internals, so it also checks that the header stands alone.
 executable('amdgpu_wddm_dxvk_engine_test', 'engine_test.cpp',

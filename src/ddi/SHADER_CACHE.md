@@ -54,7 +54,17 @@ Each executable/build pair is limited to 384 MiB of binary data and 64 MiB of lo
 The in-memory index is limited to 16,384 entries and a conservative 64 MiB budget. Each
 IR payload is limited to 16 MiB, metadata to 1 MiB, and a lookup record to 64 KiB. Files
 from older builds of the same executable can be removed when no process holds them open.
-There is no aggregate quota across different executables.
+
+All cache files in the directory together are limited to 2 GiB (`src/dxvk/dxvk_shader_cache_quota.h`).
+At initialization, after the files of older builds are removed, the cache sets the last write
+time of its own look-up table to now and adds the sizes of all files with the exact cache name
+pattern (16 hex digits, `-`, 16 hex digits, `.dxvk.lut` or `.dxvk.bin`). When the sum is above
+the limit, it removes the files of other executables, all files of one executable at a time,
+the executable with the oldest newest file first, until the sum is at the limit or below. The
+files of the running executable are never selected. Other names are not counted and not
+removed. One initialization removes at most 64 files and visits at most 4096 directory
+entries. The cache files are opened without delete sharing, so the files of a process that
+runs now cannot be removed; the sum is then checked again at the next start.
 
 ## Verification
 
@@ -67,5 +77,8 @@ unchanged. This verifies the engine path, not a real installation's profile mapp
 `amdgpu_wddm_dxvk_shader_cache_test --dumps <DXBC directory> --cache <test directory>`
 tests byte-identical SPIR-V, reopening, corruption, bounded growth, concurrent processes,
 unavailable storage and token-policy transitions. `--limit N` selects a smaller corpus.
-Run both programs in x64/x86 and release/lab configurations. The source flavour check,
+`amdgpu_wddm_dxvk_cache_quota_test` (no arguments) tests the selection of the directory limit
+as a pure function of a file list: no file system and no GPU.
+
+Run the programs in x64/x86 and release/lab configurations. The source flavour check,
 the shipped-byte forbidden-name scan and the release live-assert scan are separate gates.
