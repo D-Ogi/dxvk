@@ -1,6 +1,7 @@
 # amdgpu_wddm_dxvk.dll: DXVK as the engine behind the BC-250 system D3D10/11 user-mode driver.
 # The DLL contains the same D3D10/11 implementation as d3d11.dll plus the engine object in this directory,
-# and exports one function (amdgpu_wddm_dxvk.def). It never creates a swap chain or loads a Vulkan loader: the UMD
+# and exports two functions (amdgpu_wddm_dxvk.def): the engine functions and, from ABI 1.5, the dxgi.* options of DXVK's
+# configuration for the process. It never creates a swap chain or loads a Vulkan loader: the UMD
 # shell hands it the hosted VkInstance and VkDevice (bc250_dxvk_engine.h).
 
 ddi_src = [
@@ -32,6 +33,12 @@ executable('amdgpu_wddm_dxvk_shader_cache_test',
                           cpp.find_library('psapi'), dxvk_dep, dxbc_spirv_dep ],
   include_directories : dxvk_include_path,
   link_args           : ddi_cache_identity_link_args,
+  install             : false,
+)
+
+# Host test of the ABI 1.5 export Bc250DxvkEngineGetAppOptions: DXVK's dxgi.* options of a process, no GPU.
+executable('amdgpu_wddm_dxvk_app_options_test', 'app_options_test.cpp',
+  include_directories : include_directories('../../include/vulkan/include'),
   install             : false,
 )
 

@@ -4,7 +4,7 @@
  * UserModeDriverName DLL) and its DXVK engine ("engine", amdgpu_wddm_dxvk.dll, DXVK fork branch
  * amdgpu-wddm/ddi-engine).
  *
- * Revision r9, ABI 1.4. This file in the DXVK fork is the only copy; the shell includes it from the DXVK
+ * Revision r10, ABI 1.5. This file in the DXVK fork is the only copy; the shell includes it from the DXVK
  * source checkout it builds against, like its other DXVK-facing headers.
  *
  * Versions. A minor version adds and never changes: an engine of minor n serves a shell built for any minor
@@ -29,6 +29,9 @@
  *        11_1 is unaffected; a level above 11_1 needs the WDDM 2.0 D3D11 DDI in the shell.
  *   1.4  r9: no interface change. E2 states the BD-165 CPU-only translation workers and the persistent
  *        shader cache, which writes inline on the converting thread without a separate cache writer.
+ *   1.5  r10: Bc250DxvkEngineGetAppOptions, a second export: the dxgi.* options of DXVK's own configuration for
+ *        the process (app profiles, dxvk.conf, DXVK_CONFIG), which the engine has no swap chain to apply. A shell
+ *        that finds no such export (an engine before 1.5) has no options from it.
  *
  * WDK-free by construction. DXVK's util_gdi.h declares private extern-C D3DKMT prototypes that collide with
  * the WDK's in one translation unit, so nothing here needs d3d10umddi.h or a DXVK header: windows.h, the SDK's
@@ -112,7 +115,7 @@
 #include <vulkan/vulkan.h>
 
 #define BC250_DXVK_ENGINE_ABI_MAJOR 1u
-#define BC250_DXVK_ENGINE_ABI_MINOR 4u
+#define BC250_DXVK_ENGINE_ABI_MINOR 5u
 #define BC250_DXVK_ENGINE_ABI_VERSION ((BC250_DXVK_ENGINE_ABI_MAJOR << 16) | BC250_DXVK_ENGINE_ABI_MINOR)
 
 /* The Vulkan objects the shell owns (E1). */
@@ -431,7 +434,23 @@ struct BC250_DXVK_ENGINE_FUNCS {
     HRESULT (APIENTRY *CreateDevice)(const BC250_DXVK_DEVICE_CREATE_INFO *info, IBc250DxvkDevice **device);
 };
 
-/* The one export of amdgpu_wddm_dxvk.dll. abiVersion as BC250_DXVK_DEVICE_CREATE_INFO::AbiVersion; E_NOINTERFACE
+/* The first export of amdgpu_wddm_dxvk.dll (the second, from 1.5, is below). abiVersion as BC250_DXVK_DEVICE_CREATE_INFO::AbiVersion; E_NOINTERFACE
  * on an ABI major mismatch. */
 typedef HRESULT (APIENTRY *PFN_BC250_DXVK_ENGINE_GET_FUNCS)(UINT32 abiVersion, BC250_DXVK_ENGINE_FUNCS *funcs);
 #define BC250_DXVK_ENGINE_GET_FUNCS_NAME "Bc250DxvkEngineGetFuncs"
+
+/* ABI 1.5, the second export: DXVK's configuration options for this process whose names start with "dxgi.", and
+ * dxvk.maxFrameRate (which DXVK's DXGI options read over dxgi.maxFrameRate). The configuration is the one DXVK's
+ * instance takes: the user configuration (dxvk.conf, DXVK_CONFIG) merged with the app profile of the executable
+ * path, the user's value winning. The engine applies none of them, because it has no DXGI front and no swap chain;
+ * the shells of this driver apply what they can (a frame rate limit, a sync interval, a frame latency).
+ *
+ * text receives one "name=value\n" line per option, sorted by name, zero-terminated; *length receives the number of
+ * bytes of all lines, without the zero. S_OK when all lines fit in size bytes with the zero. When they do not,
+ * HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER), text holds the lines that fit whole, and *length tells the size to
+ * ask for. E_INVALIDARG when length is NULL or text is NULL with a size; E_NOINTERFACE on an ABI major mismatch.
+ * It creates no Vulkan object and may be called before, without or after any other engine function, from any
+ * thread, also from a process that loads the engine for this call only (the D3D12 shell). */
+typedef HRESULT (APIENTRY *PFN_BC250_DXVK_ENGINE_GET_APP_OPTIONS)(UINT32 abiVersion, char *text, UINT32 size,
+                                                                  UINT32 *length);
+#define BC250_DXVK_ENGINE_GET_APP_OPTIONS_NAME "Bc250DxvkEngineGetAppOptions"

@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <string>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 namespace dxvk {
 
@@ -87,6 +89,16 @@ namespace dxvk {
     void logOptions() const;
 
     /**
+     * \brief Options with a name prefix
+     *
+     * \param [in] prefix Start of the option names
+     * \returns The name and value of every option whose
+     *    name starts with \c prefix, sorted by name
+     */
+    std::vector<std::pair<std::string, std::string>> getOptions(
+      const std::string& prefix) const;
+
+    /**
      * \brief Retrieves default options for an app
      * 
      * \param [in] appName Name of the application
@@ -102,6 +114,70 @@ namespace dxvk {
      * \returns User-defined configuration options
      */
     static Config getUserConfig();
+
+    /**
+     * \brief Retrieves the machine-wide profile configuration
+     *
+     * amdgpu-wddm: the options of the [executable] sections for
+     * this executable in the dxvk.conf of the machine profile
+     * directory (config_profile.cpp), or an empty option set.
+     * \returns Options of the profile file
+     */
+    static Config getProfileConfig();
+
+    /**
+     * \brief Retrieves the configuration of this process
+     *
+     * amdgpu-wddm: the user configuration, then the machine
+     * profile file, then the built-in profiles. DxvkInstance
+     * and the engine export of the app options use it, so
+     * both read the same options.
+     * \param [in] exePath Path of the executable
+     * \returns Merged configuration
+     */
+    static Config getProcessConfig(const std::string& exePath);
+
+    /**
+     * \brief Parses the text of a profile file
+     *
+     * Checks the whole text first. On an error, nothing is
+     * set and the error names the line.
+     * \param [in] text The file
+     * \param [in] exeName The executable name of the sections that apply
+     * \param [out] config Gets the options of those sections
+     * \param [out] error The reason of a refusal
+     * \param [out] applied Optional: the line and text of each option set
+     * \returns \c true when the file is valid
+     */
+    static bool parseProfileConfig(
+      const std::string&                          text,
+      const std::string&                          exeName,
+            Config&                               config,
+            std::string&                          error,
+            std::vector<std::pair<uint32_t, std::string>>* applied);
+
+#ifdef _WIN32
+    /**
+     * \brief Reads the profile file of a profile directory
+     *
+     * For the host tests: \c trustAll skips the owner and
+     * access checks of the directory and the file.
+     */
+    static Config getProfileConfigFrom(
+      const std::wstring&                         root,
+      const std::string&                          exeName,
+            bool                                  trustAll);
+
+    /**
+     * \brief The access rule of the profile files
+     *
+     * \c true when SYSTEM, Administrators or TrustedInstaller
+     * owns the object and no other account may change it.
+     */
+    static bool isTrustedProfileDescriptor(
+            void*                                 securityDescriptor,
+            std::string&                          why);
+#endif
 
     static std::string toLower(std::string str);
 

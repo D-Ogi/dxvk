@@ -1811,6 +1811,19 @@ namespace dxvk {
     }
   }
 
+
+  std::vector<std::pair<std::string, std::string>> Config::getOptions(const std::string& prefix) const {
+    std::vector<std::pair<std::string, std::string>> result;
+
+    for (auto& pair : m_options) {
+      if (pair.first.compare(0, prefix.size(), prefix) == 0)
+        result.push_back(pair);
+    }
+
+    std::sort(result.begin(), result.end());
+    return result;
+  }
+
   std::string Config::toLower(std::string str) {
     std::transform(str.begin(), str.end(), str.begin(),
       [] (unsigned char c) { return (c >= 'A' && c <= 'Z') ? (c + 'a' - 'A') : c; });

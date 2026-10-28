@@ -29,8 +29,8 @@ namespace dxvk {
 
     wsi::init();
 
-    m_config = Config::getUserConfig();
-    m_config.merge(Config::getAppConfig(env::getExePath()));
+    // amdgpu-wddm: the user configuration, then the machine profile file, then the built-in profiles.
+    m_config = Config::getProcessConfig(env::getExePath());
     m_config.logOptions();
 
     m_options = DxvkOptions(m_config);

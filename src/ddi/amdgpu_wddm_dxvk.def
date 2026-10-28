@@ -1,3 +1,4 @@
 LIBRARY AMDGPU_WDDM_DXVK.DLL
 EXPORTS
     Bc250DxvkEngineGetFuncs
+    Bc250DxvkEngineGetAppOptions

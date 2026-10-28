@@ -87,15 +87,26 @@ namespace dxvk::env {
 
   std::string getExePath() {
 #if defined(_WIN32)
+    // The path can be longer than MAX_PATH (a long-path-aware process, a game in
+    // a deep directory). GetModuleFileNameW cuts a path that does not fit, so
+    // the buffer grows until it fits, up to the longest path Windows has. An
+    // empty path here means no app profile and no app name for the driver.
     std::vector<WCHAR> exePath;
-    exePath.resize(MAX_PATH + 1);
 
-    DWORD len = ::GetModuleFileNameW(NULL, exePath.data(), MAX_PATH);
-    if (!len || len == MAX_PATH)
-      return "";
-    exePath.resize(len + 1);
+    for (DWORD size = MAX_PATH + 1; size <= 65536; size *= 2) {
+      exePath.resize(size);
 
-    return str::fromws(exePath.data());
+      DWORD len = ::GetModuleFileNameW(NULL, exePath.data(), size);
+      if (!len)
+        return "";
+
+      if (len < size) {
+        exePath.resize(len + 1);
+        return str::fromws(exePath.data());
+      }
+    }
+
+    return "";
 #elif defined(__linux__)
     std::array<char, PATH_MAX> exePath = {};
 

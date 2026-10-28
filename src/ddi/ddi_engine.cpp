@@ -6,6 +6,8 @@
 
 #include "../dxvk/dxvk_instance.h"
 #include "../dxvk/dxvk_adapter.h"
+#include "../util/config/config.h"
+#include "../util/util_env.h"
 
 #include "ddi_device.h"
 #include "shader_cache_policy.h"
@@ -344,4 +346,66 @@ extern "C" HRESULT APIENTRY Bc250DxvkEngineGetFuncs(
   funcs->GetAdapterInfo           = &GetAdapterInfo;
   funcs->CreateDevice             = &CreateDevice;
   return S_OK;
+}
+
+
+extern "C" HRESULT APIENTRY Bc250DxvkEngineGetAppOptions(
+        UINT32                    abiVersion,
+        char*                     text,
+        UINT32                    size,
+        UINT32*                   length) {
+  using namespace dxvk;
+
+  if (!length || (!text && size))
+    return E_INVALIDARG;
+
+  if ((abiVersion >> 16) != BC250_DXVK_ENGINE_ABI_MAJOR)
+    return E_NOINTERFACE;
+
+  try {
+    // The configuration of DxvkInstance (dxvk_instance.cpp): the user's options, the machine profile file, then
+    // the built-in profiles.
+    Config config = Config::getProcessConfig(env::getExePath());
+
+    auto options = config.getOptions("dxgi.");
+
+    for (auto& pair : config.getOptions("dxvk.maxFrameRate")) {
+      if (pair.first == "dxvk.maxFrameRate")
+        options.push_back(pair);
+    }
+
+    std::string lines;
+    size_t fit = 0;
+
+    for (auto& pair : options) {
+      std::string line = pair.first + "=" + pair.second + "\n";
+
+      // One option per line: a line break inside a value would start a false option.
+      for (size_t i = 0; i + 1 < line.size(); i++) {
+        if (line[i] == '\n' || line[i] == '\r')
+          line[i] = ' ';
+      }
+
+      lines += line;
+
+      if (lines.size() < size)
+        fit = lines.size();
+    }
+
+    if (lines.size() > UINT32_MAX - 1)
+      return E_OUTOFMEMORY;
+
+    *length = UINT32(lines.size());
+
+    if (size) {
+      std::memcpy(text, lines.data(), fit);
+      text[fit] = '\0';
+    }
+
+    return lines.size() < size ? S_OK : HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+  } catch (const std::bad_alloc&) {
+    return E_OUTOFMEMORY;
+  } catch (...) {
+    return E_FAIL;
+  }
 }
