@@ -29,6 +29,14 @@ namespace dxvk {
     /// fast-linked pipelines.
     int32_t inlinePipelineBudget = 0;
 
+    /// With inline execution: the largest share of wall time, in percent,
+    /// that deferred optimized pipelines may take on the presenting thread.
+    /// The budget above only decides whether a compile starts, and one
+    /// compile of a large shader takes far longer than it. After a slice
+    /// that took T, the next optimized compile waits T * (100 - share) /
+    /// share. 100 compiles at every present, as before.
+    int32_t inlineOptimizedShare = 10;
+
     /// With inline execution: translate shaders on worker threads, which
     /// make no Vulkan call, and compile their pipeline libraries later on
     /// the calling thread. If false, both happen at shader creation.

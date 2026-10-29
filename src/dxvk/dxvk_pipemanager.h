@@ -51,6 +51,11 @@ namespace dxvk {
     uint64_t librariesReady;        ///< Of those, still queued
     uint64_t librariesOnDemand;     ///< Libraries compiled when a draw or dispatch needed them
     uint64_t compileErrors;         ///< Translations or compiles that threw
+    uint64_t optimizedQueued;       ///< Optimized pipelines queued for \c compileDeferred
+    uint64_t optimizedCompiled;     ///< Of those, compiled by \c compileDeferred
+    uint64_t optimizedMicros;       ///< Time of those compiles
+    uint64_t optimizedMaxMicros;    ///< Longest slice of optimized compiles
+    uint64_t optimizedHeld;         ///< Calls that skipped optimized compiles to keep the time share
   };
 
   /**
@@ -168,6 +173,11 @@ namespace dxvk {
      * whose shaders are translated first, then, if the scope
      * says so, optimized pipelines. Starts compiles until the
      * budget is used up, so a single compile may exceed it.
+     * After a slice of optimized compiles that took T, the next
+     * slice waits T * (100 - share) / share, where share is
+     * dxvk.inlineOptimizedShare: one compile can take hundreds
+     * of milliseconds, and a slice at every present would make
+     * every frame that long.
      * \param [in] budget Time budget
      * \param [in] scope What to compile
      * \returns Number of pipelines still queued in scope
@@ -230,6 +240,15 @@ namespace dxvk {
     uint64_t                          m_librariesQueued    = 0ull;
     uint64_t                          m_librariesCompiled  = 0ull;
     std::atomic<uint64_t>             m_compileErrors      = { 0ull };
+
+    uint64_t                          m_optimizedQueued    = 0ull;
+    uint64_t                          m_optimizedCompiled  = 0ull;
+    uint64_t                          m_optimizedMicros    = 0ull;
+    uint64_t                          m_optimizedMaxMicros = 0ull;
+    uint64_t                          m_optimizedHeld      = 0ull;
+
+    // No slice of optimized compiles before this time, see compileDeferred
+    dxvk::high_resolution_clock::time_point m_optimizedNotBefore = { };
 
     bool                              m_workersRunning = false;
     std::vector<dxvk::thread>         m_workers;

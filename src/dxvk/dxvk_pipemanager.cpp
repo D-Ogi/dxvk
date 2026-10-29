@@ -26,6 +26,11 @@ namespace dxvk {
     result.librariesQueued    = m_librariesQueued;
     result.librariesCompiled  = m_librariesCompiled;
     result.compileErrors      = m_compileErrors.load();
+    result.optimizedQueued    = m_optimizedQueued;
+    result.optimizedCompiled  = m_optimizedCompiled;
+    result.optimizedMicros    = m_optimizedMicros;
+    result.optimizedMaxMicros = m_optimizedMaxMicros;
+    result.optimizedHeld      = m_optimizedHeld;
 
     for (const auto& bucket : m_buckets)
       result.translationsPending += bucket.queue.size();
@@ -111,6 +116,7 @@ namespace dxvk {
       std::unique_lock lock(m_lock);
       pipeline->acquirePipeline();
       m_tasksTotal += 1;
+      m_optimizedQueued += 1u;
 
       m_deferred.emplace(pipeline, state);
       return;
@@ -178,6 +184,22 @@ namespace dxvk {
     if (scope == DxvkDeferredScope::Libraries)
       return pending;
 
+    if (m_deferred.empty())
+      return pending;
+
+    // The budget only decides whether a compile starts. One optimized compile of a large shader takes
+    // 50-900 ms on the BC-250, so a slice at every present made every frame that long while a backlog
+    // lasted (BD-216). Space the slices so that they take at most the configured share of wall time;
+    // the fast-linked pipelines serve until then.
+    auto t1 = dxvk::high_resolution_clock::now();
+
+    if (t1 < m_optimizedNotBefore) {
+      m_optimizedHeld += 1u;
+      return pending + m_deferred.size();
+    }
+
+    uint64_t compiled = 0u;
+
     while (!m_deferred.empty()) {
       if (!budgetLeft())
         break;
@@ -192,6 +214,19 @@ namespace dxvk {
       m_tasksCompleted += 1;
 
       lock.lock();
+      compiled += 1u;
+    }
+
+    if (compiled) {
+      auto t2 = dxvk::high_resolution_clock::now();
+      auto slice = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1);
+
+      int64_t share = std::clamp(m_device->config().inlineOptimizedShare, 1, 100);
+      m_optimizedNotBefore = t2 + slice * (100 - share) / share;
+
+      m_optimizedCompiled += compiled;
+      m_optimizedMicros += uint64_t(slice.count());
+      m_optimizedMaxMicros = std::max(m_optimizedMaxMicros, uint64_t(slice.count()));
     }
 
     return pending + m_deferred.size();

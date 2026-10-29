@@ -2789,6 +2789,113 @@ int main(int argc, char** argv) {
       "the deferred compiles caught up: one optimized pipeline per fast-linked one");
   }
 
+  // ---- BD-216: deferred optimized compiles keep to their share of the presenting thread ----
+  // CS2 on the BC-250 presented every other frame 50-250 ms late while a backlog of optimized pipelines lasted:
+  // each SubmitForPresent started a compile within the budget, and one compile takes far longer than the
+  // budget. After a slice of optimized compiles that took T, the next slice must wait T * (100 - share) / share
+  // (dxvk.inlineOptimizedShare, default 10). Distinct blend states give distinct pipelines with the same shaders.
+  char shareConfig[1024] = { };
+  GetEnvironmentVariableA("DXVK_CONFIG", shareConfig, sizeof(shareConfig));
+  std::string shareText = shareConfig;
+  std::transform(shareText.begin(), shareText.end(), shareText.begin(), [] (char c) { return char(std::tolower(c)); });
+
+  if (!drawLinks) {
+    std::printf("      no fast-linked pipeline on this device: compile spacing not exercised\n");
+  } else if (shareText.find("inlineoptimizedshare") != std::string::npos
+          || shareText.find("inlinepipelinebudget") != std::string::npos) {
+    std::printf("      DXVK_CONFIG sets the compile budget or share: compile spacing not checked\n");
+  } else {
+    constexpr UINT StateCount = 32u;
+    constexpr double Factor = 9.0;   // (100 - 10) / 10
+
+    const D3D11_BLEND srcBlends[] = { D3D11_BLEND_ONE, D3D11_BLEND_SRC_ALPHA, D3D11_BLEND_SRC_COLOR, D3D11_BLEND_INV_SRC_ALPHA };
+    const D3D11_BLEND dstBlends[] = { D3D11_BLEND_ZERO, D3D11_BLEND_ONE, D3D11_BLEND_INV_SRC_ALPHA, D3D11_BLEND_DEST_COLOR };
+    const D3D11_BLEND_OP blendOps[] = { D3D11_BLEND_OP_ADD, D3D11_BLEND_OP_REV_SUBTRACT };
+
+    std::vector<Microsoft::WRL::ComPtr<ID3D11BlendState>> blends(StateCount);
+    bool blendsOk = true;
+
+    for (UINT i = 0u; i < StateCount; i++) {
+      D3D11_BLEND_DESC desc = { };
+      desc.RenderTarget[0].BlendEnable           = TRUE;
+      desc.RenderTarget[0].SrcBlend              = srcBlends[i % 4u];
+      desc.RenderTarget[0].DestBlend             = dstBlends[(i / 4u) % 4u];
+      desc.RenderTarget[0].BlendOp               = blendOps[(i / 16u) % 2u];
+      desc.RenderTarget[0].SrcBlendAlpha         = D3D11_BLEND_ONE;
+      desc.RenderTarget[0].DestBlendAlpha        = D3D11_BLEND_ZERO;
+      desc.RenderTarget[0].BlendOpAlpha          = D3D11_BLEND_OP_ADD;
+      desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+      blendsOk = blendsOk && SUCCEEDED(d3d->CreateBlendState(&desc, &blends[i]));
+    }
+
+    Check(blendsOk, "compile spacing: 32 blend states");
+
+    const PipelineKinds spacingBefore = g_pipelineKinds;
+
+    for (const auto& blend : blends) {
+      ctx->OMSetBlendState(blend.Get(), nullptr, ~0u);
+      ctx->Draw(3u, 0u);
+    }
+
+    ctx->Flush();
+    ctx->OMSetBlendState(nullptr, nullptr, ~0u);
+
+    const uint32_t queued = g_pipelineKinds.fastLinks - spacingBefore.fastLinks;
+
+    // One record per present that compiled optimized pipelines: when it returned, and its compile time
+    struct Slice { double end; double compileMs; };
+    std::vector<Slice> slices;
+
+    const double start = QpcMs();
+    uint32_t presents = 0u;
+    HRESULT spacingHr = S_OK;
+
+    while (g_pipelineKinds.optimized - spacingBefore.optimized < queued && QpcMs() - start < 10000.0
+        && SUCCEEDED(spacingHr)) {
+      const PipelineKinds kinds = g_pipelineKinds;
+      spacingHr = engine->SubmitForPresent(rt.Get(), 0u);
+      presents++;
+
+      // No pause between presents: an empty frame takes far less than a hold, so a present that comes too
+      // soon after a slice shows up even where the development GPU compiles in tens of microseconds
+      if (g_pipelineKinds.optimized != kinds.optimized)
+        slices.push_back({ QpcMs(), g_pipelineKinds.optimizedMs - kinds.optimizedMs });
+    }
+
+    CheckHr(spacingHr, "compile spacing: SubmitForPresent");
+
+    const double wallMs = QpcMs() - start;
+    const double compileMs = g_pipelineKinds.optimizedMs - spacingBefore.optimizedMs;
+
+    // From one slice's return to the next's, the engine held for Factor times the earlier slice, which took at
+    // least its compile time; the later slice's own compile comes on top. Slack for the work around the slice.
+    uint32_t shortGaps = 0u;
+    double minRatio = 1e9;
+
+    for (size_t i = 1u; i < slices.size(); i++) {
+      double gap = slices[i].end - slices[i - 1u].end - slices[i].compileMs;
+      double need = Factor * slices[i - 1u].compileMs;
+      minRatio = std::min(minRatio, need > 0.0 ? gap / need : 1e9);
+
+      if (gap < 0.9 * need - 0.2)
+        shortGaps++;
+    }
+
+    std::printf("      compile spacing: %u fast-linked, %u optimized in %zu slices over %u presents, "
+      "%.1f ms compiling in %.1f ms wall, smallest gap/hold %.2f\n",
+      queued, g_pipelineKinds.optimized - spacingBefore.optimized, slices.size(), presents,
+      compileMs, wallMs, slices.size() > 1u ? minRatio : 0.0);
+
+    Check(g_pipelineKinds.optimized - spacingBefore.optimized == queued,
+      "compile spacing: every deferred optimized pipeline compiles within 10 s");
+
+    if (slices.size() > 1u) {
+      Check(shortGaps == 0u, "compile spacing: each slice waits 9 times the previous slice (share 10 %)");
+      Check(presents > slices.size(), "compile spacing: presents inside a hold compile nothing");
+    } else
+      std::printf("      all optimized pipelines fit one slice on this device: spacing not exercised\n");
+  }
+
   // ---- BD-214: a poll sees the GPU progress that no submission retired ----
   // GOG Galaxy hung at login on the system driver: Qt WebEngine's ANGLE ends an event query in glFinish and polls
   // GetData until S_OK (Renderer11::finish: flags 0 on every 100th call, DONOTFLUSH on the others, a yield after

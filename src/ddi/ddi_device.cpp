@@ -1105,7 +1105,9 @@ namespace dxvk::ddi {
       " queued=", deferred.translationsQueued, " pending=", deferred.translationsPending,
       " libraries_queued=", deferred.librariesQueued, " libraries_deferred=", deferred.librariesCompiled,
       " libraries_ready=", deferred.librariesReady, " libraries_on_demand=", deferred.librariesOnDemand,
-      " errors=", deferred.compileErrors));
+      " optimized_queued=", deferred.optimizedQueued, " optimized_deferred=", deferred.optimizedCompiled,
+      " optimized_ms=", deferred.optimizedMicros / 1000u, " optimized_max_slice_ms=", deferred.optimizedMaxMicros / 1000u,
+      " optimized_held=", deferred.optimizedHeld, " errors=", deferred.compileErrors));
   }
 
 
