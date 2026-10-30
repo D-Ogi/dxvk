@@ -5,7 +5,20 @@
 #include "dxvk_shader_ir.h"
 
 namespace dxvk {
-  
+
+  namespace {
+
+    // Set while a worker of inline execution compiles, see compileHasFallback
+    thread_local bool t_compileHasFallback = false;
+
+    struct DxvkFallbackScope {
+      DxvkFallbackScope()  { t_compileHasFallback = true; }
+      ~DxvkFallbackScope() { t_compileHasFallback = false; }
+    };
+
+  }
+
+
   DxvkPipelineWorkers::DxvkPipelineWorkers(
           DxvkDevice*                     device)
   : m_device(device) {
@@ -31,6 +44,9 @@ namespace dxvk {
     result.optimizedMicros    = m_optimizedMicros;
     result.optimizedMaxMicros = m_optimizedMaxMicros;
     result.optimizedHeld      = m_optimizedHeld;
+    result.librariesOnWorkers = m_librariesOnWorkers.load();
+    result.optimizedOnWorkers = m_optimizedOnWorkers.load();
+    result.workerFailures     = m_workerFailures.load();
 
     for (const auto& bucket : m_buckets)
       result.translationsPending += bucket.queue.size();
@@ -48,10 +64,36 @@ namespace dxvk {
   }
 
 
+  bool DxvkPipelineWorkers::compilesOnWorkers() const {
+    return translatesOnWorkers()
+        && m_device->config().compilePipelinesOnWorkers;
+  }
+
+
+  bool DxvkPipelineWorkers::compileHasFallback() {
+    return t_compileHasFallback;
+  }
+
+
   void DxvkPipelineWorkers::compilePipelineLibrary(
           DxvkShaderPipelineLibrary*      library,
           DxvkPipelinePriority            priority) {
     if (m_device->isInlineExecution()) {
+      if (compilesOnWorkers()) {
+        // The worker also translates if no one did yet
+        std::unique_lock lock(m_lock);
+        this->startWorkers();
+
+        m_tasksTotal += 1;
+
+        PipelineEntry entry(library);
+        entry.priority = priority;
+
+        m_buckets[uint32_t(priority)].queue.push(entry);
+        notifyWorkers(priority);
+        return;
+      }
+
       if (translatesOnWorkers()) {
         std::unique_lock lock(m_lock);
         queueReadyLibraryLocked(library, priority);
@@ -108,18 +150,21 @@ namespace dxvk {
           DxvkPipelinePriority            priority) {
     if (m_device->isInlineExecution()) {
       // The thread that draws would compile the optimized variant right after fast-linking the
-      // base pipeline and pay for both. Queue it for compileDeferred; the base pipeline serves
-      // until then. Without a budget, only base pipelines are used.
+      // base pipeline and pay for both. A worker compiles it, or without compiles on workers,
+      // compileDeferred; the base pipeline serves until then. Without a budget, only base
+      // pipelines are used.
       if (m_device->config().inlinePipelineBudget <= 0)
         return;
 
-      std::unique_lock lock(m_lock);
-      pipeline->acquirePipeline();
-      m_tasksTotal += 1;
-      m_optimizedQueued += 1u;
+      if (!compilesOnWorkers()) {
+        std::unique_lock lock(m_lock);
+        pipeline->acquirePipeline();
+        m_tasksTotal += 1;
+        m_optimizedQueued += 1u;
 
-      m_deferred.emplace(pipeline, state);
-      return;
+        m_deferred.emplace(pipeline, state);
+        return;
+      }
     }
 
     std::unique_lock lock(m_lock);
@@ -252,6 +297,7 @@ namespace dxvk {
         m_buckets[i].cond.notify_all();
     }
 
+    // A worker that fails a compile after this point does not queue it again
     for (auto& worker : m_workers)
       worker.join();
 
@@ -277,6 +323,72 @@ namespace dxvk {
         break;
       }
     }
+  }
+
+
+  void DxvkPipelineWorkers::compileLibraryOnWorker(
+          DxvkShaderPipelineLibrary*      library,
+          DxvkPipelinePriority            priority) {
+    // The calling thread repeats a compile that fails here and reports
+    // its own failure, so a failure here is not an error (BD-216). On
+    // the BC-250, the driver refuses work that needs a new allocation
+    // on a thread outside a DDI call, see d3d11-ddi-engine.md E2.
+    DxvkCompileResult result = DxvkCompileResult::Repeat;
+
+    try {
+      DxvkFallbackScope scope;
+      result = library->compilePipeline();
+    } catch (const DxvkError&) {
+    } catch (const std::exception&) {
+    }
+
+    if (result != DxvkCompileResult::Repeat) {
+      if (result == DxvkCompileResult::Compiled)
+        m_librariesOnWorkers += 1u;
+      return;
+    }
+
+    m_workerFailures += 1u;
+
+    std::unique_lock lock(m_lock);
+
+    if (m_workersRunning)
+      queueReadyLibraryLocked(library, priority);
+  }
+
+
+  void DxvkPipelineWorkers::compileOptimizedOnWorker(
+    const PipelineEntry&                  entry) {
+    DxvkCompileResult result;
+
+    { DxvkFallbackScope scope;
+      result = entry.graphicsPipeline->compilePipeline(entry.graphicsState);
+    }
+
+    if (result != DxvkCompileResult::Repeat) {
+      if (result == DxvkCompileResult::Compiled)
+        m_optimizedOnWorkers += 1u;
+
+      entry.graphicsPipeline->releasePipeline();
+      return;
+    }
+
+    m_workerFailures += 1u;
+
+    std::unique_lock lock(m_lock);
+
+    if (!m_workersRunning) {
+      lock.unlock();
+      entry.graphicsPipeline->releasePipeline();
+      return;
+    }
+
+    // The entry keeps the reference that compileGraphicsPipeline took;
+    // compileDeferred releases it after its compile, which inlineOptimizedShare paces
+    m_tasksTotal += 1;
+    m_optimizedQueued += 1u;
+
+    m_deferred.push(entry);
   }
 
 
@@ -383,15 +495,26 @@ namespace dxvk {
 
         // A failed translation is left to the first draw that needs it,
         // which fails the same way and reports it on the device
-        std::unique_lock lock(m_lock);
+        if (translated && compilesOnWorkers()) {
+          compileLibraryOnWorker(entry.pipelineLibrary, entry.priority);
+        } else {
+          std::unique_lock lock(m_lock);
 
-        if (translated && m_workersRunning)
-          queueReadyLibraryLocked(entry.pipelineLibrary, entry.priority);
+          if (translated && m_workersRunning)
+            queueReadyLibraryLocked(entry.pipelineLibrary, entry.priority);
+        }
       } else if (entry.pipelineLibrary) {
-        entry.pipelineLibrary->compilePipeline();
+        if (m_device->isInlineExecution())
+          compileLibraryOnWorker(entry.pipelineLibrary, entry.priority);
+        else
+          entry.pipelineLibrary->compilePipeline();
       } else if (entry.graphicsPipeline) {
-        entry.graphicsPipeline->compilePipeline(entry.graphicsState);
-        entry.graphicsPipeline->releasePipeline();
+        if (m_device->isInlineExecution()) {
+          compileOptimizedOnWorker(entry);
+        } else {
+          entry.graphicsPipeline->compilePipeline(entry.graphicsState);
+          entry.graphicsPipeline->releasePipeline();
+        }
       }
 
       m_tasksCompleted += 1;

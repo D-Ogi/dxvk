@@ -12,6 +12,7 @@ namespace dxvk {
     inlinePipelineBudget  = config.getOption<int32_t> ("dxvk.inlinePipelineBudget",   2000);
     inlineOptimizedShare  = std::clamp(config.getOption<int32_t>("dxvk.inlineOptimizedShare", 10), 1, 100);
     translateShadersOnWorkers = config.getOption<bool>("dxvk.translateShadersOnWorkers", true);
+    compilePipelinesOnWorkers = config.getOption<bool>("dxvk.compilePipelinesOnWorkers", true);
     compileLibrariesOnCreate = config.getOption<Tristate>("dxvk.compileLibrariesOnCreate", Tristate::Auto);
     enableDescriptorHeap  = config.getOption<Tristate>("dxvk.enableDescriptorHeap",   Tristate::Auto);
     enableDescriptorBuffer = config.getOption<Tristate>("dxvk.enableDescriptorBuffer", Tristate::Auto);

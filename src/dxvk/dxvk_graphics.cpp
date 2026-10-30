@@ -8,6 +8,9 @@
 
 namespace dxvk {
 
+  // Status of an optimized pipeline whose compile failed on a pipeline worker, see getOptimizedPipeline
+  constexpr VkResult RepeatOnCallingThread = VK_RESULT_MAX_ENUM;
+
   VkPrimitiveTopology determineGsInputTopology(
           VkPrimitiveTopology            shader,
           VkPrimitiveTopology            state) {
@@ -1129,10 +1132,10 @@ namespace dxvk {
   }
 
 
-  void DxvkGraphicsPipeline::compilePipeline(
+  DxvkCompileResult DxvkGraphicsPipeline::compilePipeline(
     const DxvkGraphicsPipelineStateInfo& state) {
     if (m_device->config().enableGraphicsPipelineLibrary == Tristate::True)
-      return;
+      return DxvkCompileResult::Skipped;
 
     // Try to find an existing instance that contains a base pipeline
     DxvkGraphicsPipelineInstance* instance = this->findInstance(state);
@@ -1140,12 +1143,12 @@ namespace dxvk {
     if (!instance) {
       // Exit early if the state vector is invalid
       if (!this->validatePipelineState(state, false))
-        return;
+        return DxvkCompileResult::Skipped;
 
       // Do not compile if this pipeline can be fast linked. This essentially
       // disables the state cache for pipelines that do not benefit from it.
       if (this->canCreateBasePipeline(state))
-        return;
+        return DxvkCompileResult::Skipped;
 
       // Prevent other threads from adding new instances and check again
       std::unique_lock<dxvk::mutex> lock(m_mutex);
@@ -1159,14 +1162,24 @@ namespace dxvk {
     // an optimized version of this pipeline
     if (instance->isCompiling.load()
      || instance->isCompiling.exchange(VK_TRUE))
-      return;
+      return DxvkCompileResult::Skipped;
 
     VkPipeline pipeline = this->getOptimizedPipeline(state);
+
+    // A worker's failure goes back to the calling thread, which repeats
+    // the compile and reports its own failure (BD-216)
+    if (!pipeline && DxvkPipelineWorkers::compileHasFallback()) {
+      instance->isCompiling.store(VK_FALSE);
+      return DxvkCompileResult::Repeat;
+    }
+
     instance->fastHandle.store(pipeline);
 
     // Log pipeline state on error
     if (!pipeline)
       this->logPipelineState(LogLevel::Error, state);
+
+    return DxvkCompileResult::Compiled;
   }
 
 
@@ -1428,27 +1441,42 @@ namespace dxvk {
 
     lock.unlock();
 
-    if (entry.second) {
-      // Pipeline doesn't exist yet. Compile it and write the status back last
-      // so that other threads can safely read the pipeline handle.
-      auto [status, handle] = createOptimizedPipeline(key);
+    auto& instance = entry.first->second;
 
-      entry.first->second.pipeline = handle;
-      entry.first->second.status.store(status);
-
-      return handle;
-    } else {
+    while (!entry.second) {
       // Pipeline already exists. Busy-wait until status becomes something
       // other than VK_NOT_READY in order to avoid compiling the same pipeline
       // on multiple threads in parallel, which is problematic on some drivers.
       // This should be quite rare anyway.
-      sync::spin(1000u, [&entry] {
-        auto status = entry.first->second.status.load();
+      sync::spin(1000u, [&instance] {
+        auto status = instance.status.load();
         return status != VK_NOT_READY;
       });
 
-      return entry.first->second.pipeline;
+      // A compile that failed on a worker is repeated by the first thread
+      // without a fallback that finds it; that thread takes it over as if
+      // the entry were new (BD-216). Entries are never removed, because
+      // other threads may hold them.
+      VkResult status = instance.status.load();
+
+      if (status != RepeatOnCallingThread || DxvkPipelineWorkers::compileHasFallback())
+        return instance.pipeline;
+
+      entry.second = instance.status.compare_exchange_strong(status, VK_NOT_READY);
     }
+
+    // Pipeline doesn't exist yet, or this thread repeats a worker's compile.
+    // Compile it and write the status back last so that other threads can
+    // safely read the pipeline handle.
+    auto [status, handle] = createOptimizedPipeline(key);
+
+    if (!handle && DxvkPipelineWorkers::compileHasFallback())
+      status = RepeatOnCallingThread;
+
+    instance.pipeline = handle;
+    instance.status.store(status);
+
+    return handle;
   }
 
 
@@ -1516,7 +1544,9 @@ namespace dxvk {
     VkResult vr = vk->vkCreateGraphicsPipelines(vk->device(), VK_NULL_HANDLE, 1, &info, nullptr, &pipeline);
 
     if (vr != VK_SUCCESS) {
-      Logger::err(str::format("DxvkGraphicsPipeline: Failed to compile pipeline: ", vr));
+      // A worker's failure is repeated on the calling thread, which reports it
+      if (!DxvkPipelineWorkers::compileHasFallback())
+        Logger::err(str::format("DxvkGraphicsPipeline: Failed to compile pipeline: ", vr));
       return std::make_pair(vr, VK_NULL_HANDLE);
     }
 

@@ -171,7 +171,9 @@ namespace dxvk::ddi {
     // Lines of the translation workers; and, unless a frame would wait for it (CompileLibrariesOnCreate),
     // the pipeline libraries of shaders they translated since the last call, compiled while the application
     // creates shaders rather than at its first draw with them (DxvkPipelineWorkers::compileDeferred). The
-    // new shader's translation goes to a worker.
+    // new shader's translation goes to a worker. With dxvk.compilePipelinesOnWorkers, the workers also
+    // compile the libraries, outside the runtime's device lock (BD-216), and only those that failed on a
+    // worker are queued here.
     Logger::flushDeferred();
 
     if (CompileLibrariesOnCreate())
@@ -1050,7 +1052,8 @@ namespace dxvk::ddi {
 
     // Inline execution defers optimized pipelines to here (DxvkPipelineWorkers::compileDeferred): the
     // frame is already on the GPU, and the drawing thread did not pay for them. Pipeline libraries of
-    // shaders translated on workers come first; a draw that needs one sooner compiles it itself.
+    // shaders translated on workers come first; a draw that needs one sooner compiles it itself. With
+    // dxvk.compilePipelinesOnWorkers, workers compile both, and only their failures are queued here.
     CompileDeferred(DxvkDeferredScope::All);
 
     m_presentThread.store(GetCurrentThreadId(), std::memory_order_relaxed);
@@ -1107,7 +1110,9 @@ namespace dxvk::ddi {
       " libraries_ready=", deferred.librariesReady, " libraries_on_demand=", deferred.librariesOnDemand,
       " optimized_queued=", deferred.optimizedQueued, " optimized_deferred=", deferred.optimizedCompiled,
       " optimized_ms=", deferred.optimizedMicros / 1000u, " optimized_max_slice_ms=", deferred.optimizedMaxMicros / 1000u,
-      " optimized_held=", deferred.optimizedHeld, " errors=", deferred.compileErrors));
+      " optimized_held=", deferred.optimizedHeld, " libraries_on_workers=", deferred.librariesOnWorkers,
+      " optimized_on_workers=", deferred.optimizedOnWorkers, " worker_failures=", deferred.workerFailures,
+      " errors=", deferred.compileErrors));
   }
 
 

@@ -42,6 +42,14 @@ namespace dxvk {
     /// the calling thread. If false, both happen at shader creation.
     bool translateShadersOnWorkers = true;
 
+    /// With shaders translated on workers: compile their pipeline libraries
+    /// and the optimized pipelines on the workers too, outside the calling
+    /// thread and its locks. A worker compile that fails goes back to the
+    /// queues of the calling thread (compileDeferred, the first draw), so
+    /// a driver that refuses work on a worker thread costs time, not
+    /// correctness. If false, the workers only translate.
+    bool compilePipelinesOnWorkers = true;
+
     /// With shaders translated on workers: whether shader creation also
     /// compiles pipeline libraries of translated shaders. Auto: on the
     /// thread that presents, or while nothing is presented, never where it

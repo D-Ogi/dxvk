@@ -59,8 +59,15 @@
  *   E2  Threads (ABI 1.0 = inline mode). Every Vulkan call the engine makes happens on the thread that is
  *       inside an engine call (a COM method of an engine object or an IBc250DxvkDevice method). The engine starts
  *       no thread that calls Vulkan: DXVK's CS, submit, finish, descriptor, presenter and adapter threads are not
- *       started in this mode. BD-165 pipeline workers may translate shader IR on the CPU and queue the result;
- *       creation of Vulkan pipelines stays on the calling thread in RuntimeDomain. A persistent cache writes
+ *       started in this mode. BD-165 pipeline workers may translate shader IR on the CPU and queue the result.
+ *       The one exception is pipeline creation (BD-216): with dxvk.compilePipelinesOnWorkers (default true) the
+ *       workers also create pipeline libraries and optimized graphics pipelines, outside any engine call and
+ *       outside RuntimeDomain. Their only Vulkan calls are vkCreateGraphicsPipelines, vkCreateComputePipelines,
+ *       vkGetShaderModuleCreateInfoIdentifierEXT and, in a 32-bit process, vkDestroyPipeline of a library they
+ *       created. Hosted RADV gets no runtime callback on such a thread (the shell refuses host calls outside a DDI
+ *       entry), so a create that needs one, such as a new shader arena, fails; the engine repeats it on the
+ *       calling thread in RuntimeDomain (CreateShader, SubmitForPresent, or the draw that needs it). With the
+ *       option false, creation of Vulkan pipelines stays on the calling thread in RuntimeDomain. A persistent cache writes
  *       the converted IR on the converting thread, including these CPU workers, with no separate cache writer.
  *       Cache access requires an ordinary process profile and no thread impersonation; a failed policy or cache
  *       operation falls back to conversion. Workers are joined before device teardown. DXVK's fence thread starts
@@ -334,7 +341,7 @@ IBc250DxvkDevice : public IUnknown {
     /* DXGI PresentDXGI/Present1, before the shell's present ordering and pfnPresentCb: ends the engine frame
      * and submits everything recorded so far (E3). Does not wait for the GPU. After the submission it compiles
      * optimized pipelines that draws deferred (E2 keeps them off the drawing thread; fast-linked pipelines serve
-     * until then), starting compiles for up to dxvk.inlinePipelineBudget microseconds (default 2000, 0 never
+     * until then; with dxvk.compilePipelinesOnWorkers only those whose compile failed on a worker), starting compiles for up to dxvk.inlinePipelineBudget microseconds (default 2000, 0 never
      * compiles them). After a call that compiled them for T, later calls compile none for T * (100 - share) /
      * share, share being dxvk.inlineOptimizedShare (percent, default 10, 100 compiles at every call). When DXVK_HUD or dxvk.hud enables HUD items, it first draws the HUD over subresource of
      * source, a 2D color attachment texture; any other source presents without it. The source and subresource

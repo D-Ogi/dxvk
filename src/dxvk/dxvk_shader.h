@@ -576,6 +576,16 @@ namespace dxvk {
 
 
   /**
+   * \brief Result of a request to compile a pipeline
+   */
+  enum class DxvkCompileResult : uint32_t {
+    Skipped   = 0,  ///< Nothing to compile: done before, by another thread, or nothing to create
+    Compiled  = 1,  ///< This call created the pipeline, or failed and reported it
+    Repeat    = 2,  ///< Failed where DxvkPipelineWorkers::compileHasFallback is true; the caller queues it again
+  };
+
+
+  /**
    * \brief Shader pipeline library
    *
    * Stores a pipeline object for either a complete compute
@@ -632,8 +642,12 @@ namespace dxvk {
      * This is meant to be called from a worker thread in
      * order to reduce the amount of work done on the app's
      * main thread.
+     *
+     * A compile that failed where \ref DxvkPipelineWorkers::compileHasFallback
+     * is true is repeated by the next call from a thread where it is false.
+     * \returns What the call did
      */
-    void compilePipeline();
+    DxvkCompileResult compilePipeline();
 
     /**
      * \brief Checks whether the shaders are translated
@@ -657,6 +671,7 @@ namespace dxvk {
     dxvk::mutex                     m_mutex;
     uint32_t                        m_useCount      = 0u;
     bool                            m_compiledOnce  = false;
+    bool                            m_repeatCompile = false;
 
     std::optional<DxvkShaderPipelineLibraryHandle> m_pipeline;
 

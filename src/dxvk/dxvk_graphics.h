@@ -478,7 +478,9 @@ namespace dxvk {
    * Stores the pipeline handle, as well as the compile status. Can
    * be accessed from multiple threads concurrently. A status of
    * VK_NOT_READY indicates that pipeline compilation is still in
-   * progress on another thread.
+   * progress on another thread. VK_RESULT_MAX_ENUM marks a compile
+   * that failed on a pipeline worker and that the next thread without
+   * a fallback repeats, see DxvkGraphicsPipeline::getOptimizedPipeline.
    */
   struct DxvkGraphicsPipelineFastInstanceObject {
     DxvkGraphicsPipelineFastInstanceObject() = default;
@@ -575,8 +577,12 @@ namespace dxvk {
      * Asynchronously compiles the given pipeline
      * and stores the result for future use.
      * \param [in] state Pipeline state vector
+     * \returns What the call did. \c Repeat if the compile
+     *    failed where \ref DxvkPipelineWorkers::compileHasFallback
+     *    is true; the caller then queues it for a thread where
+     *    it is false
      */
-    void compilePipeline(
+    DxvkCompileResult compilePipeline(
       const DxvkGraphicsPipelineStateInfo&    state);
 
     /**

@@ -241,18 +241,26 @@ namespace dxvk {
   }
 
 
-  void DxvkShaderPipelineLibrary::compilePipeline() {
+  DxvkCompileResult DxvkShaderPipelineLibrary::compilePipeline() {
     std::lock_guard lock(m_mutex);
 
-    // Skip if a pipeline has already been compiled
-    if (m_compiledOnce)
-      return;
+    // Skip if a pipeline has already been compiled, unless a worker
+    // failed to compile it and left the compile to this thread
+    if (m_pipeline || (m_compiledOnce && !m_repeatCompile))
+      return DxvkCompileResult::Skipped;
 
     // Compile the pipeline with default args
     DxvkShaderPipelineLibraryHandle pipeline = compileShaderPipelineLocked();
 
-    if (!pipeline.handle)
-      return;
+    if (!pipeline.handle) {
+      if (!canCreatePipelineLibrary())
+        return DxvkCompileResult::Skipped;
+
+      m_repeatCompile = DxvkPipelineWorkers::compileHasFallback();
+      return m_repeatCompile ? DxvkCompileResult::Repeat : DxvkCompileResult::Compiled;
+    }
+
+    m_repeatCompile = false;
 
     if (m_device->mustTrackPipelineLifetime()) {
       // On 32-bit, destroy the pipeline immediately in order to
@@ -264,6 +272,8 @@ namespace dxvk {
       // Write back pipeline handle for future use
       m_pipeline = pipeline;
     }
+
+    return DxvkCompileResult::Compiled;
   }
 
 
@@ -450,7 +460,8 @@ namespace dxvk {
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkResult vr = vk->vkCreateGraphicsPipelines(vk->device(), VK_NULL_HANDLE, 1, &info, nullptr, &pipeline);
 
-    if (vr && vr != VK_PIPELINE_COMPILE_REQUIRED_EXT)
+    // A worker's failure is repeated on the calling thread, which reports it
+    if (vr && vr != VK_PIPELINE_COMPILE_REQUIRED_EXT && !DxvkPipelineWorkers::compileHasFallback())
       Logger::err(str::format("DxvkShaderPipelineLibrary: Failed to create vertex shader pipeline: ", vr));
 
     return vr ? VK_NULL_HANDLE : pipeline;
@@ -554,7 +565,8 @@ namespace dxvk {
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkResult vr = vk->vkCreateGraphicsPipelines(vk->device(), VK_NULL_HANDLE, 1, &info, nullptr, &pipeline);
 
-    if (vr && !(flags & VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT))
+    if (vr && !(flags & VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT)
+           && !DxvkPipelineWorkers::compileHasFallback())
       Logger::err(str::format("DxvkShaderPipelineLibrary: Failed to create fragment shader pipeline: ", vr));
 
     return vr ? VK_NULL_HANDLE : pipeline;
@@ -587,7 +599,7 @@ namespace dxvk {
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkResult vr = vk->vkCreateComputePipelines(vk->device(), VK_NULL_HANDLE, 1, &info, nullptr, &pipeline);
 
-    if (vr && vr != VK_PIPELINE_COMPILE_REQUIRED_EXT)
+    if (vr && vr != VK_PIPELINE_COMPILE_REQUIRED_EXT && !DxvkPipelineWorkers::compileHasFallback())
       Logger::err(str::format("DxvkShaderPipelineLibrary: Failed to create compute shader pipeline: ", vr));
 
     return vr ? VK_NULL_HANDLE : pipeline;

@@ -261,7 +261,8 @@ namespace dxvk::ddi {
         deviceInfo.extensionNames = const_cast<const char**>(info->Device->ExtensionNames);
         deviceInfo.features       = info->Device->Features;
 
-        // E2, E3: Vulkan stays on the calling thread; BD-165 translation workers are CPU-only.
+        // E2, E3: Vulkan stays on the calling thread; BD-165 translation workers are CPU-only, except the
+        // pipeline creates of dxvk.compilePipelinesOnWorkers (BD-216), which fall back to the calling thread.
         // The cache writes on the converting thread and adds no writer thread or second kernel device.
         // BC250DXVK_MEASURE_WORKER_THREADS=1 is a measurement switch outside the ABI: DXVK's own worker
         // threads then call Vulkan, which breaks E2, to price inline execution against upstream threading.

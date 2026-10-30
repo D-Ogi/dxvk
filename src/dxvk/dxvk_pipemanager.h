@@ -56,6 +56,9 @@ namespace dxvk {
     uint64_t optimizedMicros;       ///< Time of those compiles
     uint64_t optimizedMaxMicros;    ///< Longest slice of optimized compiles
     uint64_t optimizedHeld;         ///< Calls that skipped optimized compiles to keep the time share
+    uint64_t librariesOnWorkers;    ///< Libraries that worker threads created
+    uint64_t optimizedOnWorkers;    ///< Optimized pipelines that worker threads compiled or found compiled
+    uint64_t workerFailures;        ///< Worker compiles that failed and went back to the calling thread
   };
 
   /**
@@ -118,6 +121,29 @@ namespace dxvk {
     bool translatesOnWorkers() const;
 
     /**
+     * \brief Checks whether pipelines are compiled on workers
+     *
+     * With translation on workers, unless dxvk.compilePipelinesOnWorkers
+     * says no. Libraries and optimized pipelines are then compiled on the
+     * workers, and \ref compileDeferred only gets the compiles that failed
+     * there.
+     * \returns \c true if inline execution compiles on workers
+     */
+    bool compilesOnWorkers() const;
+
+    /**
+     * \brief Checks whether the current compile has a fallback
+     *
+     * True on a worker thread of inline execution that compiles a library
+     * or an optimized pipeline. A failed compile there is not an error: it
+     * goes back to the calling thread, which repeats it. Compile code uses
+     * this to keep such failures out of the log and to leave the repeat to
+     * that thread.
+     * \returns \c true if a failure of the current compile is repeated
+     */
+    static bool compileHasFallback();
+
+    /**
      * \brief Compiles a pipeline library
      *
      * Asynchronously compiles a basic variant of
@@ -126,8 +152,9 @@ namespace dxvk {
      *
      * With inline execution and translation on workers, the
      * library is queued for \ref compileDeferred instead, once
-     * its shaders are translated; a draw that needs it earlier
-     * compiles it on demand.
+     * its shaders are translated, unless pipelines are compiled
+     * on workers; a draw that needs it earlier compiles it on
+     * demand.
      * \param [in] library The pipeline library
      * \param [in] priority Pipeline priority
      */
@@ -139,9 +166,10 @@ namespace dxvk {
      * \brief Translates a shader on a worker thread
      *
      * Inline execution only. The worker runs \c DxvkShader::compile,
-     * which makes no Vulkan call, and then queues the library for
-     * \ref compileDeferred. Whoever needs the shader first translates
-     * it, or waits for the translation that is running.
+     * which makes no Vulkan call, and then compiles the library if
+     * \ref compilesOnWorkers, or queues it for \ref compileDeferred.
+     * Whoever needs the shader first translates it, or waits for the
+     * translation that is running.
      * \param [in] shader The shader
      * \param [in] library The shader's own pipeline library
      * \param [in] priority Priority
@@ -154,6 +182,8 @@ namespace dxvk {
     /**
      * \brief Compiles an optimized graphics pipeline
      *
+     * With inline execution, on a worker if \ref compilesOnWorkers,
+     * otherwise queued for \ref compileDeferred.
      * \param [in] pipeline Compute pipeline
      * \param [in] state Pipeline state
      */
@@ -177,7 +207,8 @@ namespace dxvk {
      * slice waits T * (100 - share) / share, where share is
      * dxvk.inlineOptimizedShare: one compile can take hundreds
      * of milliseconds, and a slice at every present would make
-     * every frame that long.
+     * every frame that long. If \ref compilesOnWorkers, only the
+     * compiles that failed on a worker are queued here.
      * \param [in] budget Time budget
      * \param [in] scope What to compile
      * \returns Number of pipelines still queued in scope
@@ -247,6 +278,10 @@ namespace dxvk {
     uint64_t                          m_optimizedMaxMicros = 0ull;
     uint64_t                          m_optimizedHeld      = 0ull;
 
+    std::atomic<uint64_t>             m_librariesOnWorkers = { 0ull };
+    std::atomic<uint64_t>             m_optimizedOnWorkers = { 0ull };
+    std::atomic<uint64_t>             m_workerFailures     = { 0ull };
+
     // No slice of optimized compiles before this time, see compileDeferred
     dxvk::high_resolution_clock::time_point m_optimizedNotBefore = { };
 
@@ -258,6 +293,13 @@ namespace dxvk {
             DxvkPipelinePriority            priority);
 
     void notifyWorkers(DxvkPipelinePriority priority);
+
+    void compileLibraryOnWorker(
+            DxvkShaderPipelineLibrary*      library,
+            DxvkPipelinePriority            priority);
+
+    void compileOptimizedOnWorker(
+      const PipelineEntry&                  entry);
 
     void startWorkers();
 

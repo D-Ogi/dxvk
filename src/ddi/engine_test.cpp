@@ -291,9 +291,23 @@ namespace {
   // engine's calls go through the wrappers; the test's own calls use the loader's pointers directly.
   DWORD g_callerThread = 0u;
 
+  std::string ThreadName(DWORD tid);
+
+  // DXVK's pipeline workers (dxvk-shader-*), which name themselves before any work. With
+  // dxvk.compilePipelinesOnWorkers they create pipelines outside an engine call, E2's one exception (BD-216).
+  bool IsPipelineWorker() {
+    thread_local int known = -1;
+
+    if (known < 0)
+      known = ThreadName(GetCurrentThreadId()).rfind("dxvk-shader-", 0u) == 0u ? 1 : 0;
+
+    return known == 1;
+  }
+
   struct VkCallStats {
     std::atomic<uint32_t> calls   { 0u };
-    std::atomic<uint32_t> foreign { 0u };
+    std::atomic<uint32_t> worker  { 0u };   // from a pipeline worker
+    std::atomic<uint32_t> foreign { 0u };   // from any other thread
   };
 
   template<int Id, typename Fn>
@@ -307,8 +321,12 @@ namespace {
     static R VKAPI_CALL Call(A... args) {
       stats.calls++;
 
-      if (!IsCallerThread(g_callerThread))
-        stats.foreign++;
+      if (!IsCallerThread(g_callerThread)) {
+        if (IsPipelineWorker())
+          stats.worker++;
+        else
+          stats.foreign++;
+      }
 
       return real(args...);
     }
@@ -419,11 +437,40 @@ namespace {
     double   libraryMs = 0.0;  // wall time of the calls that created libraries, in the driver
     double   linkMs    = 0.0;  // the same for fast links
     double   optimizedMs = 0.0;
+    uint32_t refused   = 0u;   // pipeline workers only: creates that the test refused (g_refuseWorkerPipelines)
   };
 
   PipelineKinds g_pipelineKinds;
   thread_local PipelineKinds* t_pipelineKinds = &g_pipelineKinds;   // the loader thread counts its own
   PFN_vkCreateGraphicsPipelines g_hookedCreateGraphicsPipelines = nullptr;
+
+  // The pipeline workers' sums, which several workers add to at once
+  std::mutex    g_workerKindsMutex;
+  PipelineKinds g_workerKinds;
+
+  PipelineKinds WorkerKinds() {
+    std::lock_guard lock(g_workerKindsMutex);
+    return g_workerKinds;
+  }
+
+  // ENGINE_TEST_REFUSE_WORKER_PIPELINES=1 (read by this test, not by the engine) fails every graphics pipeline
+  // create of a pipeline worker with VK_ERROR_OUT_OF_DEVICE_MEMORY before the driver sees it. On the BC-250 the
+  // shell refuses a worker's runtime callbacks, so a worker create that needs a new shader arena fails that way;
+  // the engine must then repeat the compile on the calling thread.
+  bool g_refuseWorkerPipelines = false;
+
+  // How the engine compiles in this run, from DXVK_CONFIG as DXVK reads it and the variable above
+  enum class CompileMode { CallingThread, Workers, RefusedWorkers };
+
+  bool TranslationOnWorkersOff();
+  bool ConfigSays(const char* setting);
+
+  CompileMode PipelineCompileMode() {
+    if (TranslationOnWorkersOff() || ConfigSays("dxvk.compilepipelinesonworkers=false"))
+      return CompileMode::CallingThread;
+
+    return g_refuseWorkerPipelines ? CompileMode::RefusedWorkers : CompileMode::Workers;
+  }
 
   double QpcMs() {
     static const double freq = [] {
@@ -439,7 +486,19 @@ namespace {
 
   VkResult VKAPI_CALL ClassifyGraphicsPipelines(VkDevice device, VkPipelineCache cache, uint32_t count,
       const VkGraphicsPipelineCreateInfo* infos, const VkAllocationCallbacks* allocator, VkPipeline* pipelines) {
-    PipelineKinds& kinds = *t_pipelineKinds;
+    const bool worker = IsPipelineWorker();
+
+    if (worker && g_refuseWorkerPipelines) {
+      for (uint32_t i = 0u; i < count; i++)
+        pipelines[i] = VK_NULL_HANDLE;
+
+      std::lock_guard lock(g_workerKindsMutex);
+      g_workerKinds.refused += count;
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    }
+
+    PipelineKinds workerKinds;
+    PipelineKinds& kinds = worker ? workerKinds : *t_pipelineKinds;
     double* time = nullptr;
 
     for (uint32_t i = 0u; i < count; i++) {
@@ -465,12 +524,23 @@ namespace {
       }
     }
 
-    // The engine makes these calls on a test thread inside an engine call (E2), each with its own sums
+    // The engine makes these calls on a test thread inside an engine call (E2), each with its own sums, or on a
+    // pipeline worker (BD-216), whose sums go to g_workerKinds
     double t0 = QpcMs();
     VkResult vr = g_hookedCreateGraphicsPipelines(device, cache, count, infos, allocator, pipelines);
 
     if (time)
       *time += QpcMs() - t0;
+
+    if (worker) {
+      std::lock_guard lock(g_workerKindsMutex);
+      g_workerKinds.libraries   += workerKinds.libraries;
+      g_workerKinds.fastLinks   += workerKinds.fastLinks;
+      g_workerKinds.optimized   += workerKinds.optimized;
+      g_workerKinds.libraryMs   += workerKinds.libraryMs;
+      g_workerKinds.linkMs      += workerKinds.linkMs;
+      g_workerKinds.optimizedMs += workerKinds.optimizedMs;
+    }
 
     return vr;
   }
@@ -683,8 +753,8 @@ namespace {
     return false;
   }
 
-  // Whether the configuration turns translation on workers off (DXVK_CONFIG, as DXVK reads it)
-  bool TranslationOnWorkersOff() {
+  // Whether DXVK_CONFIG holds a setting, given in lower case without spaces (as DXVK reads it)
+  bool ConfigSays(const char* setting) {
     char config[1024] = { };
 
     if (!GetEnvironmentVariableA("DXVK_CONFIG", config, sizeof(config)))
@@ -693,7 +763,12 @@ namespace {
     std::string text = config;
     text.erase(std::remove(text.begin(), text.end(), ' '), text.end());
     std::transform(text.begin(), text.end(), text.begin(), [] (char c) { return char(std::tolower(c)); });
-    return text.find("dxvk.translateshadersonworkers=false") != std::string::npos;
+    return text.find(setting) != std::string::npos;
+  }
+
+  // Whether the configuration turns translation on workers off
+  bool TranslationOnWorkersOff() {
+    return ConfigSays("dxvk.translateshadersonworkers=false");
   }
 
   // ---- DDI-form shaders -------------------------------------------------------------------------
@@ -1444,6 +1519,7 @@ namespace {
     };
 
     const PipelineKinds kindsBefore = g_pipelineKinds;
+    const PipelineKinds workerBefore = WorkerKinds();
     PipelineKinds loaderKinds;
     double tStart = QpcMs(), cpuStart = ProcessCpuMs(), tCreated = 0.0;
     double drawWaitBefore = t_ddiWaitMs, loaderWaitMs = 0.0;
@@ -1581,6 +1657,13 @@ namespace {
     } else {
       printKinds("calling", g_pipelineKinds, kindsBefore);
     }
+
+    // BD-216: with dxvk.compilePipelinesOnWorkers, in parallel with the threads above; may still be running
+    const PipelineKinds workerNow = WorkerKinds();
+    printKinds("pipeline worker", workerNow, workerBefore);
+
+    if (workerNow.refused != workerBefore.refused)
+      std::printf("      worker creates refused by the test: %u\n", workerNow.refused - workerBefore.refused);
   }
 
   // ---- Vulkan -------------------------------------------------------------------------------------
@@ -2123,6 +2206,15 @@ int main(int argc, char** argv) {
 
   g_callerThread = GetCurrentThreadId();
   g_realGetInstanceProcAddr = vk.getInstanceProcAddr;
+
+  { char refuse[8] = { };
+    g_refuseWorkerPipelines = GetEnvironmentVariableA("ENGINE_TEST_REFUSE_WORKER_PIPELINES", refuse, sizeof(refuse))
+                           && refuse[0] == '1';
+  }
+
+  const CompileMode compileMode = PipelineCompileMode();
+  std::printf("      pipeline compiles: %s\n", compileMode == CompileMode::CallingThread ? "on the calling thread"
+    : compileMode == CompileMode::Workers ? "on pipeline workers" : "on pipeline workers, refused by the test");
 
   BC250_DXVK_VULKAN_INSTANCE vkInstance = { sizeof(vkInstance) };
   vkInstance.GetInstanceProcAddr = &HookedGetInstanceProcAddr;
@@ -2677,8 +2769,10 @@ int main(int argc, char** argv) {
   ctx->OMSetRenderTargets(1u, rtvs, nullptr);
 
   // The first draw with this state. Executing it (Flush, E3) fast-links a base pipeline when the device has
-  // pipeline libraries; in inline mode the optimized variant waits for SubmitForPresent.
+  // pipeline libraries; in inline mode the optimized variant waits for SubmitForPresent, or with
+  // dxvk.compilePipelinesOnWorkers a pipeline worker compiles it (BD-216).
   const PipelineKinds kindsBefore = g_pipelineKinds;
+  const PipelineKinds workerBefore = WorkerKinds();
   ctx->Draw(3u, 0u);
   ctx->Flush();
   const PipelineKinds kindsDraw = g_pipelineKinds;
@@ -2693,10 +2787,30 @@ int main(int argc, char** argv) {
   std::printf("      first draw: %u fast-linked, %u optimized pipelines; SubmitForPresent: %u optimized\n",
     drawLinks, drawOptimized, presentOptimized);
 
+  // A worker's compile runs alongside this thread: wait for it, up to 10 s
+  auto waitForWorkers = [&workerBefore] (uint32_t optimized) {
+    for (double start = QpcMs(); WorkerKinds().optimized - workerBefore.optimized < optimized
+                              && QpcMs() - start < 10000.0; )
+      Sleep(1);
+
+    return WorkerKinds().optimized - workerBefore.optimized;
+  };
+
   if (drawLinks) {
     Check(drawOptimized == 0u, "the draw fast-links and compiles no optimized pipeline (inline mode)");
-    Check(presentOptimized >= 1u && presentOptimized <= drawLinks,
-      "SubmitForPresent compiles the deferred optimized pipeline");
+
+    if (compileMode == CompileMode::Workers) {
+      const uint32_t workerOptimized = waitForWorkers(1u);
+      std::printf("      pipeline workers: %u optimized\n", workerOptimized);
+      Check(presentOptimized == 0u && workerOptimized >= 1u && workerOptimized <= drawLinks,
+        "a pipeline worker compiles the optimized pipeline, SubmitForPresent none (dxvk.compilePipelinesOnWorkers)");
+    } else if (compileMode == CompileMode::RefusedWorkers) {
+      // The worker's refusal and its requeue race with this present; the catch-up check below decides
+      std::printf("      worker compiles refused: SubmitForPresent repeats them once a worker gave them back\n");
+    } else {
+      Check(presentOptimized >= 1u && presentOptimized <= drawLinks,
+        "SubmitForPresent compiles the deferred optimized pipeline");
+    }
   } else {
     std::printf("      no fast-linked pipeline on this device: deferred compiles not exercised\n");
   }
@@ -2784,9 +2898,18 @@ int main(int argc, char** argv) {
 
   // The frames reuse the first draw's state, so by now every fast-linked pipeline has its optimized variant,
   // and the last frame above was drawn with it.
+  // With compiles on workers, the optimized pipelines of both threads count.
   if (drawLinks) {
-    Check(g_pipelineKinds.optimized - kindsBefore.optimized == g_pipelineKinds.fastLinks - kindsBefore.fastLinks,
-      "the deferred compiles caught up: one optimized pipeline per fast-linked one");
+    const uint32_t links = g_pipelineKinds.fastLinks - kindsBefore.fastLinks;
+    const uint32_t calling = g_pipelineKinds.optimized - kindsBefore.optimized;
+    const uint32_t onWorkers = compileMode == CompileMode::Workers ? waitForWorkers(links - calling) : 0u;
+
+    Check(calling + onWorkers == links, "the deferred compiles caught up: one optimized pipeline per fast-linked one");
+
+    if (compileMode == CompileMode::RefusedWorkers) {
+      Check(WorkerKinds().refused > workerBefore.refused && WorkerKinds().optimized == workerBefore.optimized,
+        "refused worker compiles: the calling thread repeated every one (control: the test refused some)");
+    }
   }
 
   // ---- BD-216: deferred optimized compiles keep to their share of the presenting thread ----
@@ -2794,6 +2917,8 @@ int main(int argc, char** argv) {
   // each SubmitForPresent started a compile within the budget, and one compile takes far longer than the
   // budget. After a slice of optimized compiles that took T, the next slice must wait T * (100 - share) / share
   // (dxvk.inlineOptimizedShare, default 10). Distinct blend states give distinct pipelines with the same shaders.
+  // With dxvk.compilePipelinesOnWorkers the pipeline workers compile them, and presents must compile none; the
+  // spacing then holds for the compiles that workers give back, which ENGINE_TEST_REFUSE_WORKER_PIPELINES=1 forces.
   char shareConfig[1024] = { };
   GetEnvironmentVariableA("DXVK_CONFIG", shareConfig, sizeof(shareConfig));
   std::string shareText = shareConfig;
@@ -2831,6 +2956,7 @@ int main(int argc, char** argv) {
     Check(blendsOk, "compile spacing: 32 blend states");
 
     const PipelineKinds spacingBefore = g_pipelineKinds;
+    const PipelineKinds workerSpacingBefore = WorkerKinds();
 
     for (const auto& blend : blends) {
       ctx->OMSetBlendState(blend.Get(), nullptr, ~0u);
@@ -2842,58 +2968,86 @@ int main(int argc, char** argv) {
 
     const uint32_t queued = g_pipelineKinds.fastLinks - spacingBefore.fastLinks;
 
-    // One record per present that compiled optimized pipelines: when it returned, and its compile time
-    struct Slice { double end; double compileMs; };
-    std::vector<Slice> slices;
+    if (compileMode == CompileMode::Workers) {
+      // BD-216: the pipeline workers compile them, and presents meanwhile compile none
+      const double start = QpcMs();
+      double maxPresentMs = 0.0;
+      uint32_t presents = 0u;
+      HRESULT spacingHr = S_OK;
 
-    const double start = QpcMs();
-    uint32_t presents = 0u;
-    HRESULT spacingHr = S_OK;
+      while (WorkerKinds().optimized - workerSpacingBefore.optimized < queued && QpcMs() - start < 10000.0
+          && SUCCEEDED(spacingHr)) {
+        const double t = QpcMs();
+        spacingHr = engine->SubmitForPresent(rt.Get(), 0u);
+        maxPresentMs = std::max(maxPresentMs, QpcMs() - t);
+        presents++;
+      }
 
-    while (g_pipelineKinds.optimized - spacingBefore.optimized < queued && QpcMs() - start < 10000.0
-        && SUCCEEDED(spacingHr)) {
-      const PipelineKinds kinds = g_pipelineKinds;
-      spacingHr = engine->SubmitForPresent(rt.Get(), 0u);
-      presents++;
+      CheckHr(spacingHr, "compile on workers: SubmitForPresent");
 
-      // No pause between presents: an empty frame takes far less than a hold, so a present that comes too
-      // soon after a slice shows up even where the development GPU compiles in tens of microseconds
-      if (g_pipelineKinds.optimized != kinds.optimized)
-        slices.push_back({ QpcMs(), g_pipelineKinds.optimizedMs - kinds.optimizedMs });
+      const PipelineKinds workerKinds = WorkerKinds();
+      std::printf("      compile on workers: %u fast-linked, %u optimized on workers (%.1f ms) in %.1f ms wall, "
+        "%u presents, longest %.2f ms\n", queued, workerKinds.optimized - workerSpacingBefore.optimized,
+        workerKinds.optimizedMs - workerSpacingBefore.optimizedMs, QpcMs() - start, presents, maxPresentMs);
+
+      Check(workerKinds.optimized - workerSpacingBefore.optimized == queued,
+        "compile on workers: every optimized pipeline compiles on a pipeline worker within 10 s");
+      Check(g_pipelineKinds.optimized == spacingBefore.optimized,
+        "compile on workers: the presenting thread compiles no optimized pipeline");
+    } else {
+      // One record per present that compiled optimized pipelines: when it returned, and its compile time
+      struct Slice { double end; double compileMs; };
+      std::vector<Slice> slices;
+
+      const double start = QpcMs();
+      uint32_t presents = 0u;
+      HRESULT spacingHr = S_OK;
+
+      while (g_pipelineKinds.optimized - spacingBefore.optimized < queued && QpcMs() - start < 10000.0
+          && SUCCEEDED(spacingHr)) {
+        const PipelineKinds kinds = g_pipelineKinds;
+        spacingHr = engine->SubmitForPresent(rt.Get(), 0u);
+        presents++;
+
+        // No pause between presents: an empty frame takes far less than a hold, so a present that comes too
+        // soon after a slice shows up even where the development GPU compiles in tens of microseconds
+        if (g_pipelineKinds.optimized != kinds.optimized)
+          slices.push_back({ QpcMs(), g_pipelineKinds.optimizedMs - kinds.optimizedMs });
+      }
+
+      CheckHr(spacingHr, "compile spacing: SubmitForPresent");
+
+      const double wallMs = QpcMs() - start;
+      const double compileMs = g_pipelineKinds.optimizedMs - spacingBefore.optimizedMs;
+
+      // From one slice's return to the next's, the engine held for Factor times the earlier slice, which took at
+      // least its compile time; the later slice's own compile comes on top. Slack for the work around the slice.
+      uint32_t shortGaps = 0u;
+      double minRatio = 1e9;
+
+      for (size_t i = 1u; i < slices.size(); i++) {
+        double gap = slices[i].end - slices[i - 1u].end - slices[i].compileMs;
+        double need = Factor * slices[i - 1u].compileMs;
+        minRatio = std::min(minRatio, need > 0.0 ? gap / need : 1e9);
+
+        if (gap < 0.9 * need - 0.2)
+          shortGaps++;
+      }
+
+      std::printf("      compile spacing: %u fast-linked, %u optimized in %zu slices over %u presents, "
+        "%.1f ms compiling in %.1f ms wall, smallest gap/hold %.2f\n",
+        queued, g_pipelineKinds.optimized - spacingBefore.optimized, slices.size(), presents,
+        compileMs, wallMs, slices.size() > 1u ? minRatio : 0.0);
+
+      Check(g_pipelineKinds.optimized - spacingBefore.optimized == queued,
+        "compile spacing: every deferred optimized pipeline compiles within 10 s");
+
+      if (slices.size() > 1u) {
+        Check(shortGaps == 0u, "compile spacing: each slice waits 9 times the previous slice (share 10 %)");
+        Check(presents > slices.size(), "compile spacing: presents inside a hold compile nothing");
+      } else
+        std::printf("      all optimized pipelines fit one slice on this device: spacing not exercised\n");
     }
-
-    CheckHr(spacingHr, "compile spacing: SubmitForPresent");
-
-    const double wallMs = QpcMs() - start;
-    const double compileMs = g_pipelineKinds.optimizedMs - spacingBefore.optimizedMs;
-
-    // From one slice's return to the next's, the engine held for Factor times the earlier slice, which took at
-    // least its compile time; the later slice's own compile comes on top. Slack for the work around the slice.
-    uint32_t shortGaps = 0u;
-    double minRatio = 1e9;
-
-    for (size_t i = 1u; i < slices.size(); i++) {
-      double gap = slices[i].end - slices[i - 1u].end - slices[i].compileMs;
-      double need = Factor * slices[i - 1u].compileMs;
-      minRatio = std::min(minRatio, need > 0.0 ? gap / need : 1e9);
-
-      if (gap < 0.9 * need - 0.2)
-        shortGaps++;
-    }
-
-    std::printf("      compile spacing: %u fast-linked, %u optimized in %zu slices over %u presents, "
-      "%.1f ms compiling in %.1f ms wall, smallest gap/hold %.2f\n",
-      queued, g_pipelineKinds.optimized - spacingBefore.optimized, slices.size(), presents,
-      compileMs, wallMs, slices.size() > 1u ? minRatio : 0.0);
-
-    Check(g_pipelineKinds.optimized - spacingBefore.optimized == queued,
-      "compile spacing: every deferred optimized pipeline compiles within 10 s");
-
-    if (slices.size() > 1u) {
-      Check(shortGaps == 0u, "compile spacing: each slice waits 9 times the previous slice (share 10 %)");
-      Check(presents > slices.size(), "compile spacing: presents inside a hold compile nothing");
-    } else
-      std::printf("      all optimized pipelines fit one slice on this device: spacing not exercised\n");
   }
 
   // ---- BD-214: a poll sees the GPU progress that no submission retired ----
@@ -4172,6 +4326,20 @@ int main(int argc, char** argv) {
 
     Check(errors == 0, "no translation or deferred library compile failed");
 
+    // BD-216: a worker compile that fails goes back to the calling thread and is counted, not logged as an error
+    const long long workerFailures = StatValue(shell.lines, "amdgpu_wddm_dxvk: Shader stats:", "worker_failures");
+    const long long optimizedOnWorkers = StatValue(shell.lines, "amdgpu_wddm_dxvk: Shader stats:", "optimized_on_workers");
+
+    if (compileMode == CompileMode::RefusedWorkers) {
+      Check(workerFailures > 0 && optimizedOnWorkers == 0,
+        "the stats line counts the refused worker compiles (worker_failures) and no worker pipeline");
+    } else if (compileMode == CompileMode::Workers) {
+      Check(workerFailures == 0 && (optimizedOnWorkers > 0 || !drawLinks),
+        "the stats line counts optimized pipelines on workers (optimized_on_workers) and no worker failure");
+    } else {
+      Check(workerFailures == 0 && optimizedOnWorkers == 0, "the stats line counts no compile on workers");
+    }
+
 
   }
 
@@ -4275,26 +4443,57 @@ int main(int argc, char** argv) {
   }
 
   // ---- Vulkan call census, including teardown (E2) ----
-  uint32_t hookedCalls = 0u, foreignCalls = 0u;
+  // E2's one exception (BD-216): the pipeline workers of dxvk.compilePipelinesOnWorkers create pipelines, and in a
+  // 32-bit process destroy the libraries they created.
+  auto workerMayCall = [] (const char* name) {
+    return !std::strcmp(name, "vkCreateGraphicsPipelines") || !std::strcmp(name, "vkCreateComputePipelines")
+        || !std::strcmp(name, "vkGetShaderModuleCreateInfoIdentifierEXT")
+        || (sizeof(void*) == 4u && !std::strcmp(name, "vkDestroyPipeline"));
+  };
+
+  uint32_t hookedCalls = 0u, foreignCalls = 0u, workerCalls = 0u, workerOtherCalls = 0u;
 
   for (const auto& e : g_vkHooks) {
-    uint32_t calls = e.stats->calls.load(), foreign = e.stats->foreign.load();
+    uint32_t calls = e.stats->calls.load(), foreign = e.stats->foreign.load(), worker = e.stats->worker.load();
 
     if (calls)
-      std::printf("      %-32s %6u calls, %u from other threads\n", e.name, calls, foreign);
+      std::printf("      %-40s %6u calls, %u from pipeline workers, %u from other threads\n", e.name, calls, worker, foreign);
 
     hookedCalls  += calls;
     foreignCalls += foreign;
+    workerCalls  += worker;
+
+    if (!workerMayCall(e.name))
+      workerOtherCalls += worker;
   }
 
-  std::printf("      %u hooked Vulkan calls, %u from other threads\n", hookedCalls, foreignCalls);
+  const PipelineKinds workerKinds = WorkerKinds();
+  std::printf("      %u hooked Vulkan calls, %u from pipeline workers, %u from other threads; "
+    "pipeline workers created %u libraries and %u optimized pipelines, %u creates refused by the test\n",
+    hookedCalls, workerCalls, foreignCalls, workerKinds.libraries, workerKinds.optimized, workerKinds.refused);
+
+  Check(workerOtherCalls == 0u, "pipeline workers make no Vulkan call but pipeline creation (E2, BD-216)");
+
+  if (compileMode == CompileMode::CallingThread) {
+    Check(workerCalls == 0u && workerKinds.refused == 0u,
+      "dxvk.compilePipelinesOnWorkers = False: no Vulkan call on a pipeline worker");
+  } else if (!drawLinks) {
+    std::printf("      no fast-linked pipeline on this device: no optimized pipeline for the workers\n");
+  } else if (compileMode == CompileMode::Workers) {
+    // A library can go either way: a draw right after CreateShader compiles it before a worker gets to it
+    Check(workerKinds.optimized > 0u,
+      "pipeline workers create the optimized pipelines (dxvk.compilePipelinesOnWorkers, control)");
+  } else {
+    Check(workerKinds.refused > 0u && workerKinds.libraries == 0u && workerKinds.optimized == 0u,
+      "refused worker creates: the test refused them and no worker pipeline reached the driver (control)");
+  }
 
   uint32_t submits = HookStats("vkQueueSubmit").calls + HookStats("vkQueueSubmit2").calls
                    + HookStats("vkQueueSubmit2KHR").calls;
 
   Check(submits > 0u && HookStats("vkAllocateMemory").calls > 0u && HookStats("vkCreateGraphicsPipelines").calls > 0u,
     "the census sees the engine's submissions, allocations and pipelines (control for the hooks)");
-  Check(foreignCalls == 0u, "every hooked Vulkan call of the engine ran on the calling thread (E2)");
+  Check(foreignCalls == 0u, "every other hooked Vulkan call of the engine ran on the calling thread (E2)");
 
   // ---- Log service ----
   std::printf("      %u log lines, %zu at level 1\n", linesAtRelease, shell.errors.size());
