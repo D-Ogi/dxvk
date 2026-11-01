@@ -21,6 +21,7 @@
 #include "d3d11_interop.h"
 #include "d3d11_on_12.h"
 #include "d3d11_options.h"
+#include "d3d11_runtime_private.h"
 #include "d3d11_shader.h"
 #include "d3d11_state.h"
 #include "d3d11_util.h"
@@ -854,6 +855,158 @@ namespace dxvk {
 
 
   /**
+   * \brief Partner device interface of the Windows D3D11 runtime
+   *
+   * d2d1.dll stops ID2D1Factory::CreateDevice with E_NOINTERFACE if the
+   * device does not give this interface (BD-241). It calls no method of
+   * it when it creates the device and the device context, draws text and
+   * reads back a bitmap (measured with the Windows runtime). The methods
+   * that the runtime implements for DWM and composition return E_NOTIMPL
+   * or do nothing; offer and reclaim use the IDXGIDevice2 functions.
+   */
+  class D3D11PartnerDevice : public ID3D11PartnerDevice3_DXVK {
+
+  public:
+
+    D3D11PartnerDevice(
+            D3D11DXGIDevice*        pContainer,
+            D3D11Device*            pDevice);
+
+    ULONG STDMETHODCALLTYPE AddRef();
+
+    ULONG STDMETHODCALLTYPE Release();
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(
+            REFIID                  riid,
+            void**                  ppvObject);
+
+    HRESULT STDMETHODCALLTYPE BeginGuardRectangleSupport();
+
+    void STDMETHODCALLTYPE EndGuardRectangleSupport();
+
+    HRESULT STDMETHODCALLTYPE CreateGuardableTexture2D(
+      const D3D11_TEXTURE2D_DESC*         pDesc,
+      const D3D11_SUBRESOURCE_DATA*       pInitialData,
+            ID3D11Texture2D**             ppTexture2D);
+
+    void STDMETHODCALLTYPE SetGuardRect(
+            ID3D11Texture2D*              pTexture,
+            RECT                          Rect);
+
+    void STDMETHODCALLTYPE SetEmptyGuardRect(
+            ID3D11Texture2D*              pTexture);
+
+    void STDMETHODCALLTYPE SetUnguarded(
+            ID3D11Texture2D*              pTexture);
+
+    HRESULT STDMETHODCALLTYPE OfferResourcesInternal(
+            UINT                          NumResources,
+            IDXGIResource* const*         ppResources,
+            DXGI_OFFER_RESOURCE_PRIORITY  Priority,
+            UINT                          Flags);
+
+    HRESULT STDMETHODCALLTYPE ReclaimResourcesInternal(
+            UINT                          NumResources,
+            IDXGIResource* const*         ppResources,
+            DXGI_RECLAIM_RESOURCE_RESULTS* pResults);
+
+    UINT STDMETHODCALLTYPE GetPartnerCaps();
+
+    HRESULT STDMETHODCALLTYPE CreateCompositionBuffer(
+            UINT                          Width,
+            UINT                          Height,
+            DXGI_FORMAT                   Format,
+            INT                           Arg3,
+            UINT                          Arg4,
+            UINT                          Arg5,
+            REFGUID                       riid,
+            void**                        ppBuffer,
+            void**                        ppArg8);
+
+    HRESULT STDMETHODCALLTYPE PresentCompositionBuffers(
+            void*                         hArg0,
+            IUnknown* const*              ppBuffers,
+            UINT                          NumBuffers);
+
+    void STDMETHODCALLTYPE GetGuardRect(
+            ID3D11Texture2D*              pTexture,
+            INT*                          pEnabled,
+            RECT*                         pRect);
+
+    HRESULT STDMETHODCALLTYPE CreateSynchronizedChannel(
+            ID3D11SynchronizedChannel**   ppChannel);
+
+    HRESULT STDMETHODCALLTYPE OpenSynchronizedChannel(
+            void*                         hChannel,
+            ID3D11SynchronizedChannel**   ppChannel);
+
+    HRESULT STDMETHODCALLTYPE PresentFlipManagerToken(
+            void*                         hArg0,
+            UINT64                        Arg1,
+            UINT64                        Arg2,
+            UINT                          Arg3,
+            UINT                          Arg4,
+            IUnknown* const*              ppArg5,
+            UINT                          Arg6);
+
+    HRESULT STDMETHODCALLTYPE CancelFlipManagerPresent(
+            LUID                          AdapterLuid,
+            UINT64                        Arg1,
+            UINT64                        Arg2);
+
+    HRESULT STDMETHODCALLTYPE EnableVariableRefreshForProcess();
+
+    HRESULT STDMETHODCALLTYPE FlushCompletedPresents(
+            LUID                          AdapterLuid,
+            void*                         pArg1);
+
+  private:
+
+    D3D11DXGIDevice* m_container;
+    D3D11Device*     m_device;
+
+    static void WarnOnce(std::atomic<bool>& Warned, const char* pMethod);
+
+  };
+
+
+  /**
+   * \brief Private information interface that d2d1.dll requires
+   *
+   * d2d1.dll stops ID2D1Factory::CreateDevice with E_NOINTERFACE if the
+   * device does not give this interface (BD-241). It reads the flush count
+   * when it creates the device and at BeginDraw and EndDraw, and compares
+   * it with the value it saved: a different value means that the immediate
+   * context was flushed in between. The value must change on every flush
+   * of the immediate context; a change without a flush only costs time.
+   */
+  class D3D11PrivateInfo : public ID2DPrivateInfo_DXVK {
+
+  public:
+
+    D3D11PrivateInfo(
+            D3D11DXGIDevice*        pContainer,
+            D3D11Device*            pDevice);
+
+    ULONG STDMETHODCALLTYPE AddRef();
+
+    ULONG STDMETHODCALLTYPE Release();
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(
+            REFIID                  riid,
+            void**                  ppvObject);
+
+    UINT64 STDMETHODCALLTYPE ConservativeFlushCount();
+
+  private:
+
+    D3D11DXGIDevice* m_container;
+    D3D11Device*     m_device;
+
+  };
+
+
+  /**
    * \brief DXVK swap chain factory
    */
   class DXGIVkSwapChainFactory : public IDXGIVkSwapChainFactory {
@@ -1017,6 +1170,8 @@ namespace dxvk {
     D3D11VkInterop      m_d3d11Interop;
     D3D11VideoDevice    m_d3d11Video;
     D3D11ReflexDevice   m_d3d11Reflex;
+    D3D11PartnerDevice  m_d3d11Partner;
+    D3D11PrivateInfo    m_d3d11PrivateInfo;
     D3D11on12Device     m_d3d11on12;
     DXGIDXVKDevice      m_metaDevice;
     

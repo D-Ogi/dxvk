@@ -101,6 +101,18 @@ namespace dxvk {
       return m_multithread.AcquireLock();
     }
 
+    /**
+     * \brief Number of flushes that submitted work
+     *
+     * Grows with every flush of the immediate context that submits
+     * commands. Any thread may read it. d2d1.dll reads it through
+     * ID2DPrivateInfo to see whether the context was flushed (BD-241).
+     * \returns The submission ID of the last flush
+     */
+    uint64_t GetFlushCount() const {
+      return m_flushCount.load(std::memory_order_acquire);
+    }
+
     void InjectCsChunk(
             DxvkCsQueue                 Queue,
             DxvkCsChunkRef&&            Chunk,
@@ -194,6 +206,7 @@ namespace dxvk {
 
     Rc<sync::CallbackFence> m_submissionFence;
     uint64_t                m_submissionId = 0ull;
+    std::atomic<uint64_t>   m_flushCount = { 0ull };
     DxvkSubmitStatus        m_submitStatus;
 
     uint64_t                m_flushSeqNum = 0ull;

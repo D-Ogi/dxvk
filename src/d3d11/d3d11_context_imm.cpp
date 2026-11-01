@@ -1299,6 +1299,7 @@ namespace dxvk {
 
     // Signal the submission fence and flush the command list
     uint64_t submissionId = ++m_submissionId;
+    m_flushCount.store(submissionId, std::memory_order_release);
 
     if (hEvent) {
       m_submissionFence->setCallback(submissionId, [hEvent] {

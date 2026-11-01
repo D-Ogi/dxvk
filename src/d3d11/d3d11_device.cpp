@@ -1326,10 +1326,16 @@ namespace dxvk {
     if (!pFeatureLevels || !FeatureLevels)
       return E_INVALIDARG;
 
+    // d2d1.dll passes ID3D11Device3 (BD-241), and the Windows
+    // runtime accepts every ID3D11Device revision here.
     if (EmulatedInterface != __uuidof(ID3D10Device)
      && EmulatedInterface != __uuidof(ID3D10Device1)
      && EmulatedInterface != __uuidof(ID3D11Device)
-     && EmulatedInterface != __uuidof(ID3D11Device1))
+     && EmulatedInterface != __uuidof(ID3D11Device1)
+     && EmulatedInterface != __uuidof(ID3D11Device2)
+     && EmulatedInterface != __uuidof(ID3D11Device3)
+     && EmulatedInterface != __uuidof(ID3D11Device4)
+     && EmulatedInterface != __uuidof(ID3D11Device5))
       return E_INVALIDARG;
 
     D3D_FEATURE_LEVEL featureLevel = D3D_FEATURE_LEVEL();
@@ -3687,6 +3693,234 @@ namespace dxvk {
 
 
 
+  D3D11PartnerDevice::D3D11PartnerDevice(
+          D3D11DXGIDevice*        pContainer,
+          D3D11Device*            pDevice)
+  : m_container(pContainer), m_device(pDevice) {
+
+  }
+
+
+  ULONG STDMETHODCALLTYPE D3D11PartnerDevice::AddRef() {
+    return m_container->AddRef();
+  }
+
+
+  ULONG STDMETHODCALLTYPE D3D11PartnerDevice::Release() {
+    return m_container->Release();
+  }
+
+
+  HRESULT STDMETHODCALLTYPE D3D11PartnerDevice::QueryInterface(
+          REFIID                  riid,
+          void**                  ppvObject) {
+    return m_container->QueryInterface(riid, ppvObject);
+  }
+
+
+  void D3D11PartnerDevice::WarnOnce(std::atomic<bool>& Warned, const char* pMethod) {
+    if (!Warned.exchange(true))
+      Logger::warn(str::format("D3D11PartnerDevice::", pMethod, ": Not supported"));
+  }
+
+
+  HRESULT STDMETHODCALLTYPE D3D11PartnerDevice::BeginGuardRectangleSupport() {
+    static std::atomic<bool> s_warned = { false };
+    WarnOnce(s_warned, "BeginGuardRectangleSupport");
+    return E_NOTIMPL;
+  }
+
+
+  void STDMETHODCALLTYPE D3D11PartnerDevice::EndGuardRectangleSupport() {
+
+  }
+
+
+  HRESULT STDMETHODCALLTYPE D3D11PartnerDevice::CreateGuardableTexture2D(
+    const D3D11_TEXTURE2D_DESC*         pDesc,
+    const D3D11_SUBRESOURCE_DATA*       pInitialData,
+          ID3D11Texture2D**             ppTexture2D) {
+    InitReturnPtr(ppTexture2D);
+    static std::atomic<bool> s_warned = { false };
+    WarnOnce(s_warned, "CreateGuardableTexture2D");
+    return E_NOTIMPL;
+  }
+
+
+  void STDMETHODCALLTYPE D3D11PartnerDevice::SetGuardRect(
+          ID3D11Texture2D*              pTexture,
+          RECT                          Rect) {
+
+  }
+
+
+  void STDMETHODCALLTYPE D3D11PartnerDevice::SetEmptyGuardRect(
+          ID3D11Texture2D*              pTexture) {
+
+  }
+
+
+  void STDMETHODCALLTYPE D3D11PartnerDevice::SetUnguarded(
+          ID3D11Texture2D*              pTexture) {
+
+  }
+
+
+  HRESULT STDMETHODCALLTYPE D3D11PartnerDevice::OfferResourcesInternal(
+          UINT                          NumResources,
+          IDXGIResource* const*         ppResources,
+          DXGI_OFFER_RESOURCE_PRIORITY  Priority,
+          UINT                          Flags) {
+    return m_container->OfferResources1(NumResources, ppResources, Priority, Flags);
+  }
+
+
+  HRESULT STDMETHODCALLTYPE D3D11PartnerDevice::ReclaimResourcesInternal(
+          UINT                          NumResources,
+          IDXGIResource* const*         ppResources,
+          DXGI_RECLAIM_RESOURCE_RESULTS* pResults) {
+    return m_container->ReclaimResources1(NumResources, ppResources, pResults);
+  }
+
+
+  UINT STDMETHODCALLTYPE D3D11PartnerDevice::GetPartnerCaps() {
+    return 0u;
+  }
+
+
+  HRESULT STDMETHODCALLTYPE D3D11PartnerDevice::CreateCompositionBuffer(
+          UINT                          Width,
+          UINT                          Height,
+          DXGI_FORMAT                   Format,
+          INT                           Arg3,
+          UINT                          Arg4,
+          UINT                          Arg5,
+          REFGUID                       riid,
+          void**                        ppBuffer,
+          void**                        ppArg8) {
+    InitReturnPtr(ppBuffer);
+    InitReturnPtr(ppArg8);
+    static std::atomic<bool> s_warned = { false };
+    WarnOnce(s_warned, "CreateCompositionBuffer");
+    return E_NOTIMPL;
+  }
+
+
+  HRESULT STDMETHODCALLTYPE D3D11PartnerDevice::PresentCompositionBuffers(
+          void*                         hArg0,
+          IUnknown* const*              ppBuffers,
+          UINT                          NumBuffers) {
+    static std::atomic<bool> s_warned = { false };
+    WarnOnce(s_warned, "PresentCompositionBuffers");
+    return E_NOTIMPL;
+  }
+
+
+  void STDMETHODCALLTYPE D3D11PartnerDevice::GetGuardRect(
+          ID3D11Texture2D*              pTexture,
+          INT*                          pEnabled,
+          RECT*                         pRect) {
+    if (pEnabled)
+      *pEnabled = FALSE;
+
+    if (pRect)
+      *pRect = RECT();
+  }
+
+
+  HRESULT STDMETHODCALLTYPE D3D11PartnerDevice::CreateSynchronizedChannel(
+          ID3D11SynchronizedChannel**   ppChannel) {
+    InitReturnPtr(ppChannel);
+    static std::atomic<bool> s_warned = { false };
+    WarnOnce(s_warned, "CreateSynchronizedChannel");
+    return E_NOTIMPL;
+  }
+
+
+  HRESULT STDMETHODCALLTYPE D3D11PartnerDevice::OpenSynchronizedChannel(
+          void*                         hChannel,
+          ID3D11SynchronizedChannel**   ppChannel) {
+    InitReturnPtr(ppChannel);
+    static std::atomic<bool> s_warned = { false };
+    WarnOnce(s_warned, "OpenSynchronizedChannel");
+    return E_NOTIMPL;
+  }
+
+
+  HRESULT STDMETHODCALLTYPE D3D11PartnerDevice::PresentFlipManagerToken(
+          void*                         hArg0,
+          UINT64                        Arg1,
+          UINT64                        Arg2,
+          UINT                          Arg3,
+          UINT                          Arg4,
+          IUnknown* const*              ppArg5,
+          UINT                          Arg6) {
+    static std::atomic<bool> s_warned = { false };
+    WarnOnce(s_warned, "PresentFlipManagerToken");
+    return E_NOTIMPL;
+  }
+
+
+  HRESULT STDMETHODCALLTYPE D3D11PartnerDevice::CancelFlipManagerPresent(
+          LUID                          AdapterLuid,
+          UINT64                        Arg1,
+          UINT64                        Arg2) {
+    static std::atomic<bool> s_warned = { false };
+    WarnOnce(s_warned, "CancelFlipManagerPresent");
+    return E_NOTIMPL;
+  }
+
+
+  HRESULT STDMETHODCALLTYPE D3D11PartnerDevice::EnableVariableRefreshForProcess() {
+    static std::atomic<bool> s_warned = { false };
+    WarnOnce(s_warned, "EnableVariableRefreshForProcess");
+    return E_NOTIMPL;
+  }
+
+
+  HRESULT STDMETHODCALLTYPE D3D11PartnerDevice::FlushCompletedPresents(
+          LUID                          AdapterLuid,
+          void*                         pArg1) {
+    static std::atomic<bool> s_warned = { false };
+    WarnOnce(s_warned, "FlushCompletedPresents");
+    return E_NOTIMPL;
+  }
+
+
+
+
+  D3D11PrivateInfo::D3D11PrivateInfo(
+          D3D11DXGIDevice*        pContainer,
+          D3D11Device*            pDevice)
+  : m_container(pContainer), m_device(pDevice) {
+
+  }
+
+
+  ULONG STDMETHODCALLTYPE D3D11PrivateInfo::AddRef() {
+    return m_container->AddRef();
+  }
+
+
+  ULONG STDMETHODCALLTYPE D3D11PrivateInfo::Release() {
+    return m_container->Release();
+  }
+
+
+  HRESULT STDMETHODCALLTYPE D3D11PrivateInfo::QueryInterface(
+          REFIID                  riid,
+          void**                  ppvObject) {
+    return m_container->QueryInterface(riid, ppvObject);
+  }
+
+
+  UINT64 STDMETHODCALLTYPE D3D11PrivateInfo::ConservativeFlushCount() {
+    return m_device->GetContext()->GetFlushCount();
+  }
+
+
+
+
   DXGIVkSwapChainFactory::DXGIVkSwapChainFactory(
           D3D11DXGIDevice*        pContainer,
           D3D11Device*            pDevice)
@@ -3813,6 +4047,8 @@ namespace dxvk {
     m_d3d11Interop  (this, &m_d3d11Device),
     m_d3d11Video    (this, &m_d3d11Device),
     m_d3d11Reflex   (this, &m_d3d11Device),
+    m_d3d11Partner  (this, &m_d3d11Device),
+    m_d3d11PrivateInfo(this, &m_d3d11Device),
     m_d3d11on12     (this, &m_d3d11Device, pD3D12Device, pD3D12Queue),
     m_metaDevice    (this),
     m_dxvkFactory   (this, &m_d3d11Device),
@@ -3888,6 +4124,20 @@ namespace dxvk {
 
     if (riid == __uuidof(ID3DLowLatencyDevice)) {
       *ppvObject = ref(&m_d3d11Reflex);
+      return S_OK;
+    }
+
+    // Private interfaces of the Windows D3D11 runtime that
+    // ID2D1Factory::CreateDevice of d2d1.dll requires (BD-241)
+    if (riid == __uuidof(ID3D11PartnerDevice3_DXVK)
+     || riid == ID3D11PartnerDevice3_DXVK_Alias1
+     || riid == ID3D11PartnerDevice3_DXVK_Alias2) {
+      *ppvObject = ref(&m_d3d11Partner);
+      return S_OK;
+    }
+
+    if (riid == __uuidof(ID2DPrivateInfo_DXVK)) {
+      *ppvObject = ref(&m_d3d11PrivateInfo);
       return S_OK;
     }
 
