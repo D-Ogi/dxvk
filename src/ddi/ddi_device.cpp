@@ -80,7 +80,8 @@ namespace dxvk::ddi {
      || riid == __uuidof(IBc250DxvkDevice1)
      || riid == __uuidof(IBc250DxvkDevice2)
      || riid == __uuidof(IBc250DxvkDevice3)
-     || riid == __uuidof(IBc250DxvkDevice4)) {
+     || riid == __uuidof(IBc250DxvkDevice4)
+     || riid == __uuidof(IBc250DxvkDevice5)) {
       *ppvObject = ref(this);
       return S_OK;
     }
@@ -1039,6 +1040,200 @@ namespace dxvk::ddi {
       case DxvkDeferredError::OutOfMemory: return E_OUTOFMEMORY;
       default:                             return E_FAIL;
     }
+  }
+
+
+  HRESULT Bc250DxvkDevice::GetOfferTargets(
+          ID3D11Resource*                   pResource,
+          OfferTargets*                     pTargets) {
+    constexpr UINT SharedFlags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX
+      | D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_TILED | D3D11_RESOURCE_MISC_TILE_POOL;
+
+    D3D11_RESOURCE_DIMENSION dimension = D3D11_RESOURCE_DIMENSION_UNKNOWN;
+    pResource->GetType(&dimension);
+
+    if (dimension == D3D11_RESOURCE_DIMENSION_BUFFER) {
+      auto buffer = static_cast<D3D11Buffer*>(pResource);
+
+      if ((buffer->Desc()->MiscFlags & SharedFlags) || buffer->GetBuffer() == nullptr)
+        return S_FALSE;
+
+      pTargets->d3d11Buffer = buffer;
+      pTargets->buffers.push_back(buffer->GetBuffer());
+      return S_OK;
+    }
+
+    D3D11CommonTexture* texture = GetCommonTexture(pResource);
+
+    if (!texture || (texture->Desc()->MiscFlags & SharedFlags))
+      return S_FALSE;
+
+    switch (texture->GetMapMode()) {
+      case D3D11_COMMON_TEXTURE_MAP_MODE_NONE:
+        pTargets->images.push_back(texture->GetImage());
+        return S_OK;
+
+      case D3D11_COMMON_TEXTURE_MAP_MODE_STAGING:
+        for (UINT i = 0u; i < texture->CountSubresources(); i++) {
+          Rc<DxvkBuffer> buffer = texture->GetMappedBuffer(i);
+
+          // A subresource the application holds mapped keeps its pointer
+          if (buffer == nullptr || texture->GetMapType(i) != D3D11CommonTexture::UnmappedSubresource)
+            return S_FALSE;
+
+          pTargets->buffers.push_back(std::move(buffer));
+        }
+
+        return S_OK;
+
+      default:
+        // Dynamic and directly mapped textures live in suballocated host memory
+        return S_FALSE;
+    }
+  }
+
+
+  HRESULT STDMETHODCALLTYPE Bc250DxvkDevice::PrepareOffer(
+          ID3D11Resource*                   pResource,
+          UINT                              Capacity,
+          BC250_DXVK_OFFER_MEMORY*          pMemory,
+          UINT*                             pCount) {
+    if (!pResource || !pCount || (Capacity && !pMemory))
+      return E_INVALIDARG;
+
+    *pCount = 0u;
+
+    try {
+      OfferTargets targets;
+
+      if (GetOfferTargets(pResource, &targets) != S_OK)
+        return S_FALSE;
+
+      size_t total = targets.buffers.size() + targets.images.size();
+
+      if (!total || total > Capacity)
+        return S_FALSE;
+
+      // Pending work that reads CPU-mapped storage must have run before its map goes (E3)
+      m_context->Flush();
+
+      // Mapped storage cannot move (DxvkBuffer::canRelocate): it qualifies only when it was created on
+      // memory of its own. GPU-only storage moves now, at its first offer.
+      std::vector<Rc<DxvkBuffer>> moveBuffers;
+      std::vector<Rc<DxvkImage>> moveImages;
+
+      for (const auto& buffer : targets.buffers) {
+        auto storage = buffer->storage();
+
+        if (storage->isDedicatedMemory())
+          continue;
+
+        if (storage->mapPtr())
+          return S_FALSE;
+
+        moveBuffers.push_back(buffer);
+      }
+
+      for (const auto& image : targets.images) {
+        if (!image->storage()->isDedicatedMemory())
+          moveImages.push_back(image);
+      }
+
+      if (!moveBuffers.empty() || !moveImages.empty()) {
+        m_context->RelocateToDedicatedMemory(moveBuffers.data(), moveBuffers.size(),
+          moveImages.data(), moveImages.size());
+        m_context->Flush();
+      }
+
+      // The context executed the relocation; a resource that did not move (no memory, or not movable) is
+      // not offerable, and nothing was unmapped yet
+      for (const auto& buffer : targets.buffers) {
+        if (!buffer->storage()->isDedicatedMemory())
+          return S_FALSE;
+      }
+
+      for (const auto& image : targets.images) {
+        if (!image->storage()->isDedicatedMemory())
+          return S_FALSE;
+      }
+
+      UINT count = 0u;
+
+      for (const auto& buffer : targets.buffers) {
+        buffer->releaseStorageMapping();
+
+        DxvkResourceMemoryInfo info = buffer->storage()->getMemoryInfo();
+        pMemory[count++] = { info.memory, info.size };
+      }
+
+      for (const auto& image : targets.images) {
+        DxvkResourceMemoryInfo info = image->storage()->getMemoryInfo();
+        pMemory[count++] = { info.memory, info.size };
+      }
+
+      if (targets.d3d11Buffer)
+        targets.d3d11Buffer->RefreshMapPtr();
+
+      *pCount = count;
+    } catch (const DxvkError& e) {
+      Logger::err(str::format("amdgpu_wddm_dxvk: PrepareOffer: ", e.message()));
+      *pCount = 0u;
+      return GetErrorResult(e, E_FAIL);
+    }
+
+    HRESULT status = CheckDeviceStatus();
+    return FAILED(status) ? status : S_OK;
+  }
+
+
+  HRESULT STDMETHODCALLTYPE Bc250DxvkDevice::EndOffer(
+          ID3D11Resource*                   pResource,
+          UINT                              Flags) {
+    if (!pResource)
+      return E_INVALIDARG;
+
+    HRESULT result = S_OK;
+
+    try {
+      OfferTargets targets;
+
+      if (GetOfferTargets(pResource, &targets) != S_OK)
+        return CheckDeviceStatus();
+
+      for (const auto& buffer : targets.buffers) {
+        if (!buffer->storage()->isMapReleased())
+          continue;
+
+        VkResult vr = buffer->restoreStorageMapping();
+
+        if (vr != VK_SUCCESS) {
+          Logger::err(str::format("amdgpu_wddm_dxvk: EndOffer: vkMapMemory failed: ", vr));
+          result = E_OUTOFMEMORY;
+        }
+      }
+
+      if (targets.d3d11Buffer)
+        targets.d3d11Buffer->RefreshMapPtr();
+
+      if (Flags & BC250_DXVK_END_OFFER_DISCARDED) {
+        // Only images that PrepareOffer put on memory of their own can have been offered
+        std::vector<Rc<DxvkImage>> images;
+
+        for (const auto& image : targets.images) {
+          if (image->storage()->isDedicatedMemory())
+            images.push_back(image);
+        }
+
+        if (!images.empty())
+          m_context->InitDiscardedImages(images.data(), images.size());
+      }
+    } catch (const DxvkError& e) {
+      Logger::err(str::format("amdgpu_wddm_dxvk: EndOffer: ", e.message()));
+      return GetErrorResult(e, E_FAIL);
+    }
+
+    HRESULT status = CheckDeviceStatus();
+    return FAILED(status) ? status : result;
   }
 
 

@@ -46,7 +46,7 @@ namespace dxvk::ddi {
   };
 
 
-  class Bc250DxvkDevice : public ComObject<IBc250DxvkDevice4> {
+  class Bc250DxvkDevice : public ComObject<IBc250DxvkDevice5> {
 
   public:
 
@@ -132,7 +132,29 @@ namespace dxvk::ddi {
 
     HRESULT STDMETHODCALLTYPE TakeDeferredError() final;
 
+    HRESULT STDMETHODCALLTYPE PrepareOffer(
+            ID3D11Resource*                   pResource,
+            UINT                              Capacity,
+            BC250_DXVK_OFFER_MEMORY*          pMemory,
+            UINT*                             pCount) final;
+
+    HRESULT STDMETHODCALLTYPE EndOffer(
+            ID3D11Resource*                   pResource,
+            UINT                              Flags) final;
+
   private:
+
+    // The DXVK resources whose memory an offer of a D3D11 resource gives to the OS (BD-309)
+    struct OfferTargets {
+      D3D11Buffer*                d3d11Buffer = nullptr;
+      std::vector<Rc<DxvkBuffer>> buffers;
+      std::vector<Rc<DxvkImage>>  images;
+    };
+
+    // S_OK with the targets, S_FALSE if the resource cannot be offered with its memory
+    static HRESULT GetOfferTargets(
+            ID3D11Resource*                   pResource,
+            OfferTargets*                     pTargets);
 
     // View format lists handed out through GetImageCreateInfo's pNext; they live as long as the device.
     struct ViewFormatList {

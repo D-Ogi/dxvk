@@ -4,7 +4,7 @@
  * UserModeDriverName DLL) and its DXVK engine ("engine", amdgpu_wddm_dxvk.dll, DXVK fork branch
  * amdgpu-wddm/ddi-engine).
  *
- * Revision r10, ABI 1.5. This file in the DXVK fork is the only copy; the shell includes it from the DXVK
+ * Revision r11, ABI 1.6. This file in the DXVK fork is the only copy; the shell includes it from the DXVK
  * source checkout it builds against, like its other DXVK-facing headers.
  *
  * Versions. A minor version adds and never changes: an engine of minor n serves a shell built for any minor
@@ -32,6 +32,8 @@
  *   1.5  r10: Bc250DxvkEngineGetAppOptions, a second export: the dxgi.* options of DXVK's own configuration for
  *        the process (app profiles, dxvk.conf, DXVK_CONFIG), which the engine has no swap chain to apply. A shell
  *        that finds no such export (an engine before 1.5) has no options from it.
+ *   1.6  r11: IBc250DxvkDevice5 (PrepareOffer, EndOffer): the memory of an engine resource as allocations of its
+ *        own, for DXGI OfferResources and ReclaimResources of resources that have no runtime allocation (BD-309).
  *
  * WDK-free by construction. DXVK's util_gdi.h declares private extern-C D3DKMT prototypes that collide with
  * the WDK's in one translation unit, so nothing here needs d3d10umddi.h or a DXVK header: windows.h, the SDK's
@@ -122,7 +124,7 @@
 #include <vulkan/vulkan.h>
 
 #define BC250_DXVK_ENGINE_ABI_MAJOR 1u
-#define BC250_DXVK_ENGINE_ABI_MINOR 5u
+#define BC250_DXVK_ENGINE_ABI_MINOR 6u
 #define BC250_DXVK_ENGINE_ABI_VERSION ((BC250_DXVK_ENGINE_ABI_MAJOR << 16) | BC250_DXVK_ENGINE_ABI_MINOR)
 
 /* The Vulkan objects the shell owns (E1). */
@@ -427,6 +429,45 @@ IBc250DxvkDevice4 : public IBc250DxvkDevice3 {
      * should treat it as device loss. Device loss itself is reported by GetDeviceRemovedReason (E6), not here.
      * An atomic exchange: the shell may call it after every DDI entry that returns nothing. */
     virtual HRESULT STDMETHODCALLTYPE TakeDeferredError() = 0;
+};
+
+/* ABI 1.6: one memory object of an offerable resource (PrepareOffer). */
+struct BC250_DXVK_OFFER_MEMORY {
+    VkDeviceMemory Memory;                         /* a VkDeviceMemory of this resource alone */
+    VkDeviceSize Size;
+};
+
+#define BC250_DXVK_END_OFFER_DISCARDED 0x1u        /* EndOffer: the reclaim reported the content discarded */
+
+/* ABI 1.6. The same object as IBc250DxvkDevice; QueryInterface on it, E_NOINTERFACE from an older engine. */
+MIDL_INTERFACE("41dc4ca2-d34d-4b23-8ebe-c764be11ea8a")
+IBc250DxvkDevice5 : public IBc250DxvkDevice4 {
+    /* DXGI OfferResources for an engine resource (not one of E5). The shell offers kernel allocations; the
+     * engine suballocates its memory, so this call first makes the memory of the resource allocations of its
+     * own. It submits pending work as Flush does (E3). A GPU-only resource then moves, at its first offer, to
+     * a VkDeviceMemory of its own, in command order with a GPU copy, and is submitted again before the call
+     * returns (the kernel defers the offer until that copy completed). CPU-mapped storage does not move: it
+     * qualifies when it was created on memory of its own, which the engine does for staging storage of at
+     * least d3d11.offerDedicatedStagingSize bytes (default 1 MiB; for a staging texture of at most 32
+     * subresources, their sum, and one memory object per subresource). The engine then releases the persistent CPU
+     * map of every such memory (vkUnmapMemory) so that no allocation is CPU-locked at the offer; a Map of the
+     * resource is undefined until EndOffer.
+     * S_OK: every memory object of the resource is in pMemory (*pCount entries, at most Capacity); the shell
+     * gets their kernel allocations from the ICD, offers them, and calls EndOffer after the reclaim, or at once
+     * when its offer fails. S_FALSE: the resource cannot be offered (shared, tiled, imported, mapped by the
+     * application, smaller CPU-mapped storage, more than Capacity memory objects, or no memory of its own could
+     * be allocated); nothing is unmapped, *pCount is 0, and the offer is a hint. E_INVALIDARG for NULL
+     * arguments; a device-loss code as in E6. */
+    virtual HRESULT STDMETHODCALLTYPE PrepareOffer(ID3D11Resource *resource, UINT capacity,
+                                                   BC250_DXVK_OFFER_MEMORY *memory, UINT *count) = 0;
+
+    /* Ends what PrepareOffer started, after the reclaim or a failed offer: maps the memory again (the map
+     * pointer may change). With BC250_DXVK_END_OFFER_DISCARDED the content of the resource is undefined from
+     * now on: images start again from the undefined layout in command order (their metadata is valid again,
+     * the content reads zero), buffers keep what the memory holds. A resource without a PrepareOffer is left
+     * as it is. S_OK; E_OUTOFMEMORY when vkMapMemory failed (the resource then stays unmapped, and the shell
+     * reports the device lost); a device-loss code as in E6. */
+    virtual HRESULT STDMETHODCALLTYPE EndOffer(ID3D11Resource *resource, UINT flags) = 0;
 };
 
 struct BC250_DXVK_ENGINE_FUNCS {
