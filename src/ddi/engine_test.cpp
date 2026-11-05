@@ -2616,6 +2616,333 @@ int main(int argc, char** argv) {
     }
   }
 
+  // ---- ABI 1.6: offerable memory (BD-309) ----
+  {
+    // The hosted ICD's private query (Mesa src/amd/vulkan/radv_bc250_memory.h, revision 1), declared here as the
+    // shell declares it. Only a driver loaded with --icd has it; through the loader the kernel half is skipped.
+    struct MemoryAllocation {
+      uint32_t revision;
+      uint32_t size;
+      uint32_t allocation;
+      uint32_t flags;
+      uint64_t bytes;
+    };
+
+    typedef VkResult (VKAPI_PTR *PFN_GetMemoryAllocation)(VkDevice, VkDeviceMemory, MemoryAllocation*);
+    constexpr uint32_t CpuMapped = 0x1u;
+
+    auto getAllocation = icdPath ? reinterpret_cast<PFN_GetMemoryAllocation>(
+      vk.getInstanceProcAddr(VK_NULL_HANDLE, "bc250GetMemoryAllocation")) : nullptr;
+
+    // VK_SUCCESS and the allocation, or the VkResult; flags in *pFlags
+    auto queryAllocation = [&] (VkDeviceMemory memory, uint32_t* pFlags) -> uint32_t {
+      MemoryAllocation info = { 1u, uint32_t(sizeof(MemoryAllocation)) };
+      VkResult vr = getAllocation(device, memory, &info);
+      *pFlags = info.flags;
+      return vr == VK_SUCCESS ? info.allocation : 0u;
+    };
+
+    Microsoft::WRL::ComPtr<IBc250DxvkDevice5> engine5;
+
+    if (CheckHr(engine->QueryInterface(IID_PPV_ARGS(&engine5)), "QueryInterface IBc250DxvkDevice5")) {
+      if (!getAllocation)
+        std::printf("SKIP  kernel allocations of offerable memory: %s\n",
+          icdPath ? "the ICD has no bc250GetMemoryAllocation" : "no --icd, the loader does not pass private queries");
+
+      constexpr UINT Side = 1024u;                  // 4 MiB of RGBA8, the size of the HLK Working Set texture
+      constexpr UINT Bytes = Side * Side * 4u;
+
+      auto fill = [] (UINT seed) {
+        std::vector<uint32_t> data(Bytes / 4u);
+
+        for (size_t i = 0u; i < data.size(); i++)
+          data[i] = uint32_t(i * 2654435761u) ^ seed;
+
+        return data;
+      };
+
+      // Reads a 2D texture or a buffer back through a staging copy; empty on failure
+      auto readBack = [&] (ID3D11Resource* resource) {
+        std::vector<uint32_t> result;
+        D3D11_RESOURCE_DIMENSION dim = D3D11_RESOURCE_DIMENSION_UNKNOWN;
+        resource->GetType(&dim);
+
+        Microsoft::WRL::ComPtr<ID3D11Resource> staging;
+
+        if (dim == D3D11_RESOURCE_DIMENSION_BUFFER) {
+          D3D11_BUFFER_DESC desc = { };
+          static_cast<ID3D11Buffer*>(resource)->GetDesc(&desc);
+          desc.Usage = D3D11_USAGE_STAGING; desc.BindFlags = 0u; desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+          desc.MiscFlags = 0u;
+          Microsoft::WRL::ComPtr<ID3D11Buffer> b;
+
+          if (SUCCEEDED(d3d->CreateBuffer(&desc, nullptr, &b)))
+            staging = b;
+        } else {
+          D3D11_TEXTURE2D_DESC desc = { };
+          static_cast<ID3D11Texture2D*>(resource)->GetDesc(&desc);
+          desc.Usage = D3D11_USAGE_STAGING; desc.BindFlags = 0u; desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+          desc.MiscFlags = 0u;
+          Microsoft::WRL::ComPtr<ID3D11Texture2D> t;
+
+          if (SUCCEEDED(d3d->CreateTexture2D(&desc, nullptr, &t)))
+            staging = t;
+        }
+
+        if (!staging)
+          return result;
+
+        ctx->CopyResource(staging.Get(), resource);
+
+        D3D11_MAPPED_SUBRESOURCE mapped = { };
+
+        if (FAILED(ctx->Map(staging.Get(), 0u, D3D11_MAP_READ, 0u, &mapped)))
+          return result;
+
+        result.resize(Bytes / 4u);
+
+        if (dim == D3D11_RESOURCE_DIMENSION_BUFFER) {
+          std::memcpy(result.data(), mapped.pData, Bytes);
+        } else {
+          for (UINT y = 0u; y < Side; y++)
+            std::memcpy(&result[y * Side], static_cast<const uint8_t*>(mapped.pData) + size_t(y) * mapped.RowPitch, Side * 4u);
+        }
+
+        ctx->Unmap(staging.Get(), 0u);
+        return result;
+      };
+
+      // PrepareOffer with four entries; checks the kernel half when the ICD answers
+      struct Prepared {
+        HRESULT hr = E_FAIL;
+        UINT count = ~0u;
+        BC250_DXVK_OFFER_MEMORY memory[4] = { };
+        bool allocations = true;          // every memory is a kernel allocation with no CPU lock
+      };
+
+      auto prepare = [&] (ID3D11Resource* resource, UINT capacity = 4u) {
+        Prepared p;
+        p.hr = engine5->PrepareOffer(resource, capacity, p.memory, &p.count);
+
+        if (p.hr == S_OK && getAllocation) {
+          for (UINT i = 0u; i < p.count; i++) {
+            uint32_t flags = 0u;
+            p.allocations &= queryAllocation(p.memory[i].Memory, &flags) != 0u && !(flags & CpuMapped);
+          }
+        }
+
+        return p;
+      };
+
+      BC250_DXVK_OFFER_MEMORY none[1] = { };
+      UINT noneCount = 7u;
+      Check(engine5->PrepareOffer(nullptr, 1u, none, &noneCount) == E_INVALIDARG
+         && engine5->EndOffer(nullptr, 0u) == E_INVALIDARG,
+        "PrepareOffer and EndOffer reject a NULL resource");
+
+      // 1. The Working Set case: a staging texture the CPU wrote. Its memory is its own (created so at the
+      //    default d3d11.offerDedicatedStagingSize), the CPU map goes for the offer and comes back after it.
+      D3D11_TEXTURE2D_DESC stagingDesc = { Side, Side, 1u, 1u, DXGI_FORMAT_R8G8B8A8_UNORM, { 1u, 0u },
+        D3D11_USAGE_STAGING, 0u, D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE };
+      Microsoft::WRL::ComPtr<ID3D11Texture2D> stagingTex;
+      std::vector<uint32_t> pattern = fill(0x5a5a0001u);
+
+      if (CheckHr(d3d->CreateTexture2D(&stagingDesc, nullptr, &stagingTex), "CreateTexture2D (4 MiB staging)")) {
+        D3D11_MAPPED_SUBRESOURCE mapped = { };
+
+        if (CheckHr(ctx->Map(stagingTex.Get(), 0u, D3D11_MAP_WRITE, 0u, &mapped), "Map WRITE (staging)")) {
+          for (UINT y = 0u; y < Side; y++)
+            std::memcpy(static_cast<uint8_t*>(mapped.pData) + size_t(y) * mapped.RowPitch, &pattern[y * Side], Side * 4u);
+
+          // Negative control: a subresource the application holds mapped is not offerable
+          Prepared held = prepare(stagingTex.Get());
+          Check(held.hr == S_FALSE && held.count == 0u, "PrepareOffer: a mapped staging texture is S_FALSE, count 0");
+
+          ctx->Unmap(stagingTex.Get(), 0u);
+        }
+
+        Prepared p = prepare(stagingTex.Get());
+        Check(p.hr == S_OK && p.count == 1u && p.memory[0].Memory && p.memory[0].Size >= Bytes,
+          "PrepareOffer: a 4 MiB staging texture is one memory object of at least 4 MiB");
+
+        if (getAllocation) {
+          Check(p.allocations, "PrepareOffer: the staging memory is a kernel allocation, not CPU-locked");
+
+          uint32_t flagsAfter = 0u;
+          Check(engine5->EndOffer(stagingTex.Get(), 0u) == S_OK
+             && queryAllocation(p.memory[0].Memory, &flagsAfter) != 0u && (flagsAfter & CpuMapped),
+            "EndOffer: the staging memory is CPU-mapped again (control for the unmap)");
+        } else {
+          Check(engine5->EndOffer(stagingTex.Get(), 0u) == S_OK, "EndOffer (staging)");
+        }
+
+        D3D11_MAPPED_SUBRESOURCE again = { };
+        bool same = false;
+
+        if (SUCCEEDED(ctx->Map(stagingTex.Get(), 0u, D3D11_MAP_READ, 0u, &again)) && again.pData) {
+          same = true;
+
+          for (UINT y = 0u; y < Side && same; y++)
+            same = !std::memcmp(static_cast<const uint8_t*>(again.pData) + size_t(y) * again.RowPitch, &pattern[y * Side], Side * 4u);
+
+          ctx->Unmap(stagingTex.Get(), 0u);
+        }
+
+        Check(same, "after EndOffer: Map READ of the staging texture returns what the CPU wrote");
+
+        Prepared second = prepare(stagingTex.Get());
+        Check(second.hr == S_OK && second.count == 1u && second.memory[0].Memory == p.memory[0].Memory,
+          "PrepareOffer again: the same memory object (nothing moves twice)");
+        Check(engine5->EndOffer(stagingTex.Get(), 0u) == S_OK, "EndOffer (second offer)");
+      }
+
+      // 2. Negative control for the size rule: a small staging texture shares memory and is not offerable
+      D3D11_TEXTURE2D_DESC smallDesc = stagingDesc;
+      smallDesc.Width = smallDesc.Height = 64u;
+      Microsoft::WRL::ComPtr<ID3D11Texture2D> smallTex;
+
+      if (CheckHr(d3d->CreateTexture2D(&smallDesc, nullptr, &smallTex), "CreateTexture2D (16 KiB staging)")) {
+        Prepared p = prepare(smallTex.Get());
+        Check(p.hr == S_FALSE && p.count == 0u, "PrepareOffer: a 16 KiB staging texture is S_FALSE (suballocated, mapped)");
+        Check(engine5->EndOffer(smallTex.Get(), 0u) == S_OK, "EndOffer without a PrepareOffer leaves it as it is");
+
+        D3D11_MAPPED_SUBRESOURCE mapped = { };
+        bool mapsAgain = SUCCEEDED(ctx->Map(smallTex.Get(), 0u, D3D11_MAP_WRITE, 0u, &mapped)) && mapped.pData;
+
+        if (mapsAgain)
+          ctx->Unmap(smallTex.Get(), 0u);
+
+        Check(mapsAgain, "the small staging texture still maps after the refused offer");
+      }
+
+      // 3. GPU-only textures move to memory of their own at the first offer. One keeps its content (EndOffer
+      //    without DISCARDED), the other starts again from zero (DISCARDED); each is the control of the other.
+      D3D11_TEXTURE2D_DESC defaultDesc = { Side, Side, 1u, 1u, DXGI_FORMAT_R8G8B8A8_UNORM, { 1u, 0u },
+        D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET };
+      Microsoft::WRL::ComPtr<ID3D11Texture2D> kept, discarded;
+      std::vector<uint32_t> keptPattern = fill(0x11110002u);
+
+      if (CheckHr(d3d->CreateTexture2D(&defaultDesc, nullptr, &kept), "CreateTexture2D (4 MiB default, kept)")
+       && CheckHr(d3d->CreateTexture2D(&defaultDesc, nullptr, &discarded), "CreateTexture2D (4 MiB default, discarded)")) {
+        Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> srv;
+        CheckHr(d3d->CreateShaderResourceView(kept.Get(), nullptr, &srv), "CreateShaderResourceView (offered texture)");
+
+        ctx->UpdateSubresource(kept.Get(), 0u, nullptr, keptPattern.data(), Side * 4u, 0u);
+        ctx->UpdateSubresource(discarded.Get(), 0u, nullptr, keptPattern.data(), Side * 4u, 0u);
+
+        Prepared pk = prepare(kept.Get());
+        Prepared pd = prepare(discarded.Get());
+        Check(pk.hr == S_OK && pk.count == 1u && pk.memory[0].Size >= Bytes
+           && pd.hr == S_OK && pd.count == 1u && pd.memory[0].Memory != pk.memory[0].Memory,
+          "PrepareOffer: each 4 MiB default texture is one memory object of its own");
+
+        if (getAllocation)
+          Check(pk.allocations && pd.allocations, "PrepareOffer: the default textures' memory is a kernel allocation each");
+
+        Check(engine5->EndOffer(kept.Get(), 0u) == S_OK
+           && engine5->EndOffer(discarded.Get(), BC250_DXVK_END_OFFER_DISCARDED) == S_OK,
+          "EndOffer: kept and discarded");
+
+        std::vector<uint32_t> keptData = readBack(kept.Get());
+        std::vector<uint32_t> discardedData = readBack(discarded.Get());
+
+        Check(keptData == keptPattern, "after EndOffer: the kept texture holds its content (the move copied it)");
+        Check(!discardedData.empty() && std::all_of(discardedData.begin(), discardedData.end(),
+          [] (uint32_t v) { return v == 0u; }), "after EndOffer(DISCARDED): the texture reads zero");
+
+        Prepared again = prepare(kept.Get());
+        Check(again.hr == S_OK && again.count == 1u && again.memory[0].Memory == pk.memory[0].Memory,
+          "PrepareOffer again: the moved texture keeps its memory");
+        Check(engine5->EndOffer(kept.Get(), 0u) == S_OK, "EndOffer (second offer of the default texture)");
+
+        // The view follows the moved storage: a copy through a draw is out of scope here, a read through
+        // CopyResource after the second offer is the check
+        Check(readBack(kept.Get()) == keptPattern, "after the second offer: the kept texture still holds its content");
+      }
+
+      // 4. A default buffer moves and keeps its content; a dynamic buffer is suballocated and mapped: S_FALSE
+      D3D11_BUFFER_DESC defBufDesc = { Bytes, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE };
+      D3D11_BUFFER_DESC dynBufDesc = { 1u << 16, D3D11_USAGE_DYNAMIC, D3D11_BIND_VERTEX_BUFFER, D3D11_CPU_ACCESS_WRITE };
+      Microsoft::WRL::ComPtr<ID3D11Buffer> defBuf, dynBuf;
+      std::vector<uint32_t> bufPattern = fill(0x22220003u);
+      D3D11_SUBRESOURCE_DATA bufData = { bufPattern.data() };
+
+      if (CheckHr(d3d->CreateBuffer(&defBufDesc, &bufData, &defBuf), "CreateBuffer (4 MiB default)")) {
+        Prepared p = prepare(defBuf.Get());
+        Check(p.hr == S_OK && p.count == 1u && p.memory[0].Size >= Bytes, "PrepareOffer: a default buffer is one memory object");
+
+        if (getAllocation)
+          Check(p.allocations, "PrepareOffer: the default buffer's memory is a kernel allocation");
+
+        Check(engine5->EndOffer(defBuf.Get(), 0u) == S_OK, "EndOffer (default buffer)");
+        Check(readBack(defBuf.Get()) == bufPattern, "after EndOffer: the default buffer holds its content");
+
+        // Negative control for the capacity: no room for the one memory object
+        Prepared tight = prepare(defBuf.Get(), 0u);
+        Check(tight.hr == S_FALSE && tight.count == 0u, "PrepareOffer with capacity 0 is S_FALSE, count 0");
+      }
+
+      if (CheckHr(d3d->CreateBuffer(&dynBufDesc, nullptr, &dynBuf), "CreateBuffer (64 KiB dynamic)")) {
+        Prepared p = prepare(dynBuf.Get());
+        Check(p.hr == S_FALSE && p.count == 0u, "PrepareOffer: a dynamic buffer is S_FALSE (suballocated, mapped)");
+
+        D3D11_MAPPED_SUBRESOURCE mapped = { };
+        bool maps = SUCCEEDED(ctx->Map(dynBuf.Get(), 0u, D3D11_MAP_WRITE_DISCARD, 0u, &mapped)) && mapped.pData;
+
+        if (maps)
+          ctx->Unmap(dynBuf.Get(), 0u);
+
+        Check(maps, "the dynamic buffer still maps after the refused offer");
+      }
+
+      // 5. A large staging buffer: its own memory, D3D11Buffer's cached map pointer follows the release
+      D3D11_BUFFER_DESC stagingBufDesc = { 2u << 20, D3D11_USAGE_STAGING, 0u, D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE };
+      Microsoft::WRL::ComPtr<ID3D11Buffer> stagingBuf;
+
+      if (CheckHr(d3d->CreateBuffer(&stagingBufDesc, nullptr, &stagingBuf), "CreateBuffer (2 MiB staging)")) {
+        D3D11_MAPPED_SUBRESOURCE mapped = { };
+
+        if (SUCCEEDED(ctx->Map(stagingBuf.Get(), 0u, D3D11_MAP_WRITE, 0u, &mapped))) {
+          std::memset(mapped.pData, 0x3c, 2u << 20);
+          ctx->Unmap(stagingBuf.Get(), 0u);
+        }
+
+        Prepared p = prepare(stagingBuf.Get());
+        Check(p.hr == S_OK && p.count == 1u, "PrepareOffer: a 2 MiB staging buffer is one memory object");
+
+        if (getAllocation)
+          Check(p.allocations, "PrepareOffer: the staging buffer's memory is a kernel allocation, not CPU-locked");
+
+        Check(engine5->EndOffer(stagingBuf.Get(), 0u) == S_OK, "EndOffer (staging buffer)");
+
+        D3D11_MAPPED_SUBRESOURCE again = { };
+        bool same = SUCCEEDED(ctx->Map(stagingBuf.Get(), 0u, D3D11_MAP_READ, 0u, &again)) && again.pData;
+
+        if (same) {
+          const uint8_t* bytes = static_cast<const uint8_t*>(again.pData);
+          same = bytes[0] == 0x3c && bytes[(2u << 20) - 1u] == 0x3c;
+          ctx->Unmap(stagingBuf.Get(), 0u);
+        }
+
+        Check(same, "after EndOffer: the staging buffer maps again with its content");
+      }
+
+      // 6. Negative control: a shared texture is never offered with its memory
+      D3D11_TEXTURE2D_DESC sharedDesc = defaultDesc;
+      sharedDesc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+      Microsoft::WRL::ComPtr<ID3D11Texture2D> sharedTex;
+
+      if (SUCCEEDED(d3d->CreateTexture2D(&sharedDesc, nullptr, &sharedTex))) {
+        Prepared p = prepare(sharedTex.Get());
+        Check(p.hr == S_FALSE && p.count == 0u, "PrepareOffer: a shared texture is S_FALSE");
+      } else {
+        std::printf("SKIP  shared texture offer: CreateTexture2D(MISC_SHARED) failed on this adapter\n");
+      }
+
+      Check(d3d->GetDeviceRemovedReason() == S_OK, "after the offer cases: device not removed");
+    }
+  }
+
   // ---- shaders in DDI form ----
   DdiShader vsDdi, psDdi;
   Check(CompileDdi(g_hlsl, "vs", "vs_5_0", &vsDdi), "compile VS, strip to tokens and register signatures");
