@@ -867,6 +867,26 @@ namespace dxvk {
             size_t                    count);
 
     /**
+     * \brief bc250 (BD-309): moves resources to memory of their own
+     *
+     * For the offer of a resource to the OS, which needs the resource
+     * to be one kernel allocation. In command order, with the copy of
+     * the defragmentation path (relocateResources). A resource that
+     * cannot move (DxvkPagedResource::canRelocate) or gets no dedicated
+     * memory keeps its storage. The new storage is then never moved
+     * back by defragmentation. Used by the amdgpu_wddm_dxvk engine.
+     * \param [in] buffers Buffers
+     * \param [in] bufferCount Number of buffers
+     * \param [in] images Images
+     * \param [in] imageCount Number of images
+     */
+    void relocateToDedicatedMemory(
+      const Rc<DxvkBuffer>*           buffers,
+            size_t                    bufferCount,
+      const Rc<DxvkImage>*            images,
+            size_t                    imageCount);
+
+    /**
      * \brief Generates mip maps
      * 
      * Uses blitting to generate lower mip levels from
