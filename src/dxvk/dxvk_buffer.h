@@ -38,6 +38,11 @@ namespace dxvk {
 
     /// Debug name.
     const char* debugName = nullptr;
+
+    /// bc250 (BD-309): try to give every storage of the buffer a VkDeviceMemory
+    /// of its own (DxvkAllocationMode::Dedicated), and suballocate only if that
+    /// fails. For CPU-mapped buffers the driver may offer to the OS.
+    bool dedicatedStorage = false;
   };
 
 
@@ -287,7 +292,40 @@ namespace dxvk {
       info.size = m_info.size;
       m_sharingMode.fill(info);
 
+      if (unlikely(m_info.dedicatedStorage)) {
+        DxvkAllocationInfo dedicatedInfo = allocationInfo;
+        dedicatedInfo.mode.set(DxvkAllocationMode::Dedicated);
+
+        if (auto storage = m_allocator->createBufferResource(info, dedicatedInfo, nullptr))
+          return storage;
+      }
+
       return m_allocator->createBufferResource(info, allocationInfo, cache);
+    }
+
+    /**
+     * \brief bc250 (BD-309): releases the persistent map of the current storage
+     *
+     * For an offer of the storage to the OS (DxvkMemoryAllocator::releaseMapping).
+     * mapPtr returns null until restoreStorageMapping.
+     * \returns \c true if a map was released
+     */
+    bool releaseStorageMapping() {
+      if (!m_allocator->releaseMapping(*m_storage))
+        return false;
+
+      m_bufferInfo = m_storage->getBufferInfo();
+      return true;
+    }
+
+    /**
+     * \brief bc250 (BD-309): maps the current storage again after an offer
+     * \returns \c VK_SUCCESS, or the error of vkMapMemory
+     */
+    VkResult restoreStorageMapping() {
+      VkResult vr = m_allocator->restoreMapping(*m_storage);
+      m_bufferInfo = m_storage->getBufferInfo();
+      return vr;
     }
 
     /**

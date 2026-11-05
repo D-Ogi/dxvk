@@ -998,7 +998,10 @@ namespace dxvk {
     if (unlikely(m_injectOutOfMemory) && allocationInfo.mode.isClear() && isOutOfMemoryInjected())
       throw DxvkOutOfMemoryError(str::format("Injected out of memory for buffer: ", createInfo.size, " bytes"));
 
-    if (likely(!createInfo.flags)) {
+    // bc250 (BD-309): DxvkAllocationMode::Dedicated skips the global buffers
+    const bool dedicated = allocationInfo.mode.test(DxvkAllocationMode::Dedicated);
+
+    if (likely(!createInfo.flags) && likely(!dedicated)) {
       VkMemoryRequirements memoryRequirements = { };
       memoryRequirements.size = createInfo.size;
       memoryRequirements.alignment = GlobalBufferAlignment;
@@ -1106,21 +1109,31 @@ namespace dxvk {
       // ca expect these to be long-lived and mapped, and potentially use a dedicated
       // memory type that may have unexpected size restrictions. Also make sure not
       // to ever relocate these buffers since they require a stable GPU address.
-      if (createInfo.usage & (DescriptorBufferUsage | DescriptorHeapUsage)) {
+      if (dedicated || (createInfo.usage & (DescriptorBufferUsage | DescriptorHeapUsage))) {
         VkMemoryDedicatedAllocateInfo dedicatedInfo = { VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO };
         dedicatedInfo.buffer = buffer;
 
         if ((allocation = allocateDedicatedMemory(requirements.memoryRequirements, allocationInfo, &dedicatedInfo)))
           allocation->m_flags.clr(DxvkAllocationFlag::CanMove);
+
+        // bc250 (BD-309): a dedicated request may still leave video memory, but stays dedicated
+        if (dedicated && !allocation && (allocationInfo.properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+         && !allocationInfo.mode.test(DxvkAllocationMode::NoFallback)) {
+          DxvkAllocationInfo fallbackInfo = allocationInfo;
+          fallbackInfo.properties &= ~VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+
+          if ((allocation = allocateDedicatedMemory(requirements.memoryRequirements, fallbackInfo, &dedicatedInfo)))
+            allocation->m_flags.clr(DxvkAllocationFlag::CanMove);
+        }
       }
 
       // If we have an existing global allocation from earlier, make sure it is suitable
-      if (!allocation || !(requirements.memoryRequirements.memoryTypeBits & (1u << allocation->m_type->index))
+      if (!dedicated && (!allocation || !(requirements.memoryRequirements.memoryTypeBits & (1u << allocation->m_type->index))
        || (allocation->m_size < requirements.memoryRequirements.size)
-       || (allocation->m_address & requirements.memoryRequirements.alignment))
+       || (allocation->m_address & requirements.memoryRequirements.alignment)))
         allocation = allocateMemory(requirements.memoryRequirements, allocationInfo);
 
-      if (!allocation && (allocationInfo.properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+      if (!dedicated && !allocation && (allocationInfo.properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
        && !allocationInfo.mode.test(DxvkAllocationMode::NoFallback)) {
         DxvkAllocationInfo fallbackInfo = allocationInfo;
         fallbackInfo.properties &= ~VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
@@ -1211,6 +1224,12 @@ namespace dxvk {
 
     // For shared resources, we always require a dedicated allocation
     if (next) {
+      dedicatedRequirements.requiresDedicatedAllocation = VK_TRUE;
+      dedicatedRequirements.prefersDedicatedAllocation = VK_TRUE;
+    }
+
+    // bc250 (BD-309): memory of its own or nothing, see DxvkAllocationMode::Dedicated
+    if (allocationInfo.mode.test(DxvkAllocationMode::Dedicated)) {
       dedicatedRequirements.requiresDedicatedAllocation = VK_TRUE;
       dedicatedRequirements.prefersDedicatedAllocation = VK_TRUE;
     }
@@ -2402,6 +2421,39 @@ namespace dxvk {
         allocation->m_type->devicePool.chunks[chunkIndex].canMove = false;
       }
     }
+  }
+
+
+  bool DxvkMemoryAllocator::releaseMapping(
+          DxvkResourceAllocation&     allocation) {
+    if (!allocation.isDedicatedMemory() || !allocation.m_mapPtr || allocation.m_mapReleased)
+      return false;
+
+    auto vk = m_device->vkd();
+    vk->vkUnmapMemory(vk->device(), allocation.m_memory);
+
+    allocation.m_mapPtr = nullptr;
+    allocation.m_mapReleased = true;
+    return true;
+  }
+
+
+  VkResult DxvkMemoryAllocator::restoreMapping(
+          DxvkResourceAllocation&     allocation) {
+    if (!allocation.m_mapReleased)
+      return VK_SUCCESS;
+
+    auto vk = m_device->vkd();
+    void* mapPtr = nullptr;
+
+    VkResult vr = vk->vkMapMemory(vk->device(), allocation.m_memory, 0, VK_WHOLE_SIZE, 0, &mapPtr);
+
+    if (vr != VK_SUCCESS)
+      return vr;
+
+    allocation.m_mapPtr = mapPtr;
+    allocation.m_mapReleased = false;
+    return VK_SUCCESS;
   }
 
 

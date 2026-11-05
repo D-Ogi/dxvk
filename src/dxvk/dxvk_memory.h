@@ -579,6 +579,25 @@ namespace dxvk {
     }
 
     /**
+     * \brief bc250 (BD-309): whether the allocation is a VkDeviceMemory of its own
+     *
+     * Not suballocated, not imported, not sparse: on a WDDM driver this
+     * memory is one kernel allocation, which the driver may offer to the OS.
+     */
+    bool isDedicatedMemory() const {
+      return m_flags.test(DxvkAllocationFlag::OwnsMemory)
+          && !m_flags.test(DxvkAllocationFlag::Imported)
+          && m_memory != VK_NULL_HANDLE && !m_sparsePageTable;
+    }
+
+    /**
+     * \brief bc250 (BD-309): whether the persistent map was released for an offer
+     */
+    bool isMapReleased() const {
+      return m_mapReleased;
+    }
+
+    /**
      * \brief D3DKMT resource local handle
      * \returns The resource D3DKMT local handle
      * \returns \c 0 if resource is not shared
@@ -682,6 +701,7 @@ namespace dxvk {
     VkDeviceSize                m_address = 0u;
     VkDeviceSize                m_size = 0u;
     void*                       m_mapPtr = nullptr;
+    bool                        m_mapReleased = false;
 
     VkBuffer                    m_buffer = VK_NULL_HANDLE;
     VkDeviceSize                m_bufferOffset = 0u;
@@ -1032,6 +1052,10 @@ namespace dxvk {
     NoDedicated     = 2,
     /// Do not use device memory. Used to evict resources.
     NoDeviceMemory  = 3,
+    /// bc250 (BD-309): give the resource a VkDeviceMemory of its own and fail
+    /// rather than suballocate, so that the memory is one kernel allocation
+    /// the driver can offer to the OS.
+    Dedicated       = 4,
 
     eFlagEnum
   };
@@ -1384,6 +1408,31 @@ namespace dxvk {
      */
     void lockResourceGpuAddress(
       const Rc<DxvkResourceAllocation>& allocation);
+
+    /**
+     * \brief bc250 (BD-309): releases the persistent map of a dedicated allocation
+     *
+     * An allocation offered to the OS must not be CPU-locked. Only for an
+     * allocation that owns its memory (isDedicatedMemory) and is mapped;
+     * the caller ensures that nothing reads the map pointer until
+     * restoreMapping. The cached map pointers of the resource must be
+     * refreshed afterwards.
+     * \param [in] allocation The allocation
+     * \returns \c true if the map was released
+     */
+    bool releaseMapping(
+            DxvkResourceAllocation&     allocation);
+
+    /**
+     * \brief bc250 (BD-309): maps an allocation again after releaseMapping
+     *
+     * The new map pointer may differ from the old one.
+     * \param [in] allocation The allocation
+     * \returns \c VK_SUCCESS, or the error of vkMapMemory (the
+     *    allocation then stays unmapped and releaseMapping'd)
+     */
+    VkResult restoreMapping(
+            DxvkResourceAllocation&     allocation);
 
     /**
      * \brief Performs clean-up tasks
