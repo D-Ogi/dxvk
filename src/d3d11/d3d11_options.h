@@ -83,6 +83,11 @@ namespace dxvk {
     /// an api trace.
     uint32_t cachedDynamicResources = 0;
 
+    /// bc250 (BD-309): staging storage of at least this many bytes gets
+    /// a VkDeviceMemory of its own, one kernel allocation that the driver
+    /// can offer to the OS (DXGI OfferResources). 0 disables it.
+    uint32_t offerDedicatedStagingSize = 1u << 20;
+
     /// Always lock immediate context on every API call. May be
     /// useful for debugging purposes or when applications have
     /// race conditions.

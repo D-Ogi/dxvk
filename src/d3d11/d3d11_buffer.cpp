@@ -103,6 +103,10 @@ namespace dxvk {
       VkMemoryPropertyFlags memoryFlags = GetMemoryFlags();
       m_mapMode = DetermineMapMode(memoryFlags);
 
+      // bc250 (BD-309): large staging storage is one kernel allocation that OfferResources can give back
+      uint32_t dedicatedSize = m_parent->GetOptions()->offerDedicatedStagingSize;
+      info.dedicatedStorage = pDesc->Usage == D3D11_USAGE_STAGING && dedicatedSize && info.size >= dedicatedSize;
+
       // Create the buffer and set the entire buffer slice as mapped,
       // so that we only have to update it when invalidating the buffer
       m_buffer = m_parent->GetDXVKDevice()->createBuffer(info, memoryFlags);

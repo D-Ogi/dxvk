@@ -133,6 +133,17 @@ namespace dxvk {
       return m_mapPtr;
     }
 
+    /**
+     * \brief bc250 (BD-309): reads the map pointer of the current storage again
+     *
+     * After the engine released or restored the persistent map of the
+     * storage for an offer to the OS. Null while the map is released.
+     */
+    void RefreshMapPtr() {
+      if (m_buffer != nullptr)
+        m_mapPtr = m_buffer->storage()->mapPtr();
+    }
+
     D3D10Buffer* GetD3D10Iface() {
       return &m_d3d10;
     }

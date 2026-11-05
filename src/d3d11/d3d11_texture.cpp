@@ -210,6 +210,21 @@ namespace dxvk {
      || m_mapMode == D3D11_COMMON_TEXTURE_MAP_MODE_DYNAMIC) {
       m_buffers.resize(subresourceCount);
 
+      // bc250 (BD-309): a large staging texture is one kernel allocation per subresource, so that
+      // OfferResources can give it back. The size of the whole texture decides, so that its small
+      // mips do not keep the texture from an offer; few subresources only, each is a VkDeviceMemory.
+      uint32_t dedicatedSize = m_device->GetOptions()->offerDedicatedStagingSize;
+
+      if (m_mapMode == D3D11_COMMON_TEXTURE_MAP_MODE_STAGING && dedicatedSize
+       && subresourceCount <= MaxDedicatedStagingSubresources) {
+        VkDeviceSize totalSize = 0u;
+
+        for (uint32_t i = 0; i < subresourceCount; i++)
+          totalSize += m_mapInfo[i].layout.Size;
+
+        m_dedicatedStaging = totalSize >= dedicatedSize;
+      }
+
       if (m_mapMode != D3D11_COMMON_TEXTURE_MAP_MODE_DYNAMIC) {
         for (uint32_t i = 0; i < subresourceCount; i++)
           CreateMappedBuffer(i);
@@ -881,6 +896,9 @@ namespace dxvk {
 
     if (m_desc.Usage == D3D11_USAGE_STAGING || useCached)
       memType |= VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+
+    // bc250 (BD-309): large staging storage is one kernel allocation that OfferResources can give back
+    info.dedicatedStorage = m_dedicatedStaging;
 
     auto& entry = m_buffers[Subresource];
     entry.buffer = m_device->GetDXVKDevice()->createBuffer(info, memType);

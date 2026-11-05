@@ -87,6 +87,9 @@ namespace dxvk {
 
     static constexpr uint32_t UnmappedSubresource = ~0u;
 
+    /// bc250 (BD-309): most subresources of a staging texture with dedicated memory
+    static constexpr uint32_t MaxDedicatedStagingSubresources = 32u;
+
     D3D11CommonTexture(
             ID3D11Resource*             pInterface,
             D3D11Device*                pDevice,
@@ -589,6 +592,9 @@ namespace dxvk {
     small_vector<MappedInfo, 6>   m_mapInfo;
 
     void*                         m_mapPtr = nullptr;
+
+    // bc250 (BD-309): staging buffers get memory of their own (d3d11.offerDedicatedStagingSize)
+    bool                          m_dedicatedStaging = false;
 
     void CreateMappedBuffer(
             UINT                  Subresource);
