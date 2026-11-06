@@ -47,6 +47,11 @@ executable('amdgpu_wddm_dxvk_cache_quota_test', 'cache_quota_test.cpp',
   install             : false,
 )
 
+# Host test of the colour transform of the video processor blit (a pure function; no GPU).
+executable('amdgpu_wddm_dxvk_video_csc_test', 'video_csc_test.cpp',
+  install             : false,
+)
+
 # Offline positive control: plays the UMD shell against the DLL on any Vulkan 1.3 GPU (engine_test.cpp).
 # It uses only the ABI header, never DXVK internals, so it also checks that the header stands alone.
 executable('amdgpu_wddm_dxvk_engine_test', 'engine_test.cpp',

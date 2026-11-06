@@ -2,6 +2,7 @@
 
 #include "d3d11_context_imm.h"
 #include "d3d11_video.h"
+#include "d3d11_video_csc.h"
 
 #include <d3d11_video_blit_frag.h>
 #include <d3d11_video_blit_vert.h>
@@ -1219,6 +1220,7 @@ namespace dxvk {
     bool hasStreamsEnabled = false;
 
     m_dstIsYCbCr = outputView.IsYCbCr();
+    m_dstColorSpace = videoProcessor->GetState()->outputColorSpace;
 
     for (uint32_t vi = 0; vi < views.size(); vi++) {
       if (!views[vi])
@@ -1360,46 +1362,6 @@ namespace dxvk {
   }
 
 
-  void D3D11VideoContext::ApplyColorMatrix(float pDst[3][4], const float pSrc[3][4]) {
-    float result[3][4];
-
-    for (uint32_t i = 0; i < 3; i++) {
-      for (uint32_t j = 0; j < 4; j++) {
-        result[i][j] = pSrc[i][0] * pDst[0][j]
-                     + pSrc[i][1] * pDst[1][j]
-                     + pSrc[i][2] * pDst[2][j]
-                     + pSrc[i][3] * float(j == 3);
-      }
-    }
-
-    memcpy(pDst, &result[0][0], sizeof(result));
-  }
-
-
-  void D3D11VideoContext::ApplyYCbCrMatrix(float pColorMatrix[3][4], bool UseBt709) {
-    static const float pretransform[3][4] = {
-      { 0.0f, 1.0f, 0.0f,  0.0f },
-      { 0.0f, 0.0f, 1.0f, -0.5f },
-      { 1.0f, 0.0f, 0.0f, -0.5f },
-    };
-
-    static const float bt601[3][4] = {
-      { 1.0f,  0.000000f,  1.402000f, 0.0f },
-      { 1.0f, -0.344136f, -0.714136f, 0.0f },
-      { 1.0f,  1.772000f,  0.000000f, 0.0f },
-    };
-
-    static const float bt709[3][4] = {
-      { 1.0f,  0.000000f,  1.574800f, 0.0f },
-      { 1.0f, -0.187324f, -0.468124f, 0.0f },
-      { 1.0f,  1.855600f,  0.000000f, 0.0f },
-    };
-
-    ApplyColorMatrix(pColorMatrix, pretransform);
-    ApplyColorMatrix(pColorMatrix, UseBt709 ? bt709 : bt601);
-  }
-
-
   void D3D11VideoContext::BindOutputView(
           Rc<DxvkImageView>               View,
           Rc<DxvkImageView>               FirstView) {
@@ -1458,6 +1420,7 @@ namespace dxvk {
       cViews        = view.GetViews(),
       cSrcIsYCbCr   = view.IsYCbCr(),
       cDstIsYCbCr   = m_dstIsYCbCr,
+      cDstSpace     = m_dstColorSpace,
       cDstExtent    = m_dstExtent,
       cDstSizeFactX = m_dstSizeFact[0],
       cDstSizeFactY = m_dstSizeFact[1],
@@ -1506,9 +1469,6 @@ namespace dxvk {
       }
 
       UboData uboData = { };
-      uboData.colorMatrix[0][0] = 1.0f;
-      uboData.colorMatrix[1][1] = 1.0f;
-      uboData.colorMatrix[2][2] = 1.0f;
       uboData.coordMatrix[0][0] = float(srcRect.extent.width) / float(viewExtent.width);
       uboData.coordMatrix[1][1] = float(srcRect.extent.height) / float(viewExtent.height);
       uboData.coordMatrix[2][0] = float(srcRect.offset.x) / float(viewExtent.width);
@@ -1519,13 +1479,14 @@ namespace dxvk {
       uboData.isPlanar = cViews[1] != nullptr;
       uboData.exportMode = cExportMode;
 
-      if (cSrcIsYCbCr && !cDstIsYCbCr)
-        ApplyYCbCrMatrix(uboData.colorMatrix, cStreamState.colorSpace.YCbCr_Matrix);
-
-      if (cStreamState.colorSpace.Nominal_Range) {
-        uboData.yMin = 0.0627451f;
-        uboData.yMax = 0.9215686f;
-      }
+      // One matrix carries the whole colour transform: the YCbCr matrix and the
+      // ranges of both sides (d3d11_video_csc.h). The shader's own Y expansion
+      // stays at 0..1, a clamp, so that a planar and a packed input are treated
+      // alike and the chroma range is converted too.
+      D3D11VideoCscMatrix(
+        D3D11VideoCscSpaceOf(cStreamState.colorSpace, cSrcIsYCbCr),
+        D3D11VideoCscSpaceOf(cDstSpace, cDstIsYCbCr),
+        uboData.colorMatrix);
 
       Rc<DxvkResourceAllocation> uboSlice = m_ubo->allocateStorage();
       memcpy(uboSlice->mapPtr(), &uboData, sizeof(uboData));

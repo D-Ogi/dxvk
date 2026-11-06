@@ -675,11 +675,10 @@ namespace dxvk {
     bool       m_dstIsYCbCr     = false;
     ExportMode m_exportMode     = ExportRGBA;
 
+    // The output colour space of the processor of the current blit.
+    D3D11_VIDEO_PROCESSOR_COLOR_SPACE m_dstColorSpace = D3D11_VIDEO_PROCESSOR_COLOR_SPACE();
+
     bool m_resourcesCreated = false;
-
-    void ApplyColorMatrix(float pDst[3][4], const float pSrc[3][4]);
-
-    void ApplyYCbCrMatrix(float pColorMatrix[3][4], bool UseBt709);
 
     void BindOutputView(
             Rc<DxvkImageView>               View,
