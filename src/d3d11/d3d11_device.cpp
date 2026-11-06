@@ -2387,7 +2387,17 @@ namespace dxvk {
       const VkFormat depthFormat = LookupFormat(Format, DXGI_VK_FORMAT_MODE_DEPTH).Format;
       
       if (GetImageTypeSupport(fmtMapping.Format, VK_IMAGE_TYPE_1D, 0)) flags1 |= D3D11_FORMAT_SUPPORT_TEXTURE1D;
-      if (GetImageTypeSupport(fmtMapping.Format, VK_IMAGE_TYPE_2D, 0)) flags1 |= D3D11_FORMAT_SUPPORT_TEXTURE2D;
+      // bc250 (BD-223): a packed 4:2:2 format (YUY2) gets a mutable image with its R8G8B8A8 view
+      // formats (D3D11CommonTexture), and it is sampled by the video processor. Report TEXTURE2D
+      // only when that image can be created: on gfx1013 the plain query passed and the texture
+      // creation failed, which removed the device (kit-vddi2 lab run, format 107).
+      VkImageCreateFlags flags2d = 0;
+
+      if ((fmtMapping.Format == VK_FORMAT_G8B8G8R8_422_UNORM || fmtMapping.Format == VK_FORMAT_B8G8R8G8_422_UNORM)
+       && LookupFamily(Format, DXGI_VK_FORMAT_MODE_ANY).FormatCount > 1)
+        flags2d = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+
+      if (GetImageTypeSupport(fmtMapping.Format, VK_IMAGE_TYPE_2D, flags2d)) flags1 |= D3D11_FORMAT_SUPPORT_TEXTURE2D;
       if (GetImageTypeSupport(fmtMapping.Format, VK_IMAGE_TYPE_3D, 0)) flags1 |= D3D11_FORMAT_SUPPORT_TEXTURE3D;
 
       // We only support tiled resources with a single aspect

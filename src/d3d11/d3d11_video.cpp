@@ -59,10 +59,20 @@ namespace dxvk {
   HRESULT STDMETHODCALLTYPE D3D11VideoProcessorEnumerator::CheckVideoProcessorFormat(
           DXGI_FORMAT             Format,
           UINT*                   pFlags) {
-    Logger::warn(str::format("D3D11VideoProcessorEnumerator::CheckVideoProcessorFormat: stub, format ", Format));
-
     if (!pFlags)
       return E_INVALIDARG;
+
+    // bc250 (BD-223): a format is admitted only when the device can create a 2D texture of it.
+    // The upstream stub admitted every format: on gfx1013 a YUY2 input passed this check, its
+    // CreateTexture2D then failed in the engine ("Cannot create texture", format 107) and the
+    // runtime removed the device (kit-vddi2 lab run, vpblt case yuy2-709s-bgra).
+    UINT support = 0;
+
+    if (FAILED(m_parent->CheckFormatSupport(Format, &support)) || !(support & D3D11_FORMAT_SUPPORT_TEXTURE2D)) {
+      Logger::warn(str::format("D3D11VideoProcessorEnumerator::CheckVideoProcessorFormat: format ", Format, " has no 2D texture support"));
+      *pFlags = 0;
+      return S_OK;
+    }
 
     *pFlags = D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT | D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT;
     return S_OK;
