@@ -13,9 +13,17 @@
 // it, and an RGB texel is (R, G, B). The shader computes out = M * (in, 1).
 //
 // The coefficients are those of ITU-R BT.601 (Kr 0.299, Kb 0.114) and ITU-R BT.709
-// (Kr 0.2126, Kb 0.0722). Codes are normalized as 8-bit codes: Y 16..235, chroma
-// 16..240 with its centre at 128. A 10-bit or 16-bit format stores the same
-// fractions of its range, to within one code of the 10-bit range.
+// (Kr 0.2126, Kb 0.0722). YCbCr codes have <bits> significant bits: studio range is
+// Y 16..235 and chroma 16..240 times 2^(bits-8), with the chroma centre at
+// 2^(bits-1); full range is 0..2^bits-1. The shader samples a UNORM view of
+// <storageBits> per channel, and a format such as P010 keeps its 10-bit code in
+// the high bits of a 16-bit word: the sampled value is code * 2^(storageBits-bits)
+// / (2^storageBits - 1). The matrix decodes and encodes those codes exactly. An
+// 8-bit fraction on a P010 sample is 2.2 8-bit codes off after the studio
+// expansion (BD-223, kit-vddi2 lab run: bar 2 B 189 for 191.2). RGB views are
+// read as fractions of their range.
+
+#include <cstdint>
 
 #include <d3d11.h>
 
@@ -25,7 +33,21 @@ namespace dxvk {
     bool ycbcr  = false;  // the data is YCbCr
     bool bt709  = false;  // the YCbCr matrix is BT.709 (else BT.601)
     bool studio = false;  // limited range: Y and RGB 16..235, chroma 16..240
+    uint32_t bits        = 8;  // significant bits of a YCbCr code
+    uint32_t storageBits = 8;  // bits of the UNORM channel the shader samples
   };
+
+  // The code width of a YCbCr format: P010 holds 10-bit codes in the high bits of
+  // 16-bit channels; NV12, YUY2 and AYUV hold 8-bit codes.
+  inline void D3D11VideoCscCodeBits(DXGI_FORMAT Format, uint32_t& Bits, uint32_t& StorageBits) {
+    Bits = 8;
+    StorageBits = 8;
+
+    if (Format == DXGI_FORMAT_P010) {
+      Bits = 10;
+      StorageBits = 16;
+    }
+  }
 
   // The space of a view from its legacy colour space and the kind of its format.
   // For YCbCr, Nominal_Range 0-255 is full range, and both 16-235 and undefined
@@ -33,9 +55,12 @@ namespace dxvk {
   // RGB_Range 1 is studio range.
   inline D3D11VideoCscSpace D3D11VideoCscSpaceOf(
     const D3D11_VIDEO_PROCESSOR_COLOR_SPACE& ColorSpace,
-          bool                              IsYCbCr) {
+          bool                              IsYCbCr,
+          DXGI_FORMAT                       Format = DXGI_FORMAT_UNKNOWN) {
     D3D11VideoCscSpace result;
     result.ycbcr = IsYCbCr;
+    if (IsYCbCr)
+      D3D11VideoCscCodeBits(Format, result.bits, result.storageBits);
     result.bt709 = ColorSpace.YCbCr_Matrix != 0;
     result.studio = IsYCbCr
       ? ColorSpace.Nominal_Range != D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_0_255
@@ -87,28 +112,47 @@ namespace dxvk {
       return a;
     }
 
+    // The code ranges of a YCbCr space: code = toCode * sampled value; Y' = (code - yLo) / ySpan,
+    // chroma = (code - centre) / cSpan.
+    struct CodeRange {
+      double toCode, yLo, ySpan, centre, cSpan;
+    };
+
+    inline CodeRange RangeOf(const D3D11VideoCscSpace& S) {
+      const double maxStored = double((1ull << S.storageBits) - 1u);
+      const double step = double(1ull << (S.storageBits - S.bits));
+      const double unit = double(1ull << (S.bits - 8u));
+      CodeRange r;
+      r.toCode = maxStored / step;
+      r.centre = double(1ull << (S.bits - 1u));
+      if (S.studio) {
+        r.yLo = 16.0 * unit;
+        r.ySpan = 219.0 * unit;
+        r.cSpan = 224.0 * unit;
+      } else {
+        r.yLo = 0.0;
+        r.ySpan = double((1ull << S.bits) - 1u);
+        r.cSpan = r.ySpan;
+      }
+      return r;
+    }
+
     // Stored (Y, Cb, Cr) to Y' 0..1 and chroma -0.5..0.5.
-    inline Affine DecodeYCbCr(bool Studio) {
+    inline Affine DecodeYCbCr(const D3D11VideoCscSpace& S) {
+      const CodeRange r = RangeOf(S);
       Affine a = Identity();
-      const double ys = Studio ? 255.0 / 219.0 : 1.0;
-      const double cs = Studio ? 255.0 / 224.0 : 1.0;
-      const double yo = Studio ? 16.0 / 255.0 : 0.0;
-      const double co = 128.0 / 255.0;
-      a.m[0][0] = ys; a.m[0][3] = -yo * ys;
-      a.m[1][1] = cs; a.m[1][3] = -co * cs;
-      a.m[2][2] = cs; a.m[2][3] = -co * cs;
+      a.m[0][0] = r.toCode / r.ySpan; a.m[0][3] = -r.yLo / r.ySpan;
+      a.m[1][1] = r.toCode / r.cSpan; a.m[1][3] = -r.centre / r.cSpan;
+      a.m[2][2] = r.toCode / r.cSpan; a.m[2][3] = -r.centre / r.cSpan;
       return a;
     }
 
-    inline Affine EncodeYCbCr(bool Studio) {
+    inline Affine EncodeYCbCr(const D3D11VideoCscSpace& S) {
+      const CodeRange r = RangeOf(S);
       Affine a = Identity();
-      const double ys = Studio ? 219.0 / 255.0 : 1.0;
-      const double cs = Studio ? 224.0 / 255.0 : 1.0;
-      const double yo = Studio ? 16.0 / 255.0 : 0.0;
-      const double co = 128.0 / 255.0;
-      a.m[0][0] = ys; a.m[0][3] = yo;
-      a.m[1][1] = cs; a.m[1][3] = co;
-      a.m[2][2] = cs; a.m[2][3] = co;
+      a.m[0][0] = r.ySpan / r.toCode; a.m[0][3] = r.yLo / r.toCode;
+      a.m[1][1] = r.cSpan / r.toCode; a.m[1][3] = r.centre / r.toCode;
+      a.m[2][2] = r.cSpan / r.toCode; a.m[2][3] = r.centre / r.toCode;
       return a;
     }
 
@@ -167,12 +211,12 @@ namespace dxvk {
     inline Affine Transform(const D3D11VideoCscSpace& Src, const D3D11VideoCscSpace& Dst) {
       // Stored input to R'G'B' 0..1.
       Affine toRgb = Src.ycbcr
-        ? Multiply(YCbCrToRgb(Src.bt709), Multiply(DecodeYCbCr(Src.studio), FromShaderYCbCr()))
+        ? Multiply(YCbCrToRgb(Src.bt709), Multiply(DecodeYCbCr(Src), FromShaderYCbCr()))
         : DecodeRgb(Src.studio);
 
       // R'G'B' 0..1 to stored output.
       Affine fromRgb = Dst.ycbcr
-        ? Multiply(ToShaderYCbCr(), Multiply(EncodeYCbCr(Dst.studio), RgbToYCbCr(Dst.bt709)))
+        ? Multiply(ToShaderYCbCr(), Multiply(EncodeYCbCr(Dst), RgbToYCbCr(Dst.bt709)))
         : EncodeRgb(Dst.studio);
 
       return Multiply(fromRgb, toRgb);

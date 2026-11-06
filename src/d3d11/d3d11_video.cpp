@@ -267,6 +267,7 @@ namespace dxvk {
     }
 
     m_isYCbCr = IsYCbCrFormat(resourceDesc.Format);
+    m_format = resourceDesc.Format;
   }
 
 
@@ -1220,6 +1221,7 @@ namespace dxvk {
     bool hasStreamsEnabled = false;
 
     m_dstIsYCbCr = outputView.IsYCbCr();
+    m_dstFormat = outputView.GetFormat();
     m_dstColorSpace = videoProcessor->GetState()->outputColorSpace;
 
     for (uint32_t vi = 0; vi < views.size(); vi++) {
@@ -1419,7 +1421,9 @@ namespace dxvk {
       cImage        = view.GetImage(),
       cViews        = view.GetViews(),
       cSrcIsYCbCr   = view.IsYCbCr(),
+      cSrcFormat    = view.GetFormat(),
       cDstIsYCbCr   = m_dstIsYCbCr,
+      cDstFormat    = m_dstFormat,
       cDstSpace     = m_dstColorSpace,
       cDstExtent    = m_dstExtent,
       cDstSizeFactX = m_dstSizeFact[0],
@@ -1484,8 +1488,8 @@ namespace dxvk {
       // stays at 0..1, a clamp, so that a planar and a packed input are treated
       // alike and the chroma range is converted too.
       D3D11VideoCscMatrix(
-        D3D11VideoCscSpaceOf(cStreamState.colorSpace, cSrcIsYCbCr),
-        D3D11VideoCscSpaceOf(cDstSpace, cDstIsYCbCr),
+        D3D11VideoCscSpaceOf(cStreamState.colorSpace, cSrcIsYCbCr, cSrcFormat),
+        D3D11VideoCscSpaceOf(cDstSpace, cDstIsYCbCr, cDstFormat),
         uboData.colorMatrix);
 
       Rc<DxvkResourceAllocation> uboSlice = m_ubo->allocateStorage();

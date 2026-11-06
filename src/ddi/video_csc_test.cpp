@@ -5,6 +5,9 @@
 // the shader gets to stored texels, in the shader's channel order, and compares the result with
 // the codes of ITU-R BT.601 and BT.709. Two mutants (601 and 709 exchanged, the chroma range
 // left out) must each fail at least one check, and the old range reading must differ from the new.
+// P010: the vpblt bars at 10-bit codes, sampled as R16_UNORM (code << 6) / 65535 as the shader
+// sees them, against vpblt's reference; the 8-bit reading of the same sample must reproduce the
+// lab value of kit-vddi2 (BD-223: p010-709s-bgra bar 2 B 189 for 191.2).
 // Prints "PASSED: 0 failure(s)" or "FAILED: <n> failure(s)" and returns 0 or 1.
 
 #include <cmath>
@@ -123,9 +126,81 @@ static void NoChromaRange(const D3D11VideoCscSpace& s, const D3D11VideoCscSpace&
   }
 }
 
+// P010: 10-bit codes in the high bits of 16-bit UNORM channels, in the shader's order (Cr, Y, Cb).
+static Texel YCbCr10(double y, double cb, double cr) {
+  auto s = [] (double code) { return double(unsigned(code) << 6) / 65535.0; };
+  return { s(cr), s(y), s(cb) };
+}
+
+static double Round8(double v) {
+  v = v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v);
+  return std::floor(v * 255.0 + 0.5);
+}
+
+// The vpblt bars (tools/win/vpblt/vpblt.cpp kBarColours) and their 10-bit studio BT.709 codes as
+// vpblt encodes them, with vpblt's reference: the codes decoded exactly as 10-bit codes.
+static void P010Checks() {
+  struct Bar { double r, g, b; };
+  const Bar bars[8] = { {1, 1, 1}, {.75, .75, 0}, {0, .75, .75}, {0, .75, 0}, {.75, 0, .75}, {1, 0, 0}, {0, 0, .75}, {0, 0, 0} };
+  const double kr = 0.2126, kb = 0.0722, kg = 1.0 - kr - kb;
+  auto code = [] (double v) { v = std::floor(v + 0.5); return v < 0 ? 0.0 : (v > 1023 ? 1023.0 : v); };
+
+  D3D11VideoCscSpace p010 = Space(true, true, true);
+  p010.bits = 10; p010.storageBits = 16;
+  const auto rgbFull = Space(false, false, false);
+  float fixedM[3][4], oldM[3][4];
+  dxvk::D3D11VideoCscMatrix(p010, rgbFull, fixedM);
+  dxvk::D3D11VideoCscMatrix(Space(true, true, true), rgbFull, oldM);
+
+  double worst = 0.0, oldBar2B = -1.0, fixedBar2B = -1.0;
+  for (int i = 0; i < 8; i++) {
+    const double y = kr * bars[i].r + kg * bars[i].g + kb * bars[i].b;
+    const double cb = (bars[i].b - y) / (2.0 * (1.0 - kb)), cr = (bars[i].r - y) / (2.0 * (1.0 - kr));
+    const double yc = code((16.0 + 219.0 * y) * 4.0), cbc = code(512.0 + 896.0 * cb), crc = code(512.0 + 896.0 * cr);
+    // vpblt's reference: the stored codes decoded as 10-bit codes.
+    const double y2 = (yc / 4.0 - 16.0) / 219.0, cb2 = (cbc - 512.0) / 896.0, cr2 = (crc - 512.0) / 896.0;
+    const double wr = y2 + 2.0 * (1.0 - kr) * cr2, wb = y2 + 2.0 * (1.0 - kb) * cb2, wg = (y2 - kr * wr - kb * wb) / kg;
+    const Texel in = YCbCr10(yc, cbc, crc);
+    const Texel got = Apply(fixedM, in), old = Apply(oldM, in);
+    const double want[3] = { wr, wg, wb }, gotv[3] = { got.r, got.g, got.b };
+    for (int c = 0; c < 3; c++) {
+      const double w = (want[c] < 0 ? 0 : (want[c] > 1 ? 1 : want[c])) * 255.0;
+      const double e = std::fabs(Round8(gotv[c]) - w);
+      if (e > worst) worst = e;
+    }
+    if (i == 2) { oldBar2B = Round8(old.b); fixedBar2B = Round8(got.b); }
+  }
+  char what[160];
+  std::snprintf(what, sizeof(what), "P010 709 studio bars -> RGB within 0.5 codes of vpblt's reference (max %.2f)", worst);
+  Check(worst <= 0.5 + 1e-9, what);
+  std::snprintf(what, sizeof(what), "P010 bar 2 B is 191 (got %.0f)", fixedBar2B);
+  Check(fixedBar2B == 191.0, what);
+  std::snprintf(what, sizeof(what), "control: the 8-bit reading of the P010 sample gives the lab value 189 (got %.0f)", oldBar2B);
+  Check(oldBar2B == 189.0, what);
+
+  // RGB -> P010: BT.709 red is codes 250, 409, 960 (studio); the stored value of each channel is
+  // within half a 10-bit code of code << 6.
+  float enc[3][4];
+  dxvk::D3D11VideoCscMatrix(rgbFull, p010, enc);
+  const Texel red = Apply(enc, Rgb(255, 0, 0)), want = YCbCr10(250, 409, 960);
+  const double half = 0.5 * 64.0 / 65535.0;
+  Check(std::fabs(red.r - want.r) <= half && std::fabs(red.g - want.g) <= half && std::fabs(red.b - want.b) <= half,
+        "RGB red -> P010 709 studio codes 250, 409, 960");
+  float dec[3][4];
+  dxvk::D3D11VideoCscMatrix(p010, rgbFull, dec);
+  const Texel in = Rgb(40, 200, 90);
+  Check(Near(Apply(dec, Apply(enc, in)), in), "RGB -> P010 709 studio -> RGB");
+  D3D11_VIDEO_PROCESSOR_COLOR_SPACE c = { };
+  c.YCbCr_Matrix = 1;
+  const auto s = dxvk::D3D11VideoCscSpaceOf(c, true, DXGI_FORMAT_P010);
+  Check(s.bits == 10 && s.storageBits == 16, "P010 views decode 10-bit codes in 16-bit channels");
+  const auto n = dxvk::D3D11VideoCscSpaceOf(c, true, DXGI_FORMAT_NV12);
+  Check(n.bits == 8 && n.storageBits == 8, "NV12 views decode 8-bit codes");
+}
+
 int main() {
   RunChecks(dxvk::D3D11VideoCscMatrix, true);
-
+  P010Checks();
   // Legacy colour space words.
   {
     D3D11_VIDEO_PROCESSOR_COLOR_SPACE c = { };

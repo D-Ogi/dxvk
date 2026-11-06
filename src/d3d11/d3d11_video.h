@@ -134,6 +134,10 @@ namespace dxvk {
       return m_isYCbCr;
     }
 
+    DXGI_FORMAT GetFormat() const {
+      return m_format;
+    }
+
     /**
      * \brief Queries base image
      *
@@ -194,6 +198,7 @@ namespace dxvk {
 
     std::array<Rc<DxvkImageView>, 2>      m_views;
     bool                                  m_isYCbCr = false;
+    DXGI_FORMAT                           m_format = DXGI_FORMAT_UNKNOWN;
 
     static bool IsYCbCrFormat(DXGI_FORMAT Format);
 
@@ -673,6 +678,7 @@ namespace dxvk {
     VkExtent2D m_dstExtent      = { 0u, 0u };
     float      m_dstSizeFact[2] = { 1.0f, 1.0f };
     bool       m_dstIsYCbCr     = false;
+    DXGI_FORMAT m_dstFormat     = DXGI_FORMAT_UNKNOWN;
     ExportMode m_exportMode     = ExportRGBA;
 
     // The output colour space of the processor of the current blit.
