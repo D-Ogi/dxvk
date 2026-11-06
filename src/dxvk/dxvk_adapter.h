@@ -112,6 +112,9 @@ namespace dxvk {
     std::string shaderCacheDirectory;
     /// Optional effective-token guard, checked before each cache I/O transaction.
     bool (*shaderCacheAccessAllowed)() = nullptr;
+    /// Optional host scope of a pipeline worker thread: called with true on the
+    /// worker when it starts and with false on the same thread before it ends.
+    std::function<void (bool)> workerScope;
   };
 
   /**

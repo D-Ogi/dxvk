@@ -4,7 +4,7 @@
  * UserModeDriverName DLL) and its DXVK engine ("engine", amdgpu_wddm_dxvk.dll, DXVK fork branch
  * amdgpu-wddm/ddi-engine).
  *
- * Revision r11, ABI 1.6. This file in the DXVK fork is the only copy; the shell includes it from the DXVK
+ * Revision r12, ABI 1.7. This file in the DXVK fork is the only copy; the shell includes it from the DXVK
  * source checkout it builds against, like its other DXVK-facing headers.
  *
  * Versions. A minor version adds and never changes: an engine of minor n serves a shell built for any minor
@@ -34,6 +34,10 @@
  *        that finds no such export (an engine before 1.5) has no options from it.
  *   1.6  r11: IBc250DxvkDevice5 (PrepareOffer, EndOffer): the memory of an engine resource as allocations of its
  *        own, for DXGI OfferResources and ReclaimResources of resources that have no runtime allocation (BD-309).
+ *   1.7  r12: BC250_DXVK_SHELL_SERVICES::WorkerScope (BD-327): each pipeline worker thread tells the shell when it
+ *        starts and ends, so that the shell can admit the driver-internal memory calls of hosted RADV on it. The
+ *        member is at the end of the structure: the engine reads it only when Services->Size includes it, and it
+ *        accepts the shorter structure of a shell before 1.7. An engine before 1.7 ignores the member.
  *
  * WDK-free by construction. DXVK's util_gdi.h declares private extern-C D3DKMT prototypes that collide with
  * the WDK's in one translation unit, so nothing here needs d3d10umddi.h or a DXVK header: windows.h, the SDK's
@@ -66,9 +70,14 @@
  *       workers also create pipeline libraries and optimized graphics pipelines, outside any engine call and
  *       outside RuntimeDomain. Their only Vulkan calls are vkCreateGraphicsPipelines, vkCreateComputePipelines,
  *       vkGetShaderModuleCreateInfoIdentifierEXT and, in a 32-bit process, vkDestroyPipeline of a library they
- *       created. Hosted RADV gets no runtime callback on such a thread (the shell refuses host calls outside a DDI
- *       entry), so a create that needs one, such as a new shader arena, fails; the engine repeats it on the
- *       calling thread in RuntimeDomain (CreateShader, SubmitForPresent, or the draw that needs it). With the
+ *       created. Each worker calls Services.WorkerScope(shell, TRUE) when it starts and (shell, FALSE) before it
+ *       ends, on its own thread (1.7). Inside that scope the shell admits only the driver-internal memory calls of
+ *       hosted RADV, such as a new shader arena (BD-327); it refuses every other runtime callback there, and it
+ *       refuses all of them after the device's DestroyDevice returned (a shell keeps them admitted until the
+ *       engine device's final Release joined the workers, or refuses them before DestroyDevice returns when that
+ *       Release did not happen). A create that a refused call fails is
+ *       repeated by the engine on the calling thread in RuntimeDomain (CreateShader, SubmitForPresent, or the
+ *       draw that needs it). With the
  *       option false, creation of Vulkan pipelines stays on the calling thread in RuntimeDomain. A persistent cache writes
  *       the converted IR on the converting thread, including these CPU workers, with no separate cache writer.
  *       Cache access requires an ordinary process profile and no thread impersonation; a failed policy or cache
@@ -119,12 +128,13 @@
 #error "bc250_dxvk_engine.h is a C++ header (COM interfaces)"
 #endif
 
+#include <cstddef>
 #include <windows.h>
 #include <d3d11_4.h>
 #include <vulkan/vulkan.h>
 
 #define BC250_DXVK_ENGINE_ABI_MAJOR 1u
-#define BC250_DXVK_ENGINE_ABI_MINOR 6u
+#define BC250_DXVK_ENGINE_ABI_MINOR 7u
 #define BC250_DXVK_ENGINE_ABI_VERSION ((BC250_DXVK_ENGINE_ABI_MAJOR << 16) | BC250_DXVK_ENGINE_ABI_MINOR)
 
 /* The Vulkan objects the shell owns (E1). */
@@ -172,7 +182,15 @@ struct BC250_DXVK_SHELL_SERVICES {
      * file is written. Lines logged with no such device (QueryDeviceRequirements, GetAdapterInfo) go to the
      * file in DXVK_LOG_PATH, if set, or nowhere. */
     void (APIENTRY *Log)(void *shell, UINT32 level, const char *message);
+    /* 1.7 (E2, BD-327): WorkerScope(shell, TRUE) on a pipeline worker thread of this device when it starts, and
+     * WorkerScope(shell, FALSE) on the same thread before it ends. Not called on any other thread. Every call of
+     * a worker that started returns before the engine device's final Release returns. The shell must not call
+     * the engine from it. */
+    void (APIENTRY *WorkerScope)(void *shell, BOOL enter);
 };
+
+/* The size of BC250_DXVK_SHELL_SERVICES before 1.7: the smallest Services->Size an engine accepts. */
+#define BC250_DXVK_SHELL_SERVICES_SIZE_1_0 (offsetof(BC250_DXVK_SHELL_SERVICES, WorkerScope))
 
 #define BC250_DXVK_THREADING_INLINE 0u
 

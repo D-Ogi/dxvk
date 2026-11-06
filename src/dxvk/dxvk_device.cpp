@@ -17,7 +17,8 @@ namespace dxvk {
     const DxvkDeviceHostOptions&    hostOptions)
   : m_options           (instance->options()),
     m_hostOptions       {hostOptions.inlineExecution, hostOptions.disableKmt,
-                         hostOptions.disableShaderCache, { }, hostOptions.shaderCacheAccessAllowed},
+                         hostOptions.disableShaderCache, { }, hostOptions.shaderCacheAccessAllowed,
+                         hostOptions.workerScope},
     m_instance          (instance),
     m_adapter           (adapter),
     m_vkd               (vkd),

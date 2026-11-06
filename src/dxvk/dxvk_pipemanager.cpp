@@ -449,6 +449,14 @@ namespace dxvk {
     Logger::deferThreadLines();
     DxvkIrShader::setWorkerThread();
 
+    // BD-327: inside the host's worker scope, hosted RADV can get the driver-internal memory of the
+    // pipelines this thread creates (a new shader arena). Left on every way out of this function.
+    struct WorkerScope {
+      const DxvkDevice* device;
+      explicit WorkerScope(const DxvkDevice* d) : device(d) { device->setWorkerScope(true); }
+      ~WorkerScope() { device->setWorkerScope(false); }
+    } workerScope(m_device);
+
     while (true) {
       PipelineEntry entry;
 

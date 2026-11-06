@@ -1,5 +1,6 @@
 // amdgpu_wddm_dxvk.dll entry point: the engine functions of bc250_dxvk_engine.h.
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <vector>
@@ -229,8 +230,13 @@ namespace dxvk::ddi {
 
       if (!info || info->Size < sizeof(*info) || !IsValidInstance(info->Instance)
        || !info->Device || info->Device->Size < sizeof(*info->Device) || !info->Device->Device
-       || !info->Services || info->Services->Size < sizeof(*info->Services))
+       || !info->Services || info->Services->Size < BC250_DXVK_SHELL_SERVICES_SIZE_1_0)
         return E_INVALIDARG;
+
+      // A shell before 1.7 passes the shorter structure: only the bytes it gave are read, the rest stays zero
+      BC250_DXVK_SHELL_SERVICES services = { };
+      std::memcpy(&services, info->Services, std::min<size_t>(info->Services->Size, sizeof(services)));
+      services.Size = sizeof(services);
 
       if ((info->AbiVersion >> 16) != BC250_DXVK_ENGINE_ABI_MAJOR)
         return E_NOINTERFACE;
@@ -241,8 +247,8 @@ namespace dxvk::ddi {
       // From here on, log lines go to the shell, those of instance and device import included
       std::unique_ptr<ShellLogSink> logSink;
 
-      if (info->Services->Log)
-        logSink = std::make_unique<ShellLogSink>(*info->Services);
+      if (services.Log)
+        logSink = std::make_unique<ShellLogSink>(services);
 
       try {
         Rc<DxvkInstance> instance = ImportInstance(info->Instance);
@@ -293,12 +299,22 @@ namespace dxvk::ddi {
         deviceInfo.hostOptions.shaderCacheDirectory     = std::move(cachePolicy.directory);
         deviceInfo.hostOptions.shaderCacheAccessAllowed = ShaderCacheAccessAllowed;
 
-        if (info->Services->QueueLock) {
+        if (services.QueueLock) {
           deviceInfo.queueCallback = [
-            lock  = info->Services->QueueLock,
-            shell = info->Services->Shell
+            lock  = services.QueueLock,
+            shell = services.Shell
           ] (bool doLock) {
             lock(shell, doLock ? TRUE : FALSE);
+          };
+        }
+
+        // E2, 1.7 (BD-327): each pipeline worker of this device enters the shell's worker scope on its own thread
+        if (services.WorkerScope) {
+          deviceInfo.hostOptions.workerScope = [
+            scope = services.WorkerScope,
+            shell = services.Shell
+          ] (bool enter) {
+            scope(shell, enter ? TRUE : FALSE);
           };
         }
 
@@ -317,7 +333,7 @@ namespace dxvk::ddi {
         Com<D3D11DXGIDevice> container = new D3D11DXGIDevice(nullptr, nullptr, nullptr,
           instance, adapter, device, info->FeatureLevel, 0u);
 
-        *result = ref(new Bc250DxvkDevice(container.ptr(), *info->Services, std::move(logSink)));
+        *result = ref(new Bc250DxvkDevice(container.ptr(), services, std::move(logSink)));
         return S_OK;
       } catch (const DxvkError& e) {
         Logger::err(str::format("amdgpu_wddm_dxvk: CreateDevice: ", e.message()));

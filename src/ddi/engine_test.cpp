@@ -209,6 +209,13 @@ namespace {
     std::atomic<uint32_t> logLines       { 0u };
     std::atomic<uint32_t> foreignLogs    { 0u };
     std::atomic<uint32_t> malformedLogs  { 0u };
+    // 1.7 (BD-327): WorkerScope calls, and the threads that entered and did not leave yet
+    std::mutex            scopeMutex;
+    std::set<DWORD>       scopeThreads;
+    std::atomic<uint32_t> scopeEnters    { 0u };
+    std::atomic<uint32_t> scopeLeaves    { 0u };
+    std::atomic<uint32_t> scopeOnCaller  { 0u };
+    std::atomic<uint32_t> scopeUnpaired  { 0u };
     std::vector<std::string> errors;
     std::vector<std::string> lines;
 
@@ -233,6 +240,29 @@ namespace {
       EnterCriticalSection(&s->queueLock);
     else
       LeaveCriticalSection(&s->queueLock);
+  }
+
+  // 1.7 (BD-327): a pipeline worker enters once when it starts and leaves once on the same thread before it ends
+  void APIENTRY WorkerScope(void* shell, BOOL enter) {
+    auto s = static_cast<Shell*>(shell);
+
+    if (IsCallerThread(s->mainThread))
+      s->scopeOnCaller++;
+
+    std::lock_guard<std::mutex> lock(s->scopeMutex);
+    const DWORD tid = GetCurrentThreadId();
+
+    if (enter) {
+      s->scopeEnters++;
+
+      if (!s->scopeThreads.insert(tid).second)
+        s->scopeUnpaired++;
+    } else {
+      s->scopeLeaves++;
+
+      if (!s->scopeThreads.erase(tid))
+        s->scopeUnpaired++;
+    }
   }
 
   void APIENTRY Log(void* shell, UINT32 level, const char* message) {
@@ -2299,6 +2329,7 @@ int main(int argc, char** argv) {
   services.Shell     = &shell;
   services.QueueLock = &QueueLock;
   services.Log       = &Log;
+  services.WorkerScope = &WorkerScope;
 
   BC250_DXVK_DEVICE_CREATE_INFO createInfo = { sizeof(createInfo) };
   createInfo.AbiVersion   = BC250_DXVK_ENGINE_ABI_VERSION;
@@ -4616,6 +4647,19 @@ int main(int argc, char** argv) {
   Check(remaining == 0u, "final engine Release reports no leaked D3D11 references (E4)");
   const uint32_t linesAtRelease = shell.logLines.load();
 
+  // ---- 1.7 (BD-327): the worker scope ----
+  std::printf("      worker scope: %u enters, %u leaves, %u on the calling threads, %u unpaired, %u pipeline "
+    "worker threads seen\n", shell.scopeEnters.load(), shell.scopeLeaves.load(), shell.scopeOnCaller.load(),
+    shell.scopeUnpaired.load(), engineThreads);
+  Check(shell.scopeOnCaller.load() == 0u, "no WorkerScope call on a thread that called the engine (E2, 1.7)");
+  Check(shell.scopeEnters.load() >= engineThreads, "each pipeline worker thread entered the worker scope (1.7)");
+  {
+    std::lock_guard<std::mutex> lock(shell.scopeMutex);
+    Check(shell.scopeUnpaired.load() == 0u && shell.scopeThreads.empty()
+       && shell.scopeEnters.load() == shell.scopeLeaves.load(),
+      "each worker left the scope on its own thread before the final Release returned (1.7)");
+  }
+
   // ---- r9: translation on workers, the shader cache, and the engine's threads ----
   auto printShaderLines = [] (const Shell& s) {
     for (const auto& line : s.lines) {
@@ -4692,6 +4736,13 @@ int main(int argc, char** argv) {
     BC250_DXVK_SHELL_SERVICES warmServices = services;
     warmServices.Shell = &warm;
 
+    // 1.7: the first pass is a shell before 1.7, whose structure ends before WorkerScope. The engine must accept
+    // it and must not read the member behind its end (a wrong pointer there would be called).
+    if (!cachePass) {
+      warmServices.Size = BC250_DXVK_SHELL_SERVICES_SIZE_1_0;
+      warmServices.WorkerScope = reinterpret_cast<void (APIENTRY*)(void*, BOOL)>(uintptr_t(0xdeadbeef));
+    }
+
     BC250_DXVK_DEVICE_CREATE_INFO warmInfo = createInfo;
     warmInfo.Services = &warmServices;
 
@@ -4765,6 +4816,15 @@ int main(int argc, char** argv) {
       Check(CacheProbe::writeBytes.load()>0,"rejected cache: damaged entries were replaced after correct rendering");
     Check(warm.foreignLogs.load() == 0u && warm.foreignCalls.load() == 0u,
       "second device: every Log and QueueLock call came from the calling thread (E2)");
+    if (!cachePass) {
+      Check(warm.scopeEnters.load() == 0u && warm.scopeLeaves.load() == 0u,
+        "second device, shell before 1.7: accepted, and no WorkerScope call behind the end of its structure");
+    } else {
+      std::lock_guard<std::mutex> lock(warm.scopeMutex);
+      Check(warm.scopeOnCaller.load() == 0u && warm.scopeUnpaired.load() == 0u && warm.scopeThreads.empty()
+         && warm.scopeEnters.load() == warm.scopeLeaves.load(),
+        "second device: each worker left the scope on its own thread before the final Release returned (1.7)");
+    }
     Check(EngineThreadsSince(threadsBefore).empty(), "no thread of amdgpu_wddm_dxvk.dll outlives the second device");
     DeleteCriticalSection(&warm.queueLock);
   }

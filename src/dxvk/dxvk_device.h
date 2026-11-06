@@ -122,6 +122,18 @@ namespace dxvk {
     }
 
     /**
+     * \brief Enters or leaves the host scope of a pipeline worker
+     *
+     * Called on the worker thread itself, see
+     * \ref DxvkDeviceHostOptions::workerScope.
+     * \param [in] enter \c true when the worker starts
+     */
+    void setWorkerScope(bool enter) const {
+      if (m_hostOptions.workerScope)
+        m_hostOptions.workerScope(enter);
+    }
+
+    /**
      * \brief Compiles deferred pipelines
      *
      * With inline execution, optimized pipelines wait for
