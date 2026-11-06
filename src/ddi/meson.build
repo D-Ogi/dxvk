@@ -52,6 +52,13 @@ executable('amdgpu_wddm_dxvk_video_csc_test', 'video_csc_test.cpp',
   install             : false,
 )
 
+# Host test of directional video format admission and actual plane-view queries.
+video_format_test = executable('amdgpu_wddm_dxvk_video_format_test', 'video_format_test.cpp',
+  include_directories : include_directories('../../include/vulkan/include'),
+  install             : false,
+)
+test('ddi-video-format-support', video_format_test)
+
 # Offline positive control: plays the UMD shell against the DLL on any Vulkan 1.3 GPU (engine_test.cpp).
 # It uses only the ABI header, never DXVK internals, so it also checks that the header stands alone.
 executable('amdgpu_wddm_dxvk_engine_test', 'engine_test.cpp',

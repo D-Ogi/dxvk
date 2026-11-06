@@ -3,6 +3,7 @@
 #include "d3d11_context_imm.h"
 #include "d3d11_video.h"
 #include "d3d11_video_csc.h"
+#include "d3d11_video_format.h"
 
 #include <d3d11_video_blit_frag.h>
 #include <d3d11_video_blit_vert.h>
@@ -62,20 +63,46 @@ namespace dxvk {
     if (!pFlags)
       return E_INVALIDARG;
 
-    // bc250 (BD-223): a format is admitted only when the device can create a 2D texture of it.
-    // The upstream stub admitted every format: on gfx1013 a YUY2 input passed this check, its
-    // CreateTexture2D then failed in the engine ("Cannot create texture", format 107) and the
-    // runtime removed the device (kit-vddi2 lab run, vpblt case yuy2-709s-bgra).
-    UINT support = 0;
-
-    if (FAILED(m_parent->CheckFormatSupport(Format, &support)) || !(support & D3D11_FORMAT_SUPPORT_TEXTURE2D)) {
-      Logger::warn(str::format("D3D11VideoProcessorEnumerator::CheckVideoProcessorFormat: format ", Format, " has no 2D texture support"));
-      *pFlags = 0;
-      return S_OK;
+    // The DDI reports input and render-target output separately. Query the image and the
+    // views this implementation uses; a sampled TEXTURE2D alone does not prove output.
+    const auto mapping = m_parent->LookupFormat(Format, DXGI_VK_FORMAT_MODE_COLOR);
+    const auto family = m_parent->LookupFamily(Format, DXGI_VK_FORMAT_MODE_COLOR);
+    D3D11VideoFormatQuery query;
+    query.format = mapping.Format;
+    query.family = family.Formats;
+    query.familyCount = family.FormatCount;
+    if (mapping.Format != VK_FORMAT_UNDEFINED) {
+      const auto info = lookupFormatInfo(mapping.Format);
+      query.planar = (info->aspectMask & VK_IMAGE_ASPECT_PLANE_0_BIT) != 0;
+      query.valid = (query.planar || (info->aspectMask & VK_IMAGE_ASPECT_COLOR_BIT))
+        && !info->flags.test(DxvkFormatFlag::SampledUInt)
+        && !info->flags.test(DxvkFormatFlag::SampledSInt)
+        && !info->flags.test(DxvkFormatFlag::BlockCompressed);
+      if (query.planar) {
+        // These are the two-plane encodings and matrix widths implemented by the blit.
+        query.valid &= (Format == DXGI_FORMAT_NV12 || Format == DXGI_FORMAT_P010)
+          && family.FormatCount >= 2;
+        if (family.FormatCount >= 2) {
+          query.views = { family.Formats[0], family.Formats[1] };
+          query.viewCount = 2;
+        }
+      } else {
+        query.views[0] = mapping.Format;
+        query.viewCount = 1;
+      }
     }
-
-    *pFlags = D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT | D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT;
-    return S_OK;
+    const auto device = m_parent->GetDXVKDevice();
+    return D3D11VideoFormatSupport(query,
+      [&](const VkPhysicalDeviceImageFormatInfo2& image) {
+        VkImageFormatProperties2 properties = {};
+        properties.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2;
+        return device->vki()->vkGetPhysicalDeviceImageFormatProperties2(
+          device->adapter()->handle(), &image, &properties) == VK_SUCCESS;
+      },
+      [&](VkFormat view, VkImageTiling tiling) {
+        const auto features = device->getFormatFeatures(view);
+        return tiling == VK_IMAGE_TILING_OPTIMAL ? features.optimal : features.linear;
+      }, pFlags);
   }
 
 
