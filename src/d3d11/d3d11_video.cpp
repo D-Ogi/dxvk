@@ -275,8 +275,9 @@ namespace dxvk {
 
 
   bool D3D11VideoProcessorView::IsYCbCrFormat(DXGI_FORMAT Format) {
-    static const std::array<DXGI_FORMAT, 3> s_formats = {{
+    static const std::array<DXGI_FORMAT, 4> s_formats = {{
       DXGI_FORMAT_NV12,
+      DXGI_FORMAT_P010,
       DXGI_FORMAT_YUY2,
       DXGI_FORMAT_AYUV,
     }};
