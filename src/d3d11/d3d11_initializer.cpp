@@ -175,7 +175,7 @@ namespace dxvk {
 
         for (uint32_t mip = 0; mip < image->info().mipLevels; mip++) {
           dataSize += image->info().numLayers * align(util::computeImageDataSize(
-            packedFormat, image->mipLevelExtent(mip), formatInfo->aspectMask), CACHE_LINE_SIZE);
+            packedFormat, pTexture->MipLevelExtent(mip), formatInfo->aspectMask), CACHE_LINE_SIZE);
         }
 
         stagingSlice = AllocStagingBuffer(dataSize);
@@ -192,7 +192,7 @@ namespace dxvk {
 
           if (pTexture->HasImage()) {
             VkDeviceSize mipSizePerLayer = util::computeImageDataSize(
-              packedFormat, image->mipLevelExtent(mip), formatInfo->aspectMask);
+              packedFormat, pTexture->MipLevelExtent(mip), formatInfo->aspectMask);
 
             util::packImageData(stagingSlice.mapPtr(dataOffset),
               pInitialData[index].pSysMem, pInitialData[index].SysMemPitch, pInitialData[index].SysMemSlicePitch,
@@ -216,7 +216,7 @@ namespace dxvk {
         EmitCs(stagingSize, [
           cImage        = std::move(image),
           cStagingSlice = std::move(stagingSlice),
-          cFormat       = packedFormat
+          cFormat       = pTexture->ImageCopyFormat()
         ] (DxvkContext* ctx) {
           ctx->uploadImage(cImage,
             cStagingSlice.buffer(),

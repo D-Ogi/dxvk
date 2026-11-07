@@ -31,7 +31,7 @@ namespace dxvk {
     imageInfo.format          = formatInfo.Format;
     imageInfo.flags           = 0;
     imageInfo.sampleCount     = VK_SAMPLE_COUNT_1_BIT;
-    imageInfo.extent.width    = m_desc.Width;
+    imageInfo.extent.width    = IsPackedYuy2() ? m_desc.Width / 2 : m_desc.Width;
     imageInfo.extent.height   = m_desc.Height;
     imageInfo.extent.depth    = m_desc.Depth;
     imageInfo.numLayers       = m_desc.ArraySize;
@@ -351,6 +351,16 @@ namespace dxvk {
   bool D3D11CommonTexture::CheckViewCompatibility(UINT BindFlags, DXGI_FORMAT Format, UINT Plane) const {
     const DxvkImageCreateInfo& imageInfo = m_image->info();
 
+    // Ordinary YUY2 views expose raw pairs. Video views use the separate
+    // video-processor API; a render-target view is not a YUY2 resource view.
+    if (IsPackedYuy2()) {
+      if (BindFlags & ~(D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS))
+        return false;
+      if (Format != DXGI_FORMAT_R8G8B8A8_UNORM && Format != DXGI_FORMAT_R8G8B8A8_UINT
+       && !(Format == DXGI_FORMAT_R32_UINT && BindFlags == D3D11_BIND_UNORDERED_ACCESS))
+        return false;
+    }
+
     // Check whether the given bind flags are supported
     if ((m_desc.BindFlags & BindFlags) != BindFlags)
       return false;
@@ -462,6 +472,16 @@ namespace dxvk {
        || (pDesc->Usage != D3D11_USAGE_DEFAULT)
        || (pDesc->CPUAccessFlags))
         return E_INVALIDARG;
+    }
+
+    // The packed video implementation admits 2D, single-level, single-sample
+    // resources. No mip, cube or multisample capability is advertised for it.
+    if (pDesc->Format == DXGI_FORMAT_YUY2) {
+      if ((pDesc->Width & 1) || pDesc->Depth != 1 || pDesc->MipLevels > 1
+       || pDesc->SampleDesc.Count != 1 || (pDesc->MiscFlags &
+          (D3D11_RESOURCE_MISC_GENERATE_MIPS | D3D11_RESOURCE_MISC_TEXTURECUBE | D3D11_RESOURCE_MISC_TILED)))
+        return E_INVALIDARG;
+      pDesc->MipLevels = 1;
     }
 
     // Use the maximum possible mip level count if the supplied

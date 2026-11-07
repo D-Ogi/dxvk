@@ -685,7 +685,7 @@ namespace dxvk {
       cSrcImage           = pResource->GetImage(),
       cSrcSubresource     = vk::makeSubresourceLayers(subresource),
       cDstBuffer          = pResource->GetMappedBuffer(Subresource),
-      cPackedFormat       = pResource->GetPackedFormat()
+      cPackedFormat       = pResource->ImageCopyFormat()
     ] (DxvkContext* ctx) {
       VkOffset3D offset = { 0, 0, 0 };
       VkExtent3D extent = cSrcImage->mipLevelExtent(cSrcSubresource.mipLevel);
@@ -730,13 +730,13 @@ namespace dxvk {
       EmitCs([
         cDstImage       = pResource->GetImage(),
         cDstSubresource = subresource,
-        cDstOffset      = region.Offset,
-        cDstExtent      = region.Extent,
+        cDstOffset      = pResource->ImageCopyOffset(region.Offset),
+        cDstExtent      = pResource->ImageCopyExtent(region.Extent),
         cSrcBuffer      = pResource->GetMappedBuffer(Subresource),
         cSrcOffset      = pResource->ComputeMappedOffset(Subresource, i, region.Offset),
         cSrcRowPitch    = subresourceLayout.RowPitch,
         cSrcDepthPitch  = subresourceLayout.DepthPitch,
-        cPackedFormat   = pResource->GetPackedFormat()
+        cPackedFormat   = pResource->ImageCopyFormat()
       ] (DxvkContext* ctx) {
         ctx->copyBufferToImage(
           cDstImage, cDstSubresource, cDstOffset, cDstExtent,

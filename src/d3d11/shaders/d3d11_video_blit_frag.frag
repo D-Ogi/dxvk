@@ -2,6 +2,7 @@
 
 #extension GL_EXT_samplerless_texture_functions : require
 
+#define EXPORT_YUY2 (3u)
 #define EXPORT_RGBA (0u)
 #define EXPORT_Y (1u)
 #define EXPORT_CbCr (2u)
@@ -21,7 +22,7 @@ uniform ubo_t {
   uvec2 src_extent;
   float y_min;
   float y_max;
-  bool is_planar;
+  uint input_mode;
   uint export_mode;
 };
 
@@ -31,7 +32,7 @@ layout(location = 0) out vec4 o_color;
 layout(set = 0, binding = 1) uniform texture2D s_inputY;
 layout(set = 0, binding = 2) uniform texture2D s_inputCbCr;
 
-void main() {
+vec4 filter_color(vec2 texcoord) {
   // Transform input texture coordinates to
   // account for rotation and source rectangle
   mat3x2 coord_matrix = mat3x2(
@@ -49,9 +50,10 @@ void main() {
   // manually in order to avoid bleeding from pixels outside
   // the source rectangle.
   vec2 abs_size_y = vec2(textureSize(s_inputY, 0));
+  if (input_mode == 2u) abs_size_y.x *= 2.0f;
   vec2 abs_size_c = vec2(textureSize(s_inputCbCr, 0));
 
-  vec2 coord = coord_matrix * vec3(i_texcoord, 1.0f);
+  vec2 coord = coord_matrix * vec3(texcoord, 1.0f);
   coord -= 0.5f / abs_size_y;
 
   vec2 size_factor = abs_size_c / abs_size_y;
@@ -74,7 +76,12 @@ void main() {
     // Fetch actual pixel color in source color space
     vec4 color;
 
-    if (is_planar) {
+    if (input_mode == 2u) {
+      ivec2 pixel = ivec2(fetch_coord);
+      vec4 pair = texelFetch(s_inputY, ivec2(pixel.x / 2, pixel.y), 0);
+      // The CSC matrix consumes Cr/Y/Cb. A pair contains Y0/Cb/Y1/Cr.
+      color = vec4(pair.a, (pixel.x & 1) != 0 ? pair.b : pair.r, pair.g, 1.0f);
+    } else if (input_mode == 1u) {
       color.g  = texelFetch(s_inputY, ivec2(fetch_coord), 0).r;
       color.rb = texelFetch(s_inputCbCr, ivec2(fetch_coord * size_factor), 0).gr;
       color.g  = clamp((color.g - y_min) / (y_max - y_min), 0.0f, 1.0f);
@@ -95,6 +102,21 @@ void main() {
     accum += factor.x * factor.y * color;
   }
 
+  return accum;
+}
+
+void main() {
+  if (export_mode == EXPORT_YUY2) {
+    // A destination texel covers two logical pixels. Sample at their centres,
+    // transform both, then share their mean chroma while keeping both lumas.
+    vec2 half_pixel = 0.25f * dFdx(i_texcoord);
+    vec4 even_color = filter_color(i_texcoord - half_pixel);
+    vec4 odd_color = filter_color(i_texcoord + half_pixel);
+    o_color = vec4(even_color.g, 0.5f * (even_color.b + odd_color.b),
+                   odd_color.g, 0.5f * (even_color.r + odd_color.r));
+    return;
+  }
+  vec4 accum = filter_color(i_texcoord);
   if (export_mode == EXPORT_RGBA)
     o_color = accum;
   else if (export_mode == EXPORT_Y)

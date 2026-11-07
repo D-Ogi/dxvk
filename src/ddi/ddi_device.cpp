@@ -412,7 +412,7 @@ namespace dxvk::ddi {
     VkImageCreateInfo info = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
     info.imageType     = VK_IMAGE_TYPE_2D;
     info.format        = format.Format;
-    info.extent        = { desc.Width, desc.Height, 1u };
+    info.extent        = { desc.Format == DXGI_FORMAT_YUY2 ? desc.Width / 2 : desc.Width, desc.Height, 1u };
     info.mipLevels     = desc.MipLevels;
     info.arrayLayers   = desc.ArraySize;
     info.samples       = VK_SAMPLE_COUNT_1_BIT;

@@ -1289,7 +1289,9 @@ namespace dxvk {
           outputBound = true;
         }
 
-        if (!views[1])
+        if (m_dstFormat == DXGI_FORMAT_YUY2)
+          m_exportMode = ExportYuy2;
+        else if (!views[1])
           m_exportMode = ExportRGBA;
         else if (!vi)
           m_exportMode = ExportY;
@@ -1409,6 +1411,8 @@ namespace dxvk {
 
     VkExtent3D firstExtent = FirstView->mipLevelExtent(0);
     m_dstSizeFact[0] = (float) viewExtent.width  / (float) firstExtent.width;
+    if (m_dstFormat == DXGI_FORMAT_YUY2)
+      m_dstSizeFact[0] *= 0.5f;
     m_dstSizeFact[1] = (float) viewExtent.height / (float) firstExtent.height;
 
     m_ctx->EmitCs([
@@ -1497,6 +1501,8 @@ namespace dxvk {
       }
 
       VkExtent3D viewExtent = cViews[0]->mipLevelExtent(0);
+      if (cSrcFormat == DXGI_FORMAT_YUY2)
+        viewExtent.width *= 2;
 
       VkRect2D srcRect;
       srcRect.offset = { 0, 0 };
@@ -1517,7 +1523,7 @@ namespace dxvk {
       uboData.srcRect = srcRect;
       uboData.yMin = 0.0f;
       uboData.yMax = 1.0f;
-      uboData.isPlanar = cViews[1] != nullptr;
+      uboData.inputMode = cSrcFormat == DXGI_FORMAT_YUY2 ? 2u : cViews[1] ? 1u : 0u;
       uboData.exportMode = cExportMode;
 
       // One matrix carries the whole colour transform: the YCbCr matrix and the

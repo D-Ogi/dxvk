@@ -3043,6 +3043,23 @@ int main(int argc, char** argv) {
   Check(engine->GetImageCreateInfo(&stagingLike, &rejected) == E_INVALIDARG,
     "GetImageCreateInfo rejects a CPU-accessible texture");
 
+  // The public resource keeps its logical width. The shell must allocate the
+  // same packed-pair image that the engine later wraps, not twice its bytes.
+  D3D11_TEXTURE2D_DESC1 yuy2Desc = rtDesc;
+  yuy2Desc.Format = DXGI_FORMAT_YUY2;
+  VkImageCreateInfo yuy2Info = { };
+  CheckHr(engine->GetImageCreateInfo(&yuy2Desc, &yuy2Info), "YUY2 image description");
+  Check(yuy2Info.format == VK_FORMAT_R8G8B8A8_UNORM && yuy2Info.extent.width == W / 2
+     && yuy2Info.extent.height == H && yuy2Desc.Width == W,
+    "YUY2: physical pair width and unchanged logical descriptor");
+  auto yuy2Views = static_cast<const VkImageFormatListCreateInfo*>(yuy2Info.pNext);
+  Check(yuy2Views && yuy2Views->viewFormatCount == 3
+     && (yuy2Info.flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT),
+    "YUY2: RGBA8 and R32 integer view family");
+  yuy2Desc.Width++;
+  Check(engine->GetImageCreateInfo(&yuy2Desc, &rejected) == E_INVALIDARG,
+    "YUY2: odd logical width is refused before allocating");
+
   VkImage image = VK_NULL_HANDLE;
   vr = vk.createImage(device, &imageInfo, nullptr, &image);
   Check(vr == VK_SUCCESS, "shell vkCreateImage from GetImageCreateInfo");

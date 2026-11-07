@@ -147,6 +147,24 @@ namespace dxvk {
      * This also works for staging resources that have no image.
      * \param [in] Level Mip level to compute the size of
      */
+    // YUY2 stores Y0/U/Y1/V in one RGBA8 texel. CPU offsets remain in
+    // logical pixels; only Vulkan image operations use pair coordinates.
+    bool IsPackedYuy2() const { return m_desc.Format == DXGI_FORMAT_YUY2; }
+
+    VkOffset3D ImageCopyOffset(VkOffset3D offset) const {
+      if (IsPackedYuy2()) offset.x /= 2;
+      return offset;
+    }
+
+    VkExtent3D ImageCopyExtent(VkExtent3D extent) const {
+      if (IsPackedYuy2()) extent.width = (extent.width / 2) + (extent.width & 1);
+      return extent;
+    }
+
+    VkFormat ImageCopyFormat() const {
+      return IsPackedYuy2() ? VK_FORMAT_R8G8B8A8_UNORM : GetPackedFormat();
+    }
+
     VkExtent3D MipLevelExtent(uint32_t Level) const {
       return util::computeMipLevelExtent(
         VkExtent3D { m_desc.Width, m_desc.Height, m_desc.Depth }, Level);

@@ -123,6 +123,8 @@ namespace dxvk {
     const D3D11_SUBRESOURCE_DATA* pInitialData,
           ID3D11Texture1D**       ppTexture1D) {
     InitReturnPtr(ppTexture1D);
+    if (pDesc && pDesc->Format == DXGI_FORMAT_YUY2)
+      return E_INVALIDARG;
 
     if (!pDesc)
       return E_INVALIDARG;
@@ -301,6 +303,8 @@ namespace dxvk {
     const D3D11_TEXTURE3D_DESC1*  pDesc,
     const D3D11_SUBRESOURCE_DATA* pInitialData,
           ID3D11Texture3D1**      ppTexture3D) {
+    if (pDesc->Format == DXGI_FORMAT_YUY2)
+      return E_INVALIDARG;
     D3D11_COMMON_TEXTURE_DESC desc;
     desc.Width          = pDesc->Width;
     desc.Height         = pDesc->Height;
@@ -1988,7 +1992,11 @@ namespace dxvk {
   DXGI_VK_FORMAT_INFO D3D11Device::LookupFormat(
           DXGI_FORMAT           Format,
           DXGI_VK_FORMAT_MODE   Mode) const {
-    return m_d3d11Formats.GetFormatInfo(Format, Mode);
+    // YUY2 is raw packed storage, not a Vulkan 4:2:2 sampled image. This
+    // preserves the DXGI RGBA8/R32 UAV view contract on RADV without claiming
+    // native packed-format capabilities in the ICD.
+    return m_d3d11Formats.GetFormatInfo(Format == DXGI_FORMAT_YUY2
+      ? DXGI_FORMAT_R8G8B8A8_UNORM : Format, Mode);
   }
   
   
@@ -2002,6 +2010,13 @@ namespace dxvk {
   DXGI_VK_FORMAT_FAMILY D3D11Device::LookupFamily(
           DXGI_FORMAT           Format,
           DXGI_VK_FORMAT_MODE   Mode) const {
+    if (Format == DXGI_FORMAT_YUY2) {
+      DXGI_VK_FORMAT_FAMILY family = { };
+      family.Add(VK_FORMAT_R8G8B8A8_UNORM);
+      family.Add(VK_FORMAT_R8G8B8A8_UINT);
+      family.Add(VK_FORMAT_R32_UINT);
+      return family;
+    }
     return m_d3d11Formats.GetFormatFamily(Format, Mode);
   }
 
@@ -2387,13 +2402,11 @@ namespace dxvk {
       const VkFormat depthFormat = LookupFormat(Format, DXGI_VK_FORMAT_MODE_DEPTH).Format;
       
       if (GetImageTypeSupport(fmtMapping.Format, VK_IMAGE_TYPE_1D, 0)) flags1 |= D3D11_FORMAT_SUPPORT_TEXTURE1D;
-      // bc250 (BD-223): a packed 4:2:2 format (YUY2) gets a mutable image with its R8G8B8A8 view
-      // formats (D3D11CommonTexture), and it is sampled by the video processor. Report TEXTURE2D
-      // only when that image can be created: on gfx1013 the plain query passed and the texture
-      // creation failed, which removed the device (kit-vddi2 lab run, format 107).
+      // The texture constructor uses mutable storage for packed formats and
+      // YUY2's RGBA8 pair emulation. Query that creation flag as well.
       VkImageCreateFlags flags2d = 0;
 
-      if ((fmtMapping.Format == VK_FORMAT_G8B8G8R8_422_UNORM || fmtMapping.Format == VK_FORMAT_B8G8R8G8_422_UNORM)
+      if ((Format == DXGI_FORMAT_YUY2 || fmtMapping.Format == VK_FORMAT_G8B8G8R8_422_UNORM || fmtMapping.Format == VK_FORMAT_B8G8R8G8_422_UNORM)
        && LookupFamily(Format, DXGI_VK_FORMAT_MODE_ANY).FormatCount > 1)
         flags2d = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
 
@@ -2531,6 +2544,14 @@ namespace dxvk {
     if (flags1 | flags2)
       flags1 |= D3D11_FORMAT_SUPPORT_CPU_LOCKABLE;
     
+    if (Format == DXGI_FORMAT_YUY2) {
+      flags1 &= D3D11_FORMAT_SUPPORT_TEXTURE2D | D3D11_FORMAT_SUPPORT_SHADER_LOAD
+             |  D3D11_FORMAT_SUPPORT_SHADER_SAMPLE | D3D11_FORMAT_SUPPORT_CPU_LOCKABLE
+             |  D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW
+             |  D3D11_FORMAT_SUPPORT_VIDEO_PROCESSOR_INPUT | D3D11_FORMAT_SUPPORT_VIDEO_PROCESSOR_OUTPUT;
+      flags2 &= D3D11_FORMAT_SUPPORT2_UAV_TYPED_LOAD | D3D11_FORMAT_SUPPORT2_UAV_TYPED_STORE;
+    }
+
     // Write back format support flags
     if (pFlags1 != nullptr) *pFlags1 = flags1;
     if (pFlags2 != nullptr) *pFlags2 = flags2;

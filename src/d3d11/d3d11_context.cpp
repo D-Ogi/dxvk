@@ -4378,9 +4378,9 @@ namespace dxvk {
         cSrcImage  = pSrcTexture->GetImage(),
         cDstLayers = *pDstLayers,
         cSrcLayers = *pSrcLayers,
-        cDstOffset = DstOffset,
-        cSrcOffset = SrcOffset,
-        cExtent    = SrcExtent
+        cDstOffset = pDstTexture->ImageCopyOffset(DstOffset),
+        cSrcOffset = pSrcTexture->ImageCopyOffset(SrcOffset),
+        cExtent    = pSrcTexture->ImageCopyExtent(SrcExtent)
       ] (DxvkContext* ctx) {
         // CopyResource can only copy between different images, and
         // CopySubresourceRegion can only copy data from one single
@@ -4436,9 +4436,9 @@ namespace dxvk {
             EmitCs([
               cDstImage   = pDstTexture->GetImage(),
               cDstLayers  = dstLayer,
-              cDstOffset  = DstOffset,
-              cDstExtent  = dstExtent,
-              cDstFormat  = pDstTexture->GetPackedFormat(),
+              cDstOffset  = pDstTexture->ImageCopyOffset(DstOffset),
+              cDstExtent  = pDstTexture->ImageCopyExtent(dstExtent),
+              cDstFormat  = pDstTexture->ImageCopyFormat(),
               cSrcBuffer  = pSrcTexture->GetMappedBuffer(srcSubresource),
               cSrcLayout  = pSrcTexture->GetSubresourceLayout(srcAspectMask, srcSubresource),
               cSrcOffset  = pSrcTexture->ComputeMappedOffset(srcSubresource, j, SrcOffset),
@@ -4455,10 +4455,10 @@ namespace dxvk {
 
             EmitCs([
               cSrcImage   = pSrcTexture->GetImage(),
-              cSrcFormat  = pSrcTexture->GetPackedFormat(),
+              cSrcFormat  = pSrcTexture->ImageCopyFormat(),
               cSrcLayers  = srcLayer,
-              cSrcOffset  = SrcOffset,
-              cSrcExtent  = SrcExtent,
+              cSrcOffset  = pSrcTexture->ImageCopyOffset(SrcOffset),
+              cSrcExtent  = pSrcTexture->ImageCopyExtent(SrcExtent),
               cDstBuffer  = pDstTexture->GetMappedBuffer(dstSubresource),
               cDstLayout  = pDstTexture->GetSubresourceLayout(dstAspectMask, dstSubresource),
               cDstOffset  = pDstTexture->ComputeMappedOffset(dstSubresource, j, DstOffset),
@@ -5764,10 +5764,10 @@ namespace dxvk {
       EmitCs([
         cDstImage         = pDstTexture->GetImage(),
         cDstLayers        = vk::makeSubresourceLayers(*pDstSubresource),
-        cDstOffset        = DstOffset,
-        cDstExtent        = DstExtent,
+        cDstOffset        = pDstTexture->ImageCopyOffset(DstOffset),
+        cDstExtent        = pDstTexture->ImageCopyExtent(DstExtent),
         cStagingSlice     = std::move(StagingBuffer),
-        cPackedFormat     = pDstTexture->GetPackedFormat()
+        cPackedFormat     = pDstTexture->ImageCopyFormat()
       ] (DxvkContext* ctx) {
         ctx->copyBufferToImage(cDstImage,
           cDstLayers, cDstOffset, cDstExtent,

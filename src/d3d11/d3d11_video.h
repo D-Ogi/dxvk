@@ -654,6 +654,7 @@ namespace dxvk {
   private:
 
     enum ExportMode : uint32_t {
+      ExportYuy2 = 3,
       ExportRGBA = 0,
       ExportY    = 1,
       ExportCbCr = 2,
@@ -664,7 +665,7 @@ namespace dxvk {
       float coordMatrix[3][2];
       VkRect2D srcRect;
       float yMin, yMax;
-      VkBool32 isPlanar;
+      uint32_t inputMode; // 0 = RGB, 1 = planar, 2 = packed YUY2
       ExportMode exportMode;
     };
 
