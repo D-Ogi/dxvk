@@ -3060,6 +3060,45 @@ int main(int argc, char** argv) {
   Check(engine->GetImageCreateInfo(&yuy2Desc, &rejected) == E_INVALIDARG,
     "YUY2: odd logical width is refused before allocating");
 
+  // YUY2 caps and views agree (Deep3 T003 F1): the caps are the YUY2 row of the D3D11.1 format table, and shader
+  // access goes through the DXGI view formats of YUY2 (RGBA8 UNORM/UINT), never through a view of format YUY2.
+  {
+    UINT support = 0u;
+    CheckHr(d3d->CheckFormatSupport(DXGI_FORMAT_YUY2, &support), "CheckFormatSupport YUY2");
+    const UINT required = D3D11_FORMAT_SUPPORT_TEXTURE2D | D3D11_FORMAT_SUPPORT_SHADER_LOAD
+      | D3D11_FORMAT_SUPPORT_SHADER_SAMPLE | D3D11_FORMAT_SUPPORT_SHADER_GATHER | D3D11_FORMAT_SUPPORT_CPU_LOCKABLE
+      | D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW | D3D11_FORMAT_SUPPORT_VIDEO_PROCESSOR_INPUT;
+    const UINT disallowed = D3D11_FORMAT_SUPPORT_RENDER_TARGET | D3D11_FORMAT_SUPPORT_MIP | D3D11_FORMAT_SUPPORT_TEXTURECUBE
+      | D3D11_FORMAT_SUPPORT_TEXTURE1D | D3D11_FORMAT_SUPPORT_TEXTURE3D | D3D11_FORMAT_SUPPORT_MULTISAMPLE_RENDERTARGET;
+    Check((support & required) == required && !(support & disallowed),
+      "YUY2 caps: ld, sample, gather4, typed UAV, CPU lockable, video input; no render target, mips, cube, 1D/3D, MSAA");
+
+    D3D11_FEATURE_DATA_FORMAT_SUPPORT2 support2 = { DXGI_FORMAT_YUY2, 0u };
+    CheckHr(d3d->CheckFeatureSupport(D3D11_FEATURE_FORMAT_SUPPORT2, &support2, sizeof(support2)), "CheckFeatureSupport FORMAT_SUPPORT2 YUY2");
+    Check(!(support2.OutFormatSupport2 & D3D11_FORMAT_SUPPORT2_UAV_TYPED_LOAD),
+      "YUY2 caps: no UAV typed load (the R32_UINT UAV view reads and writes)");
+
+    D3D11_TEXTURE2D_DESC texDesc = { };
+    texDesc.Width = W; texDesc.Height = H; texDesc.MipLevels = 1u; texDesc.ArraySize = 1u;
+    texDesc.Format = DXGI_FORMAT_YUY2; texDesc.SampleDesc = { 1u, 0u };
+    texDesc.Usage = D3D11_USAGE_DEFAULT; texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> yuy2Tex;
+    if (CheckHr(d3d->CreateTexture2D(&texDesc, nullptr, &yuy2Tex), "CreateTexture2D YUY2 shader resource")) {
+      D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = { };
+      srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+      srvDesc.Texture2D.MipLevels = 1u;
+      Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> pairView, yuy2View;
+      srvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+      CheckHr(d3d->CreateShaderResourceView(yuy2Tex.Get(), &srvDesc, &pairView), "YUY2: R8G8B8A8_UNORM pair SRV");
+      srvDesc.Format = DXGI_FORMAT_R8G8B8A8_UINT;
+      pairView.Reset();
+      CheckHr(d3d->CreateShaderResourceView(yuy2Tex.Get(), &srvDesc, &pairView), "YUY2: R8G8B8A8_UINT pair SRV");
+      srvDesc.Format = DXGI_FORMAT_YUY2;
+      Check(d3d->CreateShaderResourceView(yuy2Tex.Get(), &srvDesc, &yuy2View) == E_INVALIDARG && !yuy2View,
+        "YUY2: an SRV of format YUY2 is not a DXGI view format of YUY2 (E_INVALIDARG)");
+    }
+  }
+
   VkImage image = VK_NULL_HANDLE;
   vr = vk.createImage(device, &imageInfo, nullptr, &image);
   Check(vr == VK_SUCCESS, "shell vkCreateImage from GetImageCreateInfo");
