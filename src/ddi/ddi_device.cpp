@@ -1293,14 +1293,18 @@ namespace dxvk::ddi {
     if (Logger::logLevel() > LogLevel::Info)
       return;
 
-    // Translation counts are the process's, the rest this device's; the cache logs its own at its end
+    // The translation counts are the process's (DxvkIrShader keeps them for all devices), the rest this device's;
+    // the line says so. The cache logs its own at its end.
     DxvkIrTranslationStats translation = DxvkIrShader::getTranslationStats();
     DxvkDeferredCompileStats deferred = m_dxvkDevice->getDeferredCompileStats();
 
-    Logger::info(str::format("amdgpu_wddm_dxvk: Shader stats:",
-      " translated=", translation.count, " translate_ms=", translation.micros / 1000u,
+    // BD-327 diagnostics: the line goes to this device's own sink, so the shell gets it with this device's Shell.
+    // Through Logger::info it would go to the sink registered first, which is the oldest live device of the
+    // process, and the shell would name that device (RotTR, 2026-11-09: two closes named a third device).
+    Logger::logToSink(m_logSink.get(), LogLevel::Info, str::format("amdgpu_wddm_dxvk: Shader stats:",
+      " process translated=", translation.count, " translate_ms=", translation.micros / 1000u,
       " on_workers=", translation.workerCount, " workers_ms=", translation.workerMicros / 1000u,
-      " queued=", deferred.translationsQueued, " pending=", deferred.translationsPending,
+      "; device queued=", deferred.translationsQueued, " pending=", deferred.translationsPending,
       " libraries_queued=", deferred.librariesQueued, " libraries_deferred=", deferred.librariesCompiled,
       " libraries_ready=", deferred.librariesReady, " libraries_on_demand=", deferred.librariesOnDemand,
       " optimized_queued=", deferred.optimizedQueued, " optimized_deferred=", deferred.optimizedCompiled,

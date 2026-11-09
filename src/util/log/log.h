@@ -83,6 +83,19 @@ namespace dxvk {
     static void removeSink(void* context);
 
     /**
+     * \brief Sends a line to one registered sink
+     *
+     * For a line that belongs to one sink's owner, which must not go to
+     * the sink registered first when that is another owner's. Under the
+     * same lock as every other sink call. If no sink of this context is
+     * registered, the line goes where \ref log sends it.
+     * \param [in] context The sink's context
+     * \param [in] level The line's level
+     * \param [in] message The line
+     */
+    static void logToSink(void* context, LogLevel level, const std::string& message);
+
+    /**
      * \brief Keeps the calling thread's lines away from sinks
      *
      * For worker threads that must not call a sink. While a sink is
