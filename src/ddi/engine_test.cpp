@@ -4676,6 +4676,53 @@ int main(int argc, char** argv) {
   std::printf("      %u new threads in amdgpu_wddm_dxvk.dll\n", engineThreads);
   Check(otherEngineThreads == 0u, "the engine's own threads are shader translation workers; no cache writer thread");
 
+  // ---- BD-327 diagnostics: the stats line of a device goes to that device's own Log ----
+  // A second device made and released while the first one lives. The process's first sink is the first device's,
+  // and the stats line of the second device must still reach the second device's Shell, not the first one's.
+  {
+    auto countStats = [] (const Shell& s) {
+      size_t n = 0u;
+      for (const auto& line : s.lines)
+        n += line.find("amdgpu_wddm_dxvk: Shader stats:") != std::string::npos ? 1u : 0u;
+      return n;
+    };
+
+    Shell side;
+    InitializeCriticalSection(&side.queueLock);
+    side.mainThread = GetCurrentThreadId();
+
+    BC250_DXVK_SHELL_SERVICES sideServices = services;
+    sideServices.Shell = &side;
+
+    BC250_DXVK_DEVICE_CREATE_INFO sideInfo = createInfo;
+    sideInfo.Services = &sideServices;
+
+    const size_t firstBefore = countStats(shell);
+    IBc250DxvkDevice* engineSide = nullptr;
+
+    // The engine writes info lines only at DXVK_LOG_LEVEL info or below (the default)
+    char levelEnv[16] = { };
+    const DWORD levelLen = GetEnvironmentVariableA("DXVK_LOG_LEVEL", levelEnv, sizeof(levelEnv));
+    const bool infoLines = !levelLen || levelLen >= sizeof(levelEnv) || !_stricmp(levelEnv, "info") || !_stricmp(levelEnv, "debug") || !_stricmp(levelEnv, "trace");
+
+    if (CheckHr(funcs.CreateDevice(&sideInfo, &engineSide), "stats sink: a second live device")) {
+      Check(engineSide->Release() == 0u, "stats sink: the second device's final Release reports no leaked references");
+
+      if (!infoLines) {
+        std::printf("      stats sink: DXVK_LOG_LEVEL=%s, no info lines: the sink checks are skipped\n", levelEnv);
+      } else {
+        Check(countStats(side) == 1u, "stats sink: the second device's stats line reaches its own Shell");
+        Check(countStats(shell) == firstBefore, "stats sink: the first device's Shell gets no stats line of the second device");
+        Check(StatValue(side.lines, "amdgpu_wddm_dxvk: Shader stats:", "translated") >= 0
+           && HasLine(side.lines, "amdgpu_wddm_dxvk: Shader stats: process translated=")
+           && HasLine(side.lines, "; device queued="),
+          "stats sink: the line labels the translation counts as the process's and the rest as the device's");
+      }
+    }
+
+    DeleteCriticalSection(&side.queueLock);
+  }
+
   // ---- teardown (E4, E5) ----
   rtv.Reset();
   layout.Reset();

@@ -72,6 +72,30 @@ namespace dxvk {
   }
 
 
+  void Logger::logToSink(void* context, LogLevel level, const std::string& message) {
+    if (level < s_instance.m_minLevel)
+      return;
+
+    { std::lock_guard<dxvk::mutex> lock(s_instance.m_mutex);
+
+      for (const auto& sink : s_instance.m_sinks) {
+        if (sink.context != context)
+          continue;
+
+        std::stringstream stream(message);
+        std::string line;
+
+        while (std::getline(stream, line, '\n'))
+          sink.fn(sink.context, level, line.c_str());
+
+        return;
+      }
+    }
+
+    log(level, message);
+  }
+
+
   void Logger::deferThreadLines() {
     t_deferLines = true;
   }
