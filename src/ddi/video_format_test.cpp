@@ -80,6 +80,29 @@ int main() {
   check(m.run() == 0 && m.calls == 0, "unsupported numeric/format interpretation");
   m = {}; m.request = rgb;
   check(D3D11VideoFormatSupport(m.request, [&](const auto& q) { return m.image(q); }, [&](auto f, auto t) { return m.view(f, t); }, nullptr) == E_INVALIDARG && !m.calls, "null output argument");
+
+  // YUY2 CheckFormatSupport: the RGBA8 mapping's flags masked to the YUY2 row of the D3D11.1 format table.
+  UINT rgba1 = D3D11_FORMAT_SUPPORT_TEXTURE1D | D3D11_FORMAT_SUPPORT_TEXTURE2D | D3D11_FORMAT_SUPPORT_TEXTURE3D
+    | D3D11_FORMAT_SUPPORT_TEXTURECUBE | D3D11_FORMAT_SUPPORT_SHADER_LOAD | D3D11_FORMAT_SUPPORT_SHADER_SAMPLE
+    | D3D11_FORMAT_SUPPORT_SHADER_GATHER | D3D11_FORMAT_SUPPORT_MIP | D3D11_FORMAT_SUPPORT_MIP_AUTOGEN
+    | D3D11_FORMAT_SUPPORT_RENDER_TARGET | D3D11_FORMAT_SUPPORT_BLENDABLE | D3D11_FORMAT_SUPPORT_CPU_LOCKABLE
+    | D3D11_FORMAT_SUPPORT_MULTISAMPLE_RENDERTARGET | D3D11_FORMAT_SUPPORT_DISPLAY
+    | D3D11_FORMAT_SUPPORT_CAST_WITHIN_BIT_LAYOUT | D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW
+    | D3D11_FORMAT_SUPPORT_VIDEO_PROCESSOR_INPUT | D3D11_FORMAT_SUPPORT_VIDEO_PROCESSOR_OUTPUT;
+  UINT rgba2 = D3D11_FORMAT_SUPPORT2_UAV_TYPED_LOAD | D3D11_FORMAT_SUPPORT2_UAV_TYPED_STORE
+    | D3D11_FORMAT_SUPPORT2_SHAREABLE | D3D11_FORMAT_SUPPORT2_OUTPUT_MERGER_LOGIC_OP | D3D11_FORMAT_SUPPORT2_TILED;
+  D3D11MaskYuy2FormatSupport(&rgba1, &rgba2);
+  check(rgba1 == (D3D11_FORMAT_SUPPORT_TEXTURE2D | D3D11_FORMAT_SUPPORT_SHADER_LOAD | D3D11_FORMAT_SUPPORT_SHADER_SAMPLE
+    | D3D11_FORMAT_SUPPORT_SHADER_GATHER | D3D11_FORMAT_SUPPORT_CPU_LOCKABLE | D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW
+    | D3D11_FORMAT_SUPPORT_VIDEO_PROCESSOR_INPUT | D3D11_FORMAT_SUPPORT_VIDEO_PROCESSOR_OUTPUT),
+    "YUY2 flags1: the table row (ld, sample, gather4, typed UAV, CPU lockable, video processor)");
+  check(rgba2 == (D3D11_FORMAT_SUPPORT2_UAV_TYPED_STORE | D3D11_FORMAT_SUPPORT2_SHAREABLE),
+    "YUY2 flags2: typed store and shared resource, no typed load");
+  UINT none1 = D3D11_FORMAT_SUPPORT_RENDER_TARGET, none2 = D3D11_FORMAT_SUPPORT2_UAV_TYPED_LOAD;
+  D3D11MaskYuy2FormatSupport(&none1, &none2);
+  check(none1 == 0 && none2 == 0, "YUY2 mask adds no flag that the mapping did not report");
+  D3D11MaskYuy2FormatSupport(nullptr, nullptr);
+  check(true, "YUY2 mask accepts null outputs");
   printf("DIRECTIONAL-FORMAT %s %d checks %d failures\n", failures ? "FAIL" : "PASS", checks, failures);
   return failures ? 1 : 0;
 }

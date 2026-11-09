@@ -28,6 +28,7 @@
 #include "d3d11_swapchain.h"
 #include "d3d11_texture.h"
 #include "d3d11_video.h"
+#include "d3d11_video_format.h"
 
 #include "../wsi/wsi_window.h"
 
@@ -2544,13 +2545,8 @@ namespace dxvk {
     if (flags1 | flags2)
       flags1 |= D3D11_FORMAT_SUPPORT_CPU_LOCKABLE;
     
-    if (Format == DXGI_FORMAT_YUY2) {
-      flags1 &= D3D11_FORMAT_SUPPORT_TEXTURE2D | D3D11_FORMAT_SUPPORT_SHADER_LOAD
-             |  D3D11_FORMAT_SUPPORT_SHADER_SAMPLE | D3D11_FORMAT_SUPPORT_CPU_LOCKABLE
-             |  D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW
-             |  D3D11_FORMAT_SUPPORT_VIDEO_PROCESSOR_INPUT | D3D11_FORMAT_SUPPORT_VIDEO_PROCESSOR_OUTPUT;
-      flags2 &= D3D11_FORMAT_SUPPORT2_UAV_TYPED_LOAD | D3D11_FORMAT_SUPPORT2_UAV_TYPED_STORE;
-    }
+    if (Format == DXGI_FORMAT_YUY2)
+      D3D11MaskYuy2FormatSupport(&flags1, &flags2);
 
     // Write back format support flags
     if (pFlags1 != nullptr) *pFlags1 = flags1;
