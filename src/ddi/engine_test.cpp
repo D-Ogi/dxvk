@@ -216,8 +216,20 @@ namespace {
     std::atomic<uint32_t> scopeLeaves    { 0u };
     std::atomic<uint32_t> scopeOnCaller  { 0u };
     std::atomic<uint32_t> scopeUnpaired  { 0u };
+    // 1.8 (BD-373): ResolveMemory calls, and the events of MemoryEvents in their order
+    std::atomic<uint32_t> resolveCalls   { 0u };
+    std::atomic<uint32_t> resolveForeign { 0u };
+    std::mutex            memoryMutex;
+    std::vector<BC250_DXVK_MEMORY_EVENT> memoryEvents;
     std::vector<std::string> errors;
     std::vector<std::string> lines;
+
+    std::vector<BC250_DXVK_MEMORY_EVENT> TakeMemoryEvents() {
+      std::lock_guard<std::mutex> lock(memoryMutex);
+      std::vector<BC250_DXVK_MEMORY_EVENT> result;
+      result.swap(memoryEvents);
+      return result;
+    }
 
     bool HasError(const char* text) const {
       for (const auto& e : errors) {
@@ -240,6 +252,24 @@ namespace {
       EnterCriticalSection(&s->queueLock);
     else
       LeaveCriticalSection(&s->queueLock);
+  }
+
+  // 1.8 (BD-373): a test shell has no kernel allocations; the memory handle stands for one of 1 GiB
+  UINT64 APIENTRY ResolveMemory(void* shell, VkDeviceMemory memory, UINT64* bytes) {
+    auto s = static_cast<Shell*>(shell);
+    s->resolveCalls++;
+
+    if (!IsCallerThread(s->mainThread))
+      s->resolveForeign++;
+
+    *bytes = UINT64(1u) << 30;
+    return (UINT64)(memory);
+  }
+
+  void APIENTRY MemoryEvents(void* shell, const BC250_DXVK_MEMORY_EVENT* events, UINT32 count) {
+    auto s = static_cast<Shell*>(shell);
+    std::lock_guard<std::mutex> lock(s->memoryMutex);
+    s->memoryEvents.insert(s->memoryEvents.end(), events, events + count);
   }
 
   // 1.7 (BD-327): a pipeline worker enters once when it starts and leaves once on the same thread before it ends
@@ -2330,6 +2360,8 @@ int main(int argc, char** argv) {
   services.QueueLock = &QueueLock;
   services.Log       = &Log;
   services.WorkerScope = &WorkerScope;
+  services.ResolveMemory = &ResolveMemory;
+  services.MemoryEvents  = &MemoryEvents;
 
   BC250_DXVK_DEVICE_CREATE_INFO createInfo = { sizeof(createInfo) };
   createInfo.AbiVersion   = BC250_DXVK_ENGINE_ABI_VERSION;
@@ -2971,6 +3003,205 @@ int main(int argc, char** argv) {
       }
 
       Check(d3d->GetDeviceRemovedReason() == S_OK, "after the offer cases: device not removed");
+    }
+  }
+
+  // ---- ABI 1.8: allocation events of engine resources (BD-373) ----
+  {
+    Microsoft::WRL::ComPtr<IBc250DxvkDevice6> engine6;
+
+    if (CheckHr(engine->QueryInterface(IID_PPV_ARGS(&engine6)), "QueryInterface IBc250DxvkDevice6")) {
+      using Event = BC250_DXVK_MEMORY_EVENT;
+
+      // The trace as a consumer reads it: the live mappings of each cookie. A MAP or RUNDOWN adds one, an UNMAP
+      // must name a live one with the values of its map. Returns false at the first event that breaks this.
+      std::map<UINT64, std::vector<Event>> live;
+      auto same = [] (const Event& a, const Event& b) {
+        return a.Allocation == b.Allocation && a.Offset == b.Offset && a.Size == b.Size;
+      };
+      auto apply = [&] (const std::vector<Event>& events) {
+        for (const Event& e : events) {
+          auto& list = live[e.Resource];
+
+          if (e.Kind == BC250_DXVK_MEMORY_EVENT_UNMAP) {
+            auto at = std::find_if(list.begin(), list.end(), [&] (const Event& m) { return same(m, e); });
+
+            if (at == list.end())
+              return false;
+
+            list.erase(at);
+          } else if (e.Kind == BC250_DXVK_MEMORY_EVENT_MAP || e.Kind == BC250_DXVK_MEMORY_EVENT_RUNDOWN) {
+            if (!e.Allocation || !e.Size || e.AllocationSize != (UINT64(1u) << 30))
+              return false;
+
+            list.push_back(e);
+          } else {
+            return false;
+          }
+        }
+
+        return true;
+      };
+      auto only = [] (const std::vector<Event>& events, UINT64 cookie) {
+        return std::all_of(events.begin(), events.end(), [&] (const Event& e) { return e.Resource == cookie; });
+      };
+      auto discard = [&] (ID3D11Resource* resource, UINT count) {
+        for (UINT i = 0u; i < count; i++) {
+          D3D11_MAPPED_SUBRESOURCE m = { };
+
+          if (SUCCEEDED(ctx->Map(resource, 0u, D3D11_MAP_WRITE_DISCARD, 0u, &m))) {
+            static_cast<uint8_t*>(m.pData)[0] = uint8_t(i);
+            ctx->Unmap(resource, 0u);
+          }
+        }
+
+        ctx->Flush();
+      };
+
+      constexpr UINT64 BufferCookie = 0x10010u, TextureCookie = 0x10020u, MoveCookie = 0x10030u;
+
+      D3D11_BUFFER_DESC dynDesc = { };
+      dynDesc.ByteWidth      = 64u << 10;
+      dynDesc.Usage          = D3D11_USAGE_DYNAMIC;
+      dynDesc.BindFlags      = D3D11_BIND_VERTEX_BUFFER;
+      dynDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+
+      D3D11_TEXTURE2D_DESC dynTexDesc = { };
+      dynTexDesc.Width = dynTexDesc.Height = 256u;
+      dynTexDesc.MipLevels = dynTexDesc.ArraySize = 1u;
+      dynTexDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+      dynTexDesc.SampleDesc.Count = 1u;
+      dynTexDesc.Usage          = D3D11_USAGE_DYNAMIC;
+      dynTexDesc.BindFlags      = D3D11_BIND_SHADER_RESOURCE;
+      dynTexDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+
+      D3D11_TEXTURE2D_DESC moveDesc = dynTexDesc;
+      moveDesc.Width = moveDesc.Height = 1024u;
+      moveDesc.Usage          = D3D11_USAGE_DEFAULT;
+      moveDesc.CPUAccessFlags = 0u;
+
+      Microsoft::WRL::ComPtr<ID3D11Buffer> dyn, plain;
+      Microsoft::WRL::ComPtr<ID3D11Texture2D> dynTex, moving;
+      bool made = CheckHr(d3d->CreateBuffer(&dynDesc, nullptr, &dyn), "1.8: dynamic buffer")
+               && CheckHr(d3d->CreateBuffer(&dynDesc, nullptr, &plain), "1.8: untracked dynamic buffer")
+               && CheckHr(d3d->CreateTexture2D(&dynTexDesc, nullptr, &dynTex), "1.8: dynamic texture")
+               && CheckHr(d3d->CreateTexture2D(&moveDesc, nullptr, &moving), "1.8: default texture");
+
+      if (made) {
+        shell.TakeMemoryEvents();
+        Check(engine6->TrackResourceMemory(nullptr, BufferCookie) == E_INVALIDARG, "TrackResourceMemory(NULL) is E_INVALIDARG");
+        Check(engine6->TrackResourceMemory(dyn.Get(), BufferCookie) == S_OK, "TrackResourceMemory: a dynamic buffer");
+        Check(engine6->TrackResourceMemory(dyn.Get(), BufferCookie) == S_FALSE, "a second TrackResourceMemory of it is S_FALSE");
+        Check(engine6->TrackResourceMemory(dynTex.Get(), TextureCookie) == S_OK, "TrackResourceMemory: a dynamic texture");
+        Check(engine6->TrackResourceMemory(moving.Get(), MoveCookie) == S_OK, "TrackResourceMemory: a default texture");
+        Check(engine6->TrackResourceMemory(plain.Get(), 0u) == S_FALSE, "TrackResourceMemory(0) of an untracked resource is S_FALSE");
+
+        uint32_t resolves = shell.resolveCalls.load();
+        discard(dyn.Get(), 64u);
+        discard(dynTex.Get(), 4u);
+        Check(shell.TakeMemoryEvents().empty(), "reporting off: no event at track, nor for Map DISCARD of tracked resources");
+        std::printf("      reporting off: %u ResolveMemory calls for 68 renames\n", shell.resolveCalls.load() - resolves);
+
+        // The ETW callback thread: enable, then a capture-state rundown
+        std::thread([&] { engine6->SetMemoryReporting(TRUE); engine6->ReportMemory(); }).join();
+        std::vector<Event> rundown = shell.TakeMemoryEvents();
+        bool rundownKinds = std::all_of(rundown.begin(), rundown.end(),
+          [] (const Event& e) { return e.Kind == BC250_DXVK_MEMORY_EVENT_RUNDOWN; });
+        Check(rundownKinds && apply(rundown) && live[BufferCookie].size() == 1u && live[MoveCookie].size() == 1u
+           && live[BufferCookie][0].Size >= dynDesc.ByteWidth,
+          "ReportMemory on another thread: RUNDOWN of the buffer and of the default texture, with their cookies");
+
+        Event before = live[BufferCookie].empty() ? Event() : live[BufferCookie][0];
+        discard(dyn.Get(), 1u);
+        std::vector<Event> rename = shell.TakeMemoryEvents();
+        Check(rename.size() == 2u && rename[0].Kind == BC250_DXVK_MEMORY_EVENT_UNMAP && same(rename[0], before)
+           && rename[1].Kind == BC250_DXVK_MEMORY_EVENT_MAP && (rename[1].Flags & BC250_DXVK_MEMORY_RENAMED)
+           && only(rename, BufferCookie) && apply(rename),
+          "Map DISCARD while on: UNMAP of the old range, then MAP of the new one with RENAMED");
+
+        discard(dynTex.Get(), 2u);
+        std::vector<Event> texEvents = shell.TakeMemoryEvents();
+        Check(!texEvents.empty() && only(texEvents, TextureCookie) && apply(texEvents),
+          "Map DISCARD of a dynamic texture while on: its events pair up");
+        std::printf("      dynamic texture: %zu events for 2 Map/Unmap\n", texEvents.size());
+
+        Microsoft::WRL::ComPtr<IBc250DxvkDevice5> engine5;
+        BC250_DXVK_OFFER_MEMORY offer[4] = { };
+        UINT offerCount = 0u;
+
+        if (SUCCEEDED(engine->QueryInterface(IID_PPV_ARGS(&engine5)))
+         && engine5->PrepareOffer(moving.Get(), 4u, offer, &offerCount) == S_OK) {
+          std::vector<Event> move = shell.TakeMemoryEvents();
+          Check(only(move, MoveCookie) && apply(move) && live[MoveCookie].size() == 1u
+             && live[MoveCookie][0].Offset == 0u && (VkDeviceMemory)(live[MoveCookie][0].Allocation) == offer[0].Memory,
+            "PrepareOffer moves the default texture: UNMAP of its old range, MAP of its own memory");
+          Check(engine5->EndOffer(moving.Get(), 0u) == S_OK, "1.8: EndOffer");
+        } else {
+          std::printf("SKIP  move to memory of its own: PrepareOffer of the default texture was not S_OK\n");
+        }
+
+        // Off again: nothing more, and the next rundown still knows the current ranges
+        engine6->SetMemoryReporting(FALSE);
+        discard(dyn.Get(), 8u);
+        Check(shell.TakeMemoryEvents().empty(), "reporting off again: no event");
+
+        // The UNMAP of the next rename names the range that the changes while off left; a rundown then has the new one
+        engine6->SetMemoryReporting(TRUE);
+        discard(dyn.Get(), 1u);
+        std::vector<Event> next = shell.TakeMemoryEvents();
+        live.clear();
+        engine6->ReportMemory();
+        std::vector<Event> again = shell.TakeMemoryEvents();
+        Check(next.size() == 2u && next[1].Kind == BC250_DXVK_MEMORY_EVENT_MAP && apply(again)
+           && live[BufferCookie].size() == 1u && same(live[BufferCookie][0], next[1]),
+          "after changes made while off: a rename and a rundown name the current range");
+
+        Check(engine6->TrackResourceMemory(dyn.Get(), 0u) == S_OK
+           && engine6->TrackResourceMemory(dynTex.Get(), 0u) == S_OK
+           && engine6->TrackResourceMemory(moving.Get(), 0u) == S_OK, "TrackResourceMemory(0) ends tracking");
+        std::vector<Event> ends = shell.TakeMemoryEvents();
+        Check(apply(ends) && live[BufferCookie].empty() && live[TextureCookie].empty() && live[MoveCookie].empty(),
+          "end of tracking while on: an UNMAP of each live range");
+
+        engine6->ReportMemory();
+        Check(shell.TakeMemoryEvents().empty(), "no RUNDOWN after the end of tracking");
+        engine6->SetMemoryReporting(FALSE);
+
+        Check(shell.resolveForeign.load() == 0u, "ResolveMemory only on the thread inside the engine call (E2)");
+
+        // Off-cost: Map DISCARD of the same buffer, tracked and untracked in turn, with reporting off; best of
+        // ten rounds of each
+        constexpr UINT Maps = 20000u;
+        double best[2] = { 1e30, 1e30 };
+        bool toggled = true;
+
+        for (UINT round = 0u; round < 10u; round++) {
+          for (UINT which = 0u; which < 2u; which++) {
+            ID3D11Buffer* b = dyn.Get();
+            toggled = toggled && engine6->TrackResourceMemory(b, which ? 0u : BufferCookie) == S_OK;
+            double t0 = nowMs();
+
+            for (UINT i = 0u; i < Maps; i++) {
+              D3D11_MAPPED_SUBRESOURCE m = { };
+
+              if (SUCCEEDED(ctx->Map(b, 0u, D3D11_MAP_WRITE_DISCARD, 0u, &m)))
+                ctx->Unmap(b, 0u);
+
+              if ((i & 255u) == 255u)
+                ctx->Flush();
+            }
+
+            ctx->Flush();
+            best[which] = std::min(best[which], (nowMs() - t0) * 1e6 / Maps);
+          }
+        }
+
+        std::printf("      Map DISCARD + Unmap, reporting off: tracked %.1f ns, untracked %.1f ns per map\n",
+          best[0], best[1]);
+        Check(toggled && shell.TakeMemoryEvents().empty(), "1.8: tracking on and off in the timing rounds, no event");
+      }
+
+      Check(d3d->GetDeviceRemovedReason() == S_OK, "after the 1.8 cases: device not removed");
     }
   }
 
@@ -4844,6 +5075,8 @@ int main(int argc, char** argv) {
     if (!cachePass) {
       warmServices.Size = BC250_DXVK_SHELL_SERVICES_SIZE_1_0;
       warmServices.WorkerScope = reinterpret_cast<void (APIENTRY*)(void*, BOOL)>(uintptr_t(0xdeadbeef));
+      warmServices.ResolveMemory = reinterpret_cast<UINT64 (APIENTRY*)(void*, VkDeviceMemory, UINT64*)>(uintptr_t(0xdeadbeef));
+      warmServices.MemoryEvents = reinterpret_cast<void (APIENTRY*)(void*, const BC250_DXVK_MEMORY_EVENT*, UINT32)>(uintptr_t(0xdeadbeef));
     }
 
     BC250_DXVK_DEVICE_CREATE_INFO warmInfo = createInfo;
@@ -4876,6 +5109,19 @@ int main(int argc, char** argv) {
                 && SUCCEEDED(d3dWarm->CreateRenderTargetView(rtWarm.Get(), nullptr, &rtvWarm))
                 && SUCCEEDED(d3dWarm->CreateTexture2D(&stDesc, nullptr, &stagingWarm));
       Check(ready, "second device: shaders, input layout, vertices and target");
+
+      // 1.8: a shell before 1.8 has neither ResolveMemory nor MemoryEvents, so the engine tracks nothing for it
+      if (ready && !cachePass) {
+        Microsoft::WRL::ComPtr<IBc250DxvkDevice6> warm6;
+
+        if (CheckHr(engineWarm->QueryInterface(IID_PPV_ARGS(&warm6)), "second device: QueryInterface IBc250DxvkDevice6")) {
+          warm6->SetMemoryReporting(TRUE);
+          Check(warm6->TrackResourceMemory(vbWarm.Get(), 1u) == S_FALSE,
+            "second device, shell before 1.8: TrackResourceMemory is S_FALSE");
+          warm6->ReportMemory();
+          warm6->SetMemoryReporting(FALSE);
+        }
+      }
 
       if (ready) {
         ID3D11Buffer* vbsWarm[] = { vbWarm.Get() };
