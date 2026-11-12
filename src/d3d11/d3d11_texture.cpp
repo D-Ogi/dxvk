@@ -923,12 +923,21 @@ namespace dxvk {
     auto& entry = m_buffers[Subresource];
     entry.buffer = m_device->GetDXVKDevice()->createBuffer(info, memType);
     entry.slice = entry.buffer->storage();
+
+    // bc250 (BD-373): UMD allocation logging of the buffer of a mapped subresource
+    if (m_image != nullptr && unlikely(m_image->storageObserver()))
+      m_image->storageObserver()->helperChanged(Subresource, entry.buffer.ptr());
   }
 
 
   void D3D11CommonTexture::FreeMappedBuffer(
           UINT                  Subresource) {
     auto& entry = m_buffers[Subresource];
+
+    // bc250 (BD-373): the observer releases its reference before the texture does
+    if (m_image != nullptr && unlikely(m_image->storageObserver()))
+      m_image->storageObserver()->helperChanged(Subresource, nullptr);
+
     entry.buffer = nullptr;
     entry.slice = nullptr;
   }

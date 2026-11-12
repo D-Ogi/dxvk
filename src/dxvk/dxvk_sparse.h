@@ -435,6 +435,48 @@ namespace dxvk {
   };
 
 
+  class DxvkPagedResource;
+
+  /**
+   * \brief Storage observer
+   *
+   * bc250 (BD-373): learns where the memory of a resource is, for the UMD
+   * allocation logging of the engine. Called on the thread that assigns the
+   * storage, after the assignment. It must not change the resource.
+   */
+  class DxvkStorageObserver {
+
+  public:
+
+    /**
+     * \brief The resource has new backing storage
+     *
+     * \param [in] resource The resource
+     * \param [in] storage The new storage, may be \c nullptr
+     */
+    virtual void storageChanged(
+            DxvkPagedResource&        resource,
+            DxvkResourceAllocation*   storage) = 0;
+
+    /**
+     * \brief The owner of the resource uses a further resource
+     *
+     * A texture tells the observer of its image about the buffer that holds a
+     * mapped subresource, at its creation and with \c nullptr at its release.
+     * \param [in] index Index of the further resource, the subresource
+     * \param [in] helper The further resource, or \c nullptr
+     */
+    virtual void helperChanged(
+            uint32_t                  index,
+            DxvkPagedResource*        helper) = 0;
+
+  protected:
+
+    ~DxvkStorageObserver() = default;
+
+  };
+
+
   /**
    * \brief Paged resource
    *
@@ -705,9 +747,30 @@ namespace dxvk {
      */
     virtual const char* getDebugName() const = 0;
 
+    /**
+     * \brief Sets the storage observer
+     *
+     * bc250 (BD-373): the observer is told about every new backing storage of
+     * this resource. Set and cleared by its owner on the thread that changes
+     * the storage; null by default, which costs one pointer test per change.
+     * \param [in] observer The observer, or \c nullptr
+     */
+    void setStorageObserver(DxvkStorageObserver* observer) {
+      m_storageObserver = observer;
+    }
+
+    /**
+     * \brief Storage observer
+     * \returns The observer, or \c nullptr
+     */
+    DxvkStorageObserver* storageObserver() const {
+      return m_storageObserver;
+    }
+
   protected:
 
     DxvkMemoryAllocator*  m_allocator = nullptr;
+    DxvkStorageObserver*  m_storageObserver = nullptr;
 
     /**
      * \brief Updates residency status

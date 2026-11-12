@@ -367,6 +367,10 @@ namespace dxvk {
         updateDebugName();
 
       invalidateViews = true;
+
+      // bc250 (BD-373): UMD allocation logging
+      if (unlikely(m_storageObserver))
+        m_storageObserver->storageChanged(*this, m_storage.ptr());
     }
 
     if ((m_info.access | usageInfo.access) != m_info.access)
