@@ -474,9 +474,16 @@ namespace dxvk {
      * \brief The resource must keep its storage
      *
      * \c true while a storage change that the API did not ask for would make
-     * the logging lose the resource: a discard that the backend does for a
-     * write of the full resource, or a move by defragmentation. The backend
-     * then keeps the storage and orders the write. Called on the thread that
+     * the logging lose the resource. Three changes test it and keep the
+     * storage: the discard of a buffer for a write of the full buffer
+     * (prepareOutOfOrderTransfer, the write is then in order), new storage
+     * for a resolve target, and relocateStorage (defragmentation and moves
+     * to preferred memory). Other changes do not test it and still give new
+     * storage, which the logging reports as UNMAP and MAP: an image that
+     * needs a usage, flag or view format that its storage does not have
+     * (ensureImageCompatibility, invalidateImageWithUsage), because that
+     * storage cannot serve the request, and every change that the API asks
+     * for (Map with DISCARD, identity rotation). Called on the thread that
      * changes the storage.
      */
     virtual bool keepsStorage() const = 0;
@@ -782,8 +789,10 @@ namespace dxvk {
      * \brief Whether the storage must stay
      *
      * bc250 (BD-373): the observer keeps the storage. The backend then does
-     * not discard or move the storage on its own initiative. This does not
-     * change \c canRelocate: a stable GPU address must not depend on it.
+     * not discard or move the storage in the three cases that
+     * DxvkStorageObserver::keepsStorage names; a usage change of an image
+     * still gives new storage. This does not change \c canRelocate: a
+     * stable GPU address must not depend on it.
      * \returns \c true if the observer keeps the storage
      */
     bool storageIsKept() const {
