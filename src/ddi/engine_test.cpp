@@ -1747,6 +1747,10 @@ namespace {
     PFN_vkAllocateMemory                        allocateMemory = nullptr;
     PFN_vkFreeMemory                            freeMemory = nullptr;
     PFN_vkBindImageMemory                       bindImageMemory = nullptr;
+    PFN_vkCreateBuffer                          createBuffer = nullptr;
+    PFN_vkDestroyBuffer                         destroyBuffer = nullptr;
+    PFN_vkGetBufferMemoryRequirements           getBufferMemoryRequirements = nullptr;
+    PFN_vkBindBufferMemory                      bindBufferMemory = nullptr;
   };
 
   // DXVK's IDXGIVkInteropSurface (src/dxgi/dxgi_interfaces.h), declared here to keep the test on the ABI header
@@ -2339,6 +2343,10 @@ int main(int argc, char** argv) {
   vk.allocateMemory             = reinterpret_cast<PFN_vkAllocateMemory>(dev("vkAllocateMemory"));
   vk.freeMemory                 = reinterpret_cast<PFN_vkFreeMemory>(dev("vkFreeMemory"));
   vk.bindImageMemory            = reinterpret_cast<PFN_vkBindImageMemory>(dev("vkBindImageMemory"));
+  vk.createBuffer               = reinterpret_cast<PFN_vkCreateBuffer>(dev("vkCreateBuffer"));
+  vk.destroyBuffer              = reinterpret_cast<PFN_vkDestroyBuffer>(dev("vkDestroyBuffer"));
+  vk.getBufferMemoryRequirements = reinterpret_cast<PFN_vkGetBufferMemoryRequirements>(dev("vkGetBufferMemoryRequirements"));
+  vk.bindBufferMemory           = reinterpret_cast<PFN_vkBindBufferMemory>(dev("vkBindBufferMemory"));
 
   VkQueue queue = VK_NULL_HANDLE;
   vk.getDeviceQueue(device, req.QueueFamily, 0u, &queue);
@@ -4592,6 +4600,241 @@ int main(int argc, char** argv) {
     }
   }
 
+  // ---- a shared buffer on a shell-owned VkBuffer (ABI 1.9) ----
+  // The shell's part of E5 for a buffer: one memory, a VkBuffer of the creator and a second VkBuffer of an opener
+  // on the same memory, each wrapped as its own D3D11 buffer.
+  VkBuffer sharedBuffer = VK_NULL_HANDLE;
+  VkBuffer openedBuffer = VK_NULL_HANDLE;
+  VkDeviceMemory sharedMemory = VK_NULL_HANDLE;
+  {
+    Microsoft::WRL::ComPtr<IBc250DxvkDevice7> engine7;
+
+    if (CheckHr(engine->QueryInterface(IID_PPV_ARGS(&engine7)), "QueryInterface IBc250DxvkDevice7")) {
+      constexpr UINT Words = 64u;
+
+      D3D11_BUFFER_DESC sharedDesc = { };
+      sharedDesc.ByteWidth           = Words * sizeof(uint32_t);
+      sharedDesc.Usage               = D3D11_USAGE_DEFAULT;
+      sharedDesc.BindFlags           = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+      sharedDesc.MiscFlags           = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+      sharedDesc.StructureByteStride = 16u;
+
+      auto refusesDesc = [&] (const D3D11_BUFFER_DESC& desc, const char* what) {
+        VkBufferCreateInfo none = { };
+        Check(engine7->GetBufferCreateInfo(&desc, &none) == E_INVALIDARG, what);
+      };
+
+      D3D11_BUFFER_DESC badDesc = sharedDesc;
+      badDesc.Usage          = D3D11_USAGE_DYNAMIC;
+      badDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+      badDesc.BindFlags      = D3D11_BIND_SHADER_RESOURCE;
+      refusesDesc(badDesc, "GetBufferCreateInfo refuses a DYNAMIC buffer");
+
+      badDesc = sharedDesc;
+      badDesc.Usage          = D3D11_USAGE_STAGING;
+      badDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+      badDesc.BindFlags      = 0u;
+      refusesDesc(badDesc, "GetBufferCreateInfo refuses a STAGING buffer");
+
+      badDesc = sharedDesc;
+      badDesc.ByteWidth = 0u;
+      refusesDesc(badDesc, "GetBufferCreateInfo refuses ByteWidth 0");
+
+      badDesc = sharedDesc;
+      badDesc.MiscFlags |= D3D11_RESOURCE_MISC_TILED;
+      refusesDesc(badDesc, "GetBufferCreateInfo refuses a TILED buffer");
+
+      badDesc = sharedDesc;
+      badDesc.StructureByteStride = 3u;
+      refusesDesc(badDesc, "GetBufferCreateInfo refuses a description CreateBuffer refuses (stride 3)");
+
+      VkBufferCreateInfo bufInfo = { };
+      bool ok = CheckHr(engine7->GetBufferCreateInfo(&sharedDesc, &bufInfo), "GetBufferCreateInfo (shared structured buffer)");
+
+      D3D11_BUFFER_DESC plainDesc = sharedDesc;
+      plainDesc.MiscFlags &= ~D3D11_RESOURCE_MISC_SHARED;
+      VkBufferCreateInfo plainInfo = { };
+
+      if (ok) {
+        Check(bufInfo.sType == VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO && !bufInfo.pNext
+           && bufInfo.size >= sharedDesc.ByteWidth && bufInfo.sharingMode == VK_SHARING_MODE_EXCLUSIVE
+           && (bufInfo.usage & VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)
+           && (bufInfo.usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT),
+          "GetBufferCreateInfo gives size, EXCLUSIVE sharing, storage and device address usage");
+
+        Check(SUCCEEDED(engine7->GetBufferCreateInfo(&plainDesc, &plainInfo))
+           && plainInfo.size == bufInfo.size && plainInfo.usage == bufInfo.usage && plainInfo.flags == bufInfo.flags,
+          "GetBufferCreateInfo ignores the SHARED flag");
+      }
+
+      // The shell's buffers: the import structure in pNext, as for runtime memory
+      VkExternalMemoryBufferCreateInfo bufExternal = { VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO };
+      VkBufferCreateInfo shellInfo = bufInfo;
+      shellInfo.pNext = &bufExternal;
+      shellInfo.usage |= VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+
+      VkMemoryRequirements bufReq = { };
+
+      if (ok) {
+        ok = vk.createBuffer(device, &shellInfo, nullptr, &sharedBuffer) == VK_SUCCESS
+          && vk.createBuffer(device, &shellInfo, nullptr, &openedBuffer) == VK_SUCCESS;
+      }
+
+      if (ok) {
+        vk.getBufferMemoryRequirements(device, sharedBuffer, &bufReq);
+
+        uint32_t bufType = ~0u;
+
+        for (uint32_t i = 0u; i < memProps.memoryTypeCount && bufType == ~0u; i++) {
+          if ((bufReq.memoryTypeBits & (1u << i))
+           && (memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
+            bufType = i;
+        }
+
+        VkMemoryAllocateFlagsInfo bufFlags = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO };
+        bufFlags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+
+        VkMemoryAllocateInfo bufAlloc = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+        bufAlloc.pNext           = &bufFlags;
+        bufAlloc.allocationSize  = bufReq.size;
+        bufAlloc.memoryTypeIndex = bufType;
+
+        ok = bufType != ~0u
+          && vk.allocateMemory(device, &bufAlloc, nullptr, &sharedMemory) == VK_SUCCESS
+          && vk.bindBufferMemory(device, sharedBuffer, sharedMemory, 0u) == VK_SUCCESS
+          && vk.bindBufferMemory(device, openedBuffer, sharedMemory, 0u) == VK_SUCCESS;
+      }
+
+      Check(ok, "shell creates two buffers from GetBufferCreateInfo and binds both to one device address memory");
+
+      if (ok) {
+        auto rejects = [&] (const VkBufferCreateInfo& info, const char* what) {
+          Microsoft::WRL::ComPtr<ID3D11Buffer> none;
+          Check(engine7->CreateBufferFromVkBuffer(&sharedDesc, &info, sharedBuffer, &none) == E_INVALIDARG && !none, what);
+        };
+
+        VkBufferCreateInfo bad = shellInfo;
+        bad.size += 256u;
+        rejects(bad, "CreateBufferFromVkBuffer rejects another size");
+
+        bad = shellInfo;
+        bad.usage &= ~VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        rejects(bad, "CreateBufferFromVkBuffer rejects a removed usage bit");
+
+        bad = shellInfo;
+        bad.flags |= VK_BUFFER_CREATE_SPARSE_BINDING_BIT;
+        rejects(bad, "CreateBufferFromVkBuffer rejects another flag");
+
+        bad = shellInfo;
+        bad.sharingMode = VK_SHARING_MODE_CONCURRENT;
+        rejects(bad, "CreateBufferFromVkBuffer rejects another sharing mode");
+
+        VkBufferUsageFlags2CreateInfoKHR usage2 = { VK_STRUCTURE_TYPE_BUFFER_USAGE_FLAGS_2_CREATE_INFO_KHR };
+        bad = shellInfo;
+        bad.pNext = &usage2;
+        rejects(bad, "CreateBufferFromVkBuffer rejects an unknown structure in pNext");
+
+        Microsoft::WRL::ComPtr<ID3D11Buffer> none;
+        Check(engine7->CreateBufferFromVkBuffer(&sharedDesc, &shellInfo, VK_NULL_HANDLE, &none) == E_INVALIDARG && !none,
+          "CreateBufferFromVkBuffer rejects a null VkBuffer");
+
+        Microsoft::WRL::ComPtr<ID3D11Buffer> creator, opener, readBack;
+
+        D3D11_BUFFER_DESC readDesc = { sharedDesc.ByteWidth, D3D11_USAGE_STAGING, 0u, D3D11_CPU_ACCESS_READ };
+
+        // The first word of the memory before the wrap: the engine must not write it at creation
+        if (CheckHr(engine7->CreateBufferFromVkBuffer(&sharedDesc, &shellInfo, sharedBuffer, &creator),
+              "CreateBufferFromVkBuffer (creator)")
+         && CheckHr(engine7->CreateBufferFromVkBuffer(&sharedDesc, &shellInfo, openedBuffer, &opener),
+              "CreateBufferFromVkBuffer (opener, second VkBuffer on the same memory)")
+         && CheckHr(d3d->CreateBuffer(&readDesc, nullptr, &readBack), "CreateBuffer (staging read back)")) {
+          D3D11_BUFFER_DESC seen = { };
+          creator->GetDesc(&seen);
+          Check(seen.ByteWidth == sharedDesc.ByteWidth && seen.BindFlags == sharedDesc.BindFlags
+             && seen.StructureByteStride == sharedDesc.StructureByteStride
+             && (seen.MiscFlags & D3D11_RESOURCE_MISC_BUFFER_STRUCTURED),
+            "the wrapped buffer has the description");
+
+          auto readWords = [&] (ID3D11Buffer* src, std::array<uint32_t, Words>& words) {
+            ctx->CopyResource(readBack.Get(), src);
+            D3D11_MAPPED_SUBRESOURCE m = { };
+
+            if (FAILED(ctx->Map(readBack.Get(), 0u, D3D11_MAP_READ, 0u, &m)))
+              return false;
+
+            std::memcpy(words.data(), m.pData, sizeof(words));
+            ctx->Unmap(readBack.Get(), 0u);
+            return true;
+          };
+
+          auto pattern = [] (uint32_t seed, uint32_t i) { return 0x9e3779b9u * (i + 1u) ^ seed; };
+          std::array<uint32_t, Words> data = { }, words = { };
+
+          for (uint32_t i = 0u; i < Words; i++)
+            data[i] = pattern(0x5eed0001u, i);
+
+          // The engine tracks hazards per buffer object, not per memory: two objects on one memory are two devices
+          // of an application, which order their work through a flush and a wait (a query or a keyed mutex)
+          ctx->UpdateSubresource(creator.Get(), 0u, nullptr, data.data(), 0u, 0u);
+          CheckHr(engine->WaitForResourceIdle(creator.Get()), "WaitForResourceIdle (creator after its write)");
+          bool same = readWords(opener.Get(), words) && words == data;
+          Check(same, "the opener's buffer reads what the creator's buffer wrote (one memory)");
+
+          for (uint32_t i = 0u; i < Words; i++)
+            data[i] = pattern(0x5eed0002u, i);
+
+          // A copy into the opener's buffer, read through the creator's
+          D3D11_SUBRESOURCE_DATA init = { data.data() };
+          D3D11_BUFFER_DESC srcDesc = { sharedDesc.ByteWidth, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE };
+          Microsoft::WRL::ComPtr<ID3D11Buffer> src;
+
+          if (CheckHr(d3d->CreateBuffer(&srcDesc, &init, &src), "CreateBuffer (copy source)")) {
+            ctx->CopyResource(opener.Get(), src.Get());
+            CheckHr(engine->WaitForResourceIdle(opener.Get()), "WaitForResourceIdle (opener after its write)");
+            Check(readWords(creator.Get(), words) && words == data,
+              "the creator's buffer reads a copy into the opener's buffer");
+          }
+
+          // A third wrap on the creator's VkBuffer: no initialization at creation, the content stays
+          Microsoft::WRL::ComPtr<ID3D11Buffer> again;
+
+          if (CheckHr(engine7->CreateBufferFromVkBuffer(&sharedDesc, &shellInfo, sharedBuffer, &again),
+                "CreateBufferFromVkBuffer (a later open)")) {
+            Check(readWords(again.Get(), words) && words == data,
+              "CreateBufferFromVkBuffer does not write the buffer at creation");
+            CheckHr(engine->WaitForResourceIdle(again.Get()), "WaitForResourceIdle (later open)");
+          }
+
+          // Views of the wrapped buffer, as the runtime creates them for SRV and UAV binds
+          D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = { };
+          srvDesc.Format             = DXGI_FORMAT_UNKNOWN;
+          srvDesc.ViewDimension      = D3D11_SRV_DIMENSION_BUFFER;
+          srvDesc.Buffer.NumElements = sharedDesc.ByteWidth / sharedDesc.StructureByteStride;
+
+          D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = { };
+          uavDesc.Format             = DXGI_FORMAT_UNKNOWN;
+          uavDesc.ViewDimension      = D3D11_UAV_DIMENSION_BUFFER;
+          uavDesc.Buffer.NumElements = srvDesc.Buffer.NumElements;
+
+          Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> sharedSrv;
+          Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> sharedUav;
+          CheckHr(d3d->CreateShaderResourceView(opener.Get(), &srvDesc, &sharedSrv), "CreateShaderResourceView (wrapped buffer)");
+          CheckHr(d3d->CreateUnorderedAccessView(opener.Get(), &uavDesc, &sharedUav), "CreateUnorderedAccessView (wrapped buffer)");
+
+          // Map of a GPU-only buffer is not possible
+          D3D11_MAPPED_SUBRESOURCE m = { };
+          Check(FAILED(ctx->Map(creator.Get(), 0u, D3D11_MAP_WRITE_DISCARD, 0u, &m)), "Map of the wrapped buffer fails");
+        }
+
+        if (creator)
+          CheckHr(engine->WaitForResourceIdle(creator.Get()), "WaitForResourceIdle (creator buffer)");
+
+        if (opener)
+          CheckHr(engine->WaitForResourceIdle(opener.Get()), "WaitForResourceIdle (opener buffer)");
+      }
+    }
+  }
+
   // ---- stream output of the vertex program, without a geometry program ----
   {
     UINT posReg = ~0u, colReg = ~0u;
@@ -5456,6 +5699,15 @@ int main(int argc, char** argv) {
 
   if (linMemory)
     vk.freeMemory(device, linMemory, nullptr);
+
+  if (sharedBuffer)
+    vk.destroyBuffer(device, sharedBuffer, nullptr);
+
+  if (openedBuffer)
+    vk.destroyBuffer(device, openedBuffer, nullptr);
+
+  if (sharedMemory)
+    vk.freeMemory(device, sharedMemory, nullptr);
 
   for (UINT i = 0u; i < RotCount; i++) {
     if (rotImages[i])
