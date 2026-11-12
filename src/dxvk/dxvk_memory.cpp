@@ -989,13 +989,22 @@ namespace dxvk {
   }
 
 
+  // bc250: the injected out-of-memory error of the lab flavour hits the allocation that an application call
+  // makes. That is a request with no mode, or with only Dedicated (BD-373: a large resource gets memory of its
+  // own at creation). A request of the allocator itself (relocation, eviction) has one of the other modes.
+  static bool isFirstAllocationMode(DxvkAllocationModes mode) {
+    return !mode.any(DxvkAllocationMode::NoFallback, DxvkAllocationMode::NoAllocation,
+      DxvkAllocationMode::NoDedicated, DxvkAllocationMode::NoDeviceMemory);
+  }
+
+
   Rc<DxvkResourceAllocation> DxvkMemoryAllocator::createBufferResource(
     const VkBufferCreateInfo&         createInfo,
     const DxvkAllocationInfo&         allocationInfo,
           DxvkLocalAllocationCache*   allocationCache) {
     Rc<DxvkResourceAllocation> allocation;
 
-    if (unlikely(m_injectOutOfMemory) && allocationInfo.mode.isClear() && isOutOfMemoryInjected())
+    if (unlikely(m_injectOutOfMemory) && isFirstAllocationMode(allocationInfo.mode) && isOutOfMemoryInjected())
       throw DxvkOutOfMemoryError(str::format("Injected out of memory for buffer: ", createInfo.size, " bytes"));
 
     // bc250 (BD-309): DxvkAllocationMode::Dedicated skips the global buffers
@@ -1195,7 +1204,7 @@ namespace dxvk {
     const void*                       next) {
     auto vk = m_device->vkd();
 
-    if (unlikely(m_injectOutOfMemory) && allocationInfo.mode.isClear() && isOutOfMemoryInjected()) {
+    if (unlikely(m_injectOutOfMemory) && isFirstAllocationMode(allocationInfo.mode) && isOutOfMemoryInjected()) {
       throw DxvkOutOfMemoryError(str::format("Injected out of memory for image: ",
         createInfo.extent.width, "x", createInfo.extent.height, "x", createInfo.extent.depth));
     }
