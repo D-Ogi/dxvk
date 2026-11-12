@@ -524,9 +524,13 @@ IBc250DxvkDevice5 : public IBc250DxvkDevice4 {
 /* ABI 1.8 (BD-373). The same object as IBc250DxvkDevice; QueryInterface on it, E_NOINTERFACE from an older engine.
  * The shell holds a reference for the calls from other threads and makes none of them after it starts the final
  * Release of the device. The engine keeps the current memory of each tracked resource and tells the shell through Services.MemoryEvents
- * only while reporting is on (lazy): a storage change of a tracked resource costs no lock, no kernel call and no
- * shell call when it is off. Events of one resource come in the order of its changes. A change that happens during
- * a ReportMemory can be in its RUNDOWN events and also in an UNMAP and MAP after them; it is never missing. */
+ * only while reporting is on (lazy). When it is off, a storage change of a tracked resource costs no lock, no kernel
+ * call and no MemoryEvents call. It calls Services.ResolveMemory only when the new storage is in another VkDeviceMemory
+ * than the storage it replaces (the ICD reads the state of its BO). The engine cannot keep that call for a later
+ * ReportMemory: ReportMemory runs on any thread, where the memory object of the storage can already be freed, and
+ * ResolveMemory is called only inside an engine call (E2), where the storage is alive.
+ * Events of one resource come in the order of its changes. A change that happens during a ReportMemory can be in its
+ * RUNDOWN events and also in an UNMAP and MAP after them; it is never missing. */
 MIDL_INTERFACE("bb949564-bf28-4b99-ae85-2eb63275d8e0")
 IBc250DxvkDevice6 : public IBc250DxvkDevice5 {
     /* Inside an engine call. cookie != 0 starts tracking of a resource of this device that the engine created
