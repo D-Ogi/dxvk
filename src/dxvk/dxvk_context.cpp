@@ -1344,6 +1344,15 @@ namespace dxvk {
     if (bufferInfos.empty() && imageInfos.empty())
       return;
 
+    // The resources do not come back to their chunks: free each chunk
+    // as soon as its last allocation goes (BD-372). Otherwise the pool
+    // keeps the memory that the moves free as its unused allowance.
+    for (const auto& e : bufferInfos)
+      m_common->memoryManager().releaseChunkWhenEmpty(*e.buffer->storage());
+
+    for (const auto& e : imageInfos)
+      m_common->memoryManager().releaseChunkWhenEmpty(*e.image->storage());
+
     // As for image rotation: apply deferred clears and return every
     // resource to its default layout before its storage moves.
     for (const auto& e : bufferInfos)

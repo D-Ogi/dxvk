@@ -1623,6 +1623,7 @@ namespace dxvk {
     pool.chunks[chunkIndex].memory = chunk;
     pool.chunks[chunkIndex].unusedTime = high_resolution_clock::time_point();
     pool.chunks[chunkIndex].canMove = true;
+    pool.chunks[chunkIndex].releaseWhenEmpty = false;
     return true;
   }
 
@@ -1864,7 +1865,9 @@ namespace dxvk {
       // Free the chunk if it is smaller than the current chunk size of
       // the pool, since it is unlikely to be useful for future allocations.
       // Also free if the pending allocation would exceed the heap budget.
-      bool shouldFree = chunk.memory.size < pool.nextChunkSize
+      // A chunk that a resource left for good goes at once (bc250, BD-372).
+      bool shouldFree = chunk.releaseWhenEmpty
+        || chunk.memory.size < pool.nextChunkSize
         || allocationSize + heapAllocated > heapBudget
         || allocationSize > heapBudget;
 
@@ -2421,6 +2424,26 @@ namespace dxvk {
         allocation->m_type->devicePool.chunks[chunkIndex].canMove = false;
       }
     }
+  }
+
+
+  void DxvkMemoryAllocator::releaseChunkWhenEmpty(
+    const DxvkResourceAllocation&     allocation) {
+    if (!allocation.m_type || allocation.m_sparsePageTable
+     || allocation.m_flags.test(DxvkAllocationFlag::OwnsMemory))
+      return;
+
+    std::unique_lock lock(m_mutex);
+
+    // The same pool choice as freeAllocation
+    DxvkMemoryPool& pool = allocation.m_mapPtr
+      ? allocation.m_type->mappedPool
+      : allocation.m_type->devicePool;
+
+    uint32_t chunkIndex = allocation.m_address >> DxvkPageAllocator::ChunkAddressBits;
+
+    if (chunkIndex < pool.chunks.size())
+      pool.chunks[chunkIndex].releaseWhenEmpty = true;
   }
 
 
