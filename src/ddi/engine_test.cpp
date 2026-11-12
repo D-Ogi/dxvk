@@ -3006,6 +3006,189 @@ int main(int argc, char** argv) {
     }
   }
 
+  // ---- ABI 1.6: the memory that an offer leaves behind (BD-372, HLK OfferReclaim11 Lower Commit) ----
+  {
+    // The HLK test per try: 60 pairs of a 4 MiB DEFAULT texture with a view and a 4 MiB staging texture that the
+    // CPU fills, a snapshot of the system commit, an offer with ALLOW_DECOMMIT of every resource, a GPU drain,
+    // a kernel trim pass that decommits the offered memory, and the commit again. It passes when
+    //   commit after <= snapshot - decommitted + 32 MiB.
+    // The trim is a kernel pass: the UMD gets no Trim call. The decommit takes away exactly the memory that
+    // PrepareOffer reported, so the rule is the same as: the Vulkan memory that the process holds after the
+    // offers (offered memory included) is not more than 32 MiB above the snapshot. Memory that an offer moved
+    // a resource out of must go back to the kernel without a Trim call. Here the driver's heap usage
+    // (VK_EXT_memory_budget) is the commit, and the kernel half is not needed: nothing is offered to a kernel.
+    Microsoft::WRL::ComPtr<IBc250DxvkDevice5> engine5;
+    bool haveBudget = false;
+    auto enumerateExtensions = reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(
+      vk.getInstanceProcAddr(instance, "vkEnumerateDeviceExtensionProperties"));
+    auto getMemoryProperties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties2>(
+      vk.getInstanceProcAddr(instance, "vkGetPhysicalDeviceMemoryProperties2"));
+
+    if (enumerateExtensions) {
+      uint32_t extCount = 0u;
+      enumerateExtensions(physDev, nullptr, &extCount, nullptr);
+      std::vector<VkExtensionProperties> exts(extCount);
+      enumerateExtensions(physDev, nullptr, &extCount, exts.data());
+
+      for (const auto& e : exts)
+        haveBudget |= !std::strcmp(e.extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    }
+
+    if (!haveBudget || !getMemoryProperties2) {
+      std::printf("SKIP  offer leftover (Lower Commit model): VK_EXT_memory_budget not supported\n");
+    } else if (CheckHr(engine->QueryInterface(IID_PPV_ARGS(&engine5)), "QueryInterface IBc250DxvkDevice5 (Lower Commit model)")) {
+      constexpr UINT Pairs = 60u;
+      constexpr UINT Side = 1024u;                          // 4 MiB of RGBA8: 60 x 2 x 4 MiB = TOTAL_SIZE_MANY
+      constexpr UINT Tries = 5u;
+      constexpr VkDeviceSize MiB = VkDeviceSize(1u) << 20;
+      constexpr VkDeviceSize Margin = 32u * MiB;            // the test's margin
+
+      struct HeapUsage {
+        uint32_t count = 0u;
+        VkDeviceSize heap[VK_MAX_MEMORY_HEAPS] = { };
+        VkDeviceSize total = 0u;
+      };
+
+      auto usage = [&] {
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT budget = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT };
+        VkPhysicalDeviceMemoryProperties2 props = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &budget };
+        getMemoryProperties2(physDev, &props);
+
+        HeapUsage u;
+        u.count = props.memoryProperties.memoryHeapCount;
+
+        for (uint32_t i = 0u; i < u.count; i++) {
+          u.heap[i] = budget.heapUsage[i];
+          u.total += budget.heapUsage[i];
+        }
+
+        return u;
+      };
+
+      auto heaps = [&] (const HeapUsage& u) {
+        std::string text;
+
+        for (uint32_t i = 0u; i < u.count; i++) {
+          char part[48];
+          std::snprintf(part, sizeof(part), "%sheap %u %llu", i ? ", " : "", i, (unsigned long long)(u.heap[i] / MiB));
+          text += part;
+        }
+
+        return text;
+      };
+
+      // The GPU has done all the work of the context (the HLK test waits on its drain event)
+      Microsoft::WRL::ComPtr<ID3D11Query> drainQuery;
+      D3D11_QUERY_DESC queryDesc = { D3D11_QUERY_EVENT, 0u };
+      CheckHr(d3d->CreateQuery(&queryDesc, &drainQuery), "CreateQuery (event, Lower Commit model)");
+
+      auto drain = [&] {
+        if (!drainQuery)
+          return;
+
+        ctx->End(drainQuery.Get());
+        BOOL done = FALSE;
+
+        while (ctx->GetData(drainQuery.Get(), &done, sizeof(done), 0u) == S_FALSE)
+          Sleep(0u);
+      };
+
+      D3D11_TEXTURE2D_DESC texDesc = { Side, Side, 1u, 1u, DXGI_FORMAT_R8G8B8A8_UNORM, { 1u, 0u },
+        D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE };
+      D3D11_TEXTURE2D_DESC stagingDesc = { Side, Side, 1u, 1u, DXGI_FORMAT_R8G8B8A8_UNORM, { 1u, 0u },
+        D3D11_USAGE_STAGING, 0u, D3D11_CPU_ACCESS_WRITE };
+
+      UINT passed = 0u;
+      bool allOffered = true;
+
+      for (UINT t = 0u; t < Tries; t++) {
+        struct Pair {
+          Microsoft::WRL::ComPtr<ID3D11Texture2D> texture, staging;
+          Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> srv;
+        };
+
+        std::vector<Pair> pairs(Pairs);
+        bool created = true;
+
+        for (UINT i = 0u; i < Pairs && created; i++) {
+          created = SUCCEEDED(d3d->CreateTexture2D(&texDesc, nullptr, &pairs[i].texture))
+                 && SUCCEEDED(d3d->CreateShaderResourceView(pairs[i].texture.Get(), nullptr, &pairs[i].srv))
+                 && SUCCEEDED(d3d->CreateTexture2D(&stagingDesc, nullptr, &pairs[i].staging));
+
+          D3D11_MAPPED_SUBRESOURCE mapped = { };
+
+          if (created && SUCCEEDED(ctx->Map(pairs[i].staging.Get(), 0u, D3D11_MAP_WRITE, 0u, &mapped))) {
+            for (UINT y = 0u; y < Side; y++)
+              std::memset(static_cast<uint8_t*>(mapped.pData) + size_t(y) * mapped.RowPitch, int(0x40u + i), Side * 4u);
+
+            ctx->Unmap(pairs[i].staging.Get(), 0u);
+            ctx->CopyResource(pairs[i].texture.Get(), pairs[i].staging.Get());
+          }
+        }
+
+        if (!created) {
+          Check(false, "Lower Commit model: 60 pairs of 4 MiB textures created");
+          break;
+        }
+
+        ctx->Flush();
+        drain();
+        HeapUsage snapshot = usage();
+
+        VkDeviceSize offered = 0u;
+        UINT offeredCount = 0u;
+        double tOffers = nowMs();
+
+        for (const auto& pair : pairs) {
+          for (ID3D11Resource* resource : { static_cast<ID3D11Resource*>(pair.texture.Get()),
+                                            static_cast<ID3D11Resource*>(pair.staging.Get()) }) {
+            BC250_DXVK_OFFER_MEMORY memory[4] = { };
+            UINT count = 0u;
+
+            if (engine5->PrepareOffer(resource, 4u, memory, &count) == S_OK) {
+              offeredCount += 1u;
+
+              for (UINT m = 0u; m < count; m++)
+                offered += memory[m].Size;
+            }
+          }
+        }
+
+        double offersMs = nowMs() - tOffers;
+        drain();
+        HeapUsage atDrain = usage();
+
+        // Read at once after the drain, with no settle time: nothing else calls the driver in the test either
+        long long growth = (long long)(atDrain.total / MiB) - (long long)(snapshot.total / MiB);
+        bool pass = offeredCount == 2u * Pairs && atDrain.total <= snapshot.total + Margin;
+        allOffered &= offeredCount == 2u * Pairs;
+        passed += pass ? 1u : 0u;
+
+        std::printf("      try %u: %u of %u offered in %.1f ms, %llu MiB reported; heap usage MiB: snapshot %llu (%s), "
+                    "after the drain %llu (%s); growth %lld MiB (limit 32): %s\n",
+          t + 1u, offeredCount, 2u * Pairs, offersMs, (unsigned long long)(offered / MiB),
+          (unsigned long long)(snapshot.total / MiB), heaps(snapshot).c_str(), (unsigned long long)(atDrain.total / MiB),
+          heaps(atDrain).c_str(), growth, pass ? "pass" : "FAIL");
+
+        for (const auto& pair : pairs) {
+          engine5->EndOffer(pair.texture.Get(), 0u);
+          engine5->EndOffer(pair.staging.Get(), 0u);
+        }
+
+        pairs.clear();
+        ctx->Flush();
+        drain();
+      }
+
+      Check(allOffered, "Lower Commit model: PrepareOffer is S_OK for every texture and staging texture");
+      char what[128];
+      std::snprintf(what, sizeof(what), "Lower Commit model: %u of %u tries keep the memory after the offers within "
+        "32 MiB of the snapshot", passed, Tries);
+      Check(passed == Tries, what);
+      Check(d3d->GetDeviceRemovedReason() == S_OK, "after the Lower Commit model: device not removed");
+    }
+  }
+
   // ---- ABI 1.8: allocation events of engine resources (BD-373) ----
   {
     Microsoft::WRL::ComPtr<IBc250DxvkDevice6> engine6;
