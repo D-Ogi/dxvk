@@ -4835,6 +4835,175 @@ int main(int argc, char** argv) {
     }
   }
 
+  // ---- a LINEAR mip chain array on shell-owned memory (ABI 1.2), as the shell shares one (BD-373) ----
+  // The creator's image and an opener's image with the same create info on one memory: every subresource
+  // the creator writes reads back through the opener, and GenerateMips works on the LINEAR chain.
+  VkImage chainImages[2] = { };
+  VkDeviceMemory chainMemory = VK_NULL_HANDLE;
+  {
+    Microsoft::WRL::ComPtr<IBc250DxvkDevice2> engine2;
+    constexpr UINT ChainW = 64u, ChainH = 32u, ChainMips = 4u, ChainLayers = 3u;
+
+    D3D11_TEXTURE2D_DESC1 chainDesc = { };
+    chainDesc.Width          = ChainW;
+    chainDesc.Height         = ChainH;
+    chainDesc.MipLevels      = ChainMips;
+    chainDesc.ArraySize      = ChainLayers;
+    chainDesc.Format         = DXGI_FORMAT_R8G8B8A8_UNORM;
+    chainDesc.SampleDesc     = { 1u, 0u };
+    chainDesc.Usage          = D3D11_USAGE_DEFAULT;
+    chainDesc.BindFlags      = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    chainDesc.MiscFlags      = D3D11_RESOURCE_MISC_GENERATE_MIPS;
+
+    VkImageCreateInfo chainInfo = { };
+    VkImageFormatProperties chainProps = { };
+    bool ok = SUCCEEDED(engine->QueryInterface(IID_PPV_ARGS(&engine2)))
+      && CheckHr(engine->GetImageCreateInfo(&chainDesc, &chainInfo), "GetImageCreateInfo (mip chain array)");
+
+    if (ok) {
+      Check(chainInfo.mipLevels == ChainMips && chainInfo.arrayLayers == ChainLayers,
+        "GetImageCreateInfo keeps the mip levels and array layers");
+      chainInfo.tiling = VK_IMAGE_TILING_LINEAR;
+      ok = vk.getPhysicalDeviceImageFormatProperties(physDev, chainInfo.format, chainInfo.imageType, chainInfo.tiling,
+        chainInfo.usage, chainInfo.flags, &chainProps) == VK_SUCCESS
+        && chainProps.maxMipLevels >= ChainMips && chainProps.maxArrayLayers >= ChainLayers;
+
+      if (!ok)
+        std::printf("      LINEAR mip chain array not supported on this adapter: checks skipped\n");
+    }
+
+    VkMemoryRequirements chainReq[2] = { };
+
+    if (ok) {
+      ok = vk.createImage(device, &chainInfo, nullptr, &chainImages[0]) == VK_SUCCESS
+        && vk.createImage(device, &chainInfo, nullptr, &chainImages[1]) == VK_SUCCESS;
+
+      if (ok) {
+        vk.getImageMemoryRequirements(device, chainImages[0], &chainReq[0]);
+        vk.getImageMemoryRequirements(device, chainImages[1], &chainReq[1]);
+
+        uint32_t chainType = ~0u;
+
+        for (uint32_t i = 0u; i < memProps.memoryTypeCount && chainType == ~0u; i++) {
+          if ((chainReq[0].memoryTypeBits & (1u << i))
+           && (memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
+            chainType = i;
+        }
+
+        VkMemoryAllocateInfo chainAlloc = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+        chainAlloc.allocationSize  = chainReq[0].size;
+        chainAlloc.memoryTypeIndex = chainType;
+
+        ok = chainType != ~0u && chainReq[0].size == chainReq[1].size
+          && vk.allocateMemory(device, &chainAlloc, nullptr, &chainMemory) == VK_SUCCESS
+          && vk.bindImageMemory(device, chainImages[0], chainMemory, 0u) == VK_SUCCESS
+          && vk.bindImageMemory(device, chainImages[1], chainMemory, 0u) == VK_SUCCESS;
+      }
+
+      Check(ok, "shell creates two LINEAR mip chain arrays with one create info and binds both to one memory");
+    }
+
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> creatorTex, openerTex, chainStaging;
+
+    if (ok
+     && CheckHr(engine2->CreateTexture2DFromImage2(&chainDesc, &chainInfo, chainImages[0], &creatorTex),
+          "CreateTexture2DFromImage2 (LINEAR mip chain array, creator)")
+     && CheckHr(engine2->CreateTexture2DFromImage2(&chainDesc, &chainInfo, chainImages[1], &openerTex),
+          "CreateTexture2DFromImage2 (LINEAR mip chain array, opener)")) {
+      D3D11_TEXTURE2D_DESC stagingDesc = { ChainW, ChainH, ChainMips, ChainLayers, chainDesc.Format, { 1u, 0u },
+        D3D11_USAGE_STAGING, 0u, D3D11_CPU_ACCESS_READ, 0u };
+      ok = CheckHr(d3d->CreateTexture2D(&stagingDesc, nullptr, &chainStaging), "CreateTexture2D (mip chain staging)");
+
+      auto texel = [] (UINT layer, UINT mip, UINT x, UINT y) {
+        return uint32_t(0xff000000u | (layer << 20) | (mip << 16) | ((y & 0xffu) << 8) | (x & 0xffu));
+      };
+
+      for (UINT layer = 0u; layer < ChainLayers && ok; layer++) {
+        for (UINT mip = 0u; mip < ChainMips; mip++) {
+          const UINT w = std::max(1u, ChainW >> mip), h = std::max(1u, ChainH >> mip);
+          std::vector<uint32_t> pixels(w * h);
+
+          for (UINT y = 0u; y < h; y++)
+            for (UINT x = 0u; x < w; x++)
+              pixels[y * w + x] = texel(layer, mip, x, y);
+
+          ctx->UpdateSubresource(creatorTex.Get(), D3D11CalcSubresource(mip, layer, ChainMips), nullptr,
+            pixels.data(), w * 4u, 0u);
+        }
+      }
+
+      CheckHr(engine->WaitForResourceIdle(creatorTex.Get()), "WaitForResourceIdle (mip chain creator)");
+
+      auto readsBack = [&] (ID3D11Texture2D* texture) {
+        ctx->CopyResource(chainStaging.Get(), texture);
+        uint32_t wrong = 0u;
+
+        for (UINT layer = 0u; layer < ChainLayers; layer++) {
+          for (UINT mip = 0u; mip < ChainMips; mip++) {
+            const UINT sub = D3D11CalcSubresource(mip, layer, ChainMips);
+            const UINT w = std::max(1u, ChainW >> mip), h = std::max(1u, ChainH >> mip);
+            D3D11_MAPPED_SUBRESOURCE m = { };
+
+            if (FAILED(ctx->Map(chainStaging.Get(), sub, D3D11_MAP_READ, 0u, &m)))
+              return ~0u;
+
+            for (UINT y = 0u; y < h; y++) {
+              const uint32_t* row = reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(m.pData) + y * m.RowPitch);
+
+              for (UINT x = 0u; x < w; x++)
+                wrong += row[x] != texel(layer, mip, x, y) ? 1u : 0u;
+            }
+
+            ctx->Unmap(chainStaging.Get(), sub);
+          }
+        }
+
+        return wrong;
+      };
+
+      if (ok) {
+        uint32_t creatorWrong = readsBack(creatorTex.Get());
+        uint32_t openerWrong = readsBack(openerTex.Get());
+        std::printf("      LINEAR mip chain array: %u wrong texels through the creator, %u through the opener\n",
+          creatorWrong, openerWrong);
+        Check(!creatorWrong, "every subresource of the LINEAR mip chain array reads back through the creator");
+        Check(!openerWrong, "every subresource reads back through the opener's image on the same memory");
+
+        // GenerateMips on the opener's object: a uniform mip 0 of layer 1 gives the same colour on every level
+        std::vector<uint32_t> flat(ChainW * ChainH, 0xff3060c0u);
+        ctx->UpdateSubresource(openerTex.Get(), D3D11CalcSubresource(0u, 1u, ChainMips), nullptr, flat.data(), ChainW * 4u, 0u);
+
+        D3D11_SHADER_RESOURCE_VIEW_DESC chainSrvDesc = { };
+        chainSrvDesc.Format                         = chainDesc.Format;
+        chainSrvDesc.ViewDimension                  = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+        chainSrvDesc.Texture2DArray.MipLevels       = ChainMips;
+        chainSrvDesc.Texture2DArray.ArraySize       = ChainLayers;
+
+        Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> chainSrv;
+
+        if (CheckHr(d3d->CreateShaderResourceView(openerTex.Get(), &chainSrvDesc, &chainSrv), "CreateShaderResourceView (mip chain)")) {
+          ctx->GenerateMips(chainSrv.Get());
+          CheckHr(engine->WaitForResourceIdle(openerTex.Get()), "WaitForResourceIdle (mip chain opener)");
+          ctx->CopyResource(chainStaging.Get(), creatorTex.Get());
+
+          const UINT last = D3D11CalcSubresource(ChainMips - 1u, 1u, ChainMips);
+          D3D11_MAPPED_SUBRESOURCE m = { };
+
+          if (CheckHr(ctx->Map(chainStaging.Get(), last, D3D11_MAP_READ, 0u, &m), "Map (last mip of layer 1)")) {
+            const uint8_t* p = static_cast<const uint8_t*>(m.pData);
+            std::printf("      GenerateMips on LINEAR: last mip of layer 1 = %u,%u,%u,%u\n", p[0], p[1], p[2], p[3]);
+            Check(similar({ int(p[0]), int(p[1]), int(p[2]), int(p[3]) }, 0xc0, 0x60, 0x30, 2),
+              "GenerateMips through the opener fills the LINEAR chain, seen by the creator");
+            ctx->Unmap(chainStaging.Get(), last);
+          }
+        }
+      }
+
+      CheckHr(engine->WaitForResourceIdle(creatorTex.Get()), "WaitForResourceIdle (mip chain creator, end)");
+      CheckHr(engine->WaitForResourceIdle(openerTex.Get()), "WaitForResourceIdle (mip chain opener, end)");
+    }
+  }
+
   // ---- stream output of the vertex program, without a geometry program ----
   {
     UINT posReg = ~0u, colReg = ~0u;
@@ -5708,6 +5877,14 @@ int main(int argc, char** argv) {
 
   if (sharedMemory)
     vk.freeMemory(device, sharedMemory, nullptr);
+
+  for (VkImage chainImage : chainImages) {
+    if (chainImage)
+      vk.destroyImage(device, chainImage, nullptr);
+  }
+
+  if (chainMemory)
+    vk.freeMemory(device, chainMemory, nullptr);
 
   for (UINT i = 0u; i < RotCount; i++) {
     if (rotImages[i])
