@@ -47,7 +47,7 @@ namespace dxvk::ddi {
   };
 
 
-  class Bc250DxvkDevice : public ComObject<IBc250DxvkDevice6> {
+  class Bc250DxvkDevice : public ComObject<IBc250DxvkDevice7> {
 
   public:
 
@@ -151,6 +151,16 @@ namespace dxvk::ddi {
             BOOL                              Enabled) final;
 
     void STDMETHODCALLTYPE ReportMemory() final;
+
+    HRESULT STDMETHODCALLTYPE GetBufferCreateInfo(
+      const D3D11_BUFFER_DESC*                pDesc,
+            VkBufferCreateInfo*               pInfo) final;
+
+    HRESULT STDMETHODCALLTYPE CreateBufferFromVkBuffer(
+      const D3D11_BUFFER_DESC*                pDesc,
+      const VkBufferCreateInfo*               pInfo,
+            VkBuffer                          Buffer,
+            ID3D11Buffer**                    ppBuffer) final;
 
   private:
 

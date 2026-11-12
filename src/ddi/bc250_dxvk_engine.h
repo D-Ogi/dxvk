@@ -4,7 +4,7 @@
  * UserModeDriverName DLL) and its DXVK engine ("engine", amdgpu_wddm_dxvk.dll, DXVK fork branch
  * amdgpu-wddm/ddi-engine).
  *
- * Revision r13, ABI 1.8. This file in the DXVK fork is the only copy; the shell includes it from the DXVK
+ * Revision r14, ABI 1.9. This file in the DXVK fork is the only copy; the shell includes it from the DXVK
  * source checkout it builds against, like its other DXVK-facing headers.
  *
  * Versions. A minor version adds and never changes: an engine of minor n serves a shell built for any minor
@@ -42,6 +42,8 @@
  *        ResolveMemory and MemoryEvents (BD-373): the kernel allocation of each engine resource for the UMD
  *        logging provider of WDDM 1.2. The members are at the end of the structure; the engine tracks no resource
  *        when Services->Size does not include both, so a shell before 1.8 sees no change.
+ *   1.9  r14: IBc250DxvkDevice7 (GetBufferCreateInfo, CreateBufferFromVkBuffer): E5 for buffers, a buffer on a
+ *        shell-owned VkBuffer, for shared buffers on runtime allocations (BD-373).
  *
  * WDK-free by construction. DXVK's util_gdi.h declares private extern-C D3DKMT prototypes that collide with
  * the WDK's in one translation unit, so nothing here needs d3d10umddi.h or a DXVK header: windows.h, the SDK's
@@ -138,7 +140,7 @@
 #include <vulkan/vulkan.h>
 
 #define BC250_DXVK_ENGINE_ABI_MAJOR 1u
-#define BC250_DXVK_ENGINE_ABI_MINOR 8u
+#define BC250_DXVK_ENGINE_ABI_MINOR 9u
 #define BC250_DXVK_ENGINE_ABI_VERSION ((BC250_DXVK_ENGINE_ABI_MAJOR << 16) | BC250_DXVK_ENGINE_ABI_MINOR)
 
 /* The Vulkan objects the shell owns (E1). */
@@ -544,6 +546,30 @@ IBc250DxvkDevice6 : public IBc250DxvkDevice5 {
     /* Any thread, also outside an engine call. A RUNDOWN event of each memory of each tracked resource, through
      * Services.MemoryEvents on this thread, before it returns. Makes no Vulkan call. */
     virtual void STDMETHODCALLTYPE ReportMemory() = 0;
+};
+
+/* ABI 1.9 (BD-373). The same object as IBc250DxvkDevice; QueryInterface on it, E_NOINTERFACE from an older engine.
+ * E5 for a buffer whose memory the runtime owns (a shared buffer). */
+MIDL_INTERFACE("2362774e-159a-4ddc-9faf-2a08916bffe0")
+IBc250DxvkDevice7 : public IBc250DxvkDevice6 {
+    /* What the engine's D3D11 buffer expects for desc: size (ByteWidth), flags, usage and EXCLUSIVE sharing; pNext is
+     * NULL. Only GPU-only buffers qualify: Usage DEFAULT or IMMUTABLE, CPUAccessFlags 0, not TILED or TILE_POOL,
+     * ByteWidth not 0, and a description that ID3D11Device::CreateBuffer accepts (E_INVALIDARG otherwise). The
+     * SHARED, SHARED_NTHANDLE and SHARED_KEYEDMUTEX MiscFlags are ignored, sharing is the shell's. The shell may add
+     * usage bits; it must not remove usage or flags. The usage includes SHADER_DEVICE_ADDRESS: the memory the shell
+     * binds must be allocated with VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT. */
+    virtual HRESULT STDMETHODCALLTYPE GetBufferCreateInfo(const D3D11_BUFFER_DESC *desc, VkBufferCreateInfo *info) = 0;
+
+    /* A buffer on a shell-owned VkBuffer that the shell created with info and bound to memory at offset 0. Compared
+     * with what GetBufferCreateInfo returns for desc, info must have the same size, flags and sharing mode, every
+     * returned usage bit, and no structure in pNext other than VkExternalMemoryBufferCreateInfo (the shell's import
+     * of runtime memory needs it); E_INVALIDARG otherwise. The engine does not write the buffer at creation:
+     * the content is what the memory holds. It never renames or moves the buffer (Map of it is not possible: it is
+     * GPU-only). Otherwise as E5: WaitForResourceIdle and the last Release end every engine use of the VkBuffer,
+     * then the shell destroys it and frees its memory. */
+    virtual HRESULT STDMETHODCALLTYPE CreateBufferFromVkBuffer(const D3D11_BUFFER_DESC *desc,
+                                                               const VkBufferCreateInfo *info, VkBuffer buffer,
+                                                               ID3D11Buffer **object) = 0;
 };
 
 struct BC250_DXVK_ENGINE_FUNCS {

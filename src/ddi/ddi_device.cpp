@@ -83,7 +83,8 @@ namespace dxvk::ddi {
      || riid == __uuidof(IBc250DxvkDevice3)
      || riid == __uuidof(IBc250DxvkDevice4)
      || riid == __uuidof(IBc250DxvkDevice5)
-     || riid == __uuidof(IBc250DxvkDevice6)) {
+     || riid == __uuidof(IBc250DxvkDevice6)
+     || riid == __uuidof(IBc250DxvkDevice7)) {
       *ppvObject = ref(this);
       return S_OK;
     }
@@ -579,6 +580,112 @@ namespace dxvk::ddi {
       // swap chain images: the runtime owns this memory.
       Com<D3D11Texture2D> texture = new D3D11Texture2D(m_device, &desc, DXGI_USAGE_BACK_BUFFER, Image, Tiling);
       *ppTexture = texture.ref();
+      return S_OK;
+    } catch (const DxvkError& e) {
+      Logger::err(e.message());
+      return GetErrorResult(e, E_INVALIDARG);
+    }
+  }
+
+
+  // E5 for buffers (ABI 1.9): the description of a GPU-only buffer that CreateBuffer would accept, without the sharing
+  // flags, which are the shell's.
+  static HRESULT GetImportableBufferDesc(
+    const D3D11_BUFFER_DESC*                pDesc,
+          D3D11_BUFFER_DESC*                pResult) {
+    D3D11_BUFFER_DESC desc = *pDesc;
+    desc.MiscFlags &= ~(D3D11_RESOURCE_MISC_SHARED
+                      | D3D11_RESOURCE_MISC_SHARED_NTHANDLE
+                      | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX);
+
+    if ((desc.Usage != D3D11_USAGE_DEFAULT && desc.Usage != D3D11_USAGE_IMMUTABLE)
+     || desc.CPUAccessFlags || !desc.ByteWidth
+     || (desc.MiscFlags & (D3D11_RESOURCE_MISC_TILED | D3D11_RESOURCE_MISC_TILE_POOL)))
+      return E_INVALIDARG;
+
+    HRESULT hr = D3D11Buffer::NormalizeBufferProperties(&desc);
+
+    if (FAILED(hr))
+      return hr;
+
+    *pResult = desc;
+    return S_OK;
+  }
+
+
+  HRESULT STDMETHODCALLTYPE Bc250DxvkDevice::GetBufferCreateInfo(
+    const D3D11_BUFFER_DESC*                pDesc,
+          VkBufferCreateInfo*               pInfo) {
+    if (!pDesc || !pInfo)
+      return E_INVALIDARG;
+
+    D3D11_BUFFER_DESC desc;
+    HRESULT hr = GetImportableBufferDesc(pDesc, &desc);
+
+    if (FAILED(hr))
+      return hr;
+
+    // The buffer half of the D3D11Buffer constructor; DXVK's own buffers get the same usage.
+    DxvkBufferCreateInfo buffer = D3D11Buffer::DescribeBuffer(m_device, &desc);
+
+    VkBufferCreateInfo info = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    info.flags       = buffer.flags;
+    info.size        = buffer.size;
+    info.usage       = buffer.usage;
+    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    *pInfo = info;
+    return S_OK;
+  }
+
+
+  HRESULT STDMETHODCALLTYPE Bc250DxvkDevice::CreateBufferFromVkBuffer(
+    const D3D11_BUFFER_DESC*                pDesc,
+    const VkBufferCreateInfo*               pInfo,
+          VkBuffer                          Buffer,
+          ID3D11Buffer**                    ppBuffer) {
+    if (!ppBuffer)
+      return E_INVALIDARG;
+
+    *ppBuffer = nullptr;
+
+    if (!pDesc || !pInfo || Buffer == VK_NULL_HANDLE)
+      return E_INVALIDARG;
+
+    VkBufferCreateInfo expected = { };
+    HRESULT hr = GetBufferCreateInfo(pDesc, &expected);
+
+    if (FAILED(hr))
+      return hr;
+
+    const VkBufferCreateInfo& actual = *pInfo;
+
+    // The engine reads none of pNext; it refuses structures that could change what the buffer is.
+    bool chainKnown = true;
+
+    for (auto s = reinterpret_cast<const VkBaseInStructure*>(actual.pNext); s; s = s->pNext)
+      chainKnown &= s->sType == VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO;
+
+    bool compatible = actual.sType == VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO
+      && chainKnown
+      && actual.size       == expected.size
+      && actual.flags       == expected.flags
+      && actual.sharingMode == expected.sharingMode
+      && (actual.usage & expected.usage) == expected.usage;
+
+    if (!compatible)
+      return E_INVALIDARG;
+
+    D3D11_BUFFER_DESC desc;
+    hr = GetImportableBufferDesc(pDesc, &desc);
+
+    if (FAILED(hr))
+      return hr;
+
+    try {
+      // No initializer: the content is what the runtime memory holds (E5).
+      Com<D3D11Buffer> buffer = new D3D11Buffer(m_device, &desc, nullptr, Buffer);
+      *ppBuffer = buffer.ref();
       return S_OK;
     } catch (const DxvkError& e) {
       Logger::err(e.message());
