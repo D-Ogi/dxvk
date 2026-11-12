@@ -8,12 +8,69 @@ namespace dxvk {
   D3D11Buffer::D3D11Buffer(
           D3D11Device*                pDevice,
     const D3D11_BUFFER_DESC*          pDesc,
-    const D3D11_ON_12_RESOURCE_INFO*  p11on12Info)
+    const D3D11_ON_12_RESOURCE_INFO*  p11on12Info,
+          VkBuffer                    vkBuffer)
   : D3D11DeviceChild<ID3D11Buffer>(pDevice),
     m_desc        (*pDesc),
     m_resource    (this, pDevice),
     m_d3d10       (this),
     m_destructionNotifier(this) {
+    DxvkBufferCreateInfo info = DescribeBuffer(pDevice, pDesc);
+
+    if (p11on12Info) {
+      m_11on12 = *p11on12Info;
+
+      DxvkBufferImportInfo importInfo;
+      importInfo.buffer = VkBuffer(m_11on12.VulkanHandle);
+      importInfo.offset = m_11on12.VulkanOffset;
+
+      if (m_desc.CPUAccessFlags)
+        m_11on12.Resource->Map(0, nullptr, &importInfo.mapPtr);
+
+      m_buffer = m_parent->GetDXVKDevice()->importBuffer(info, importInfo, GetMemoryFlags());
+      m_cookie = m_buffer->cookie();
+      m_mapPtr = m_buffer->mapPtr(0);
+      m_mapMode = DetermineMapMode(m_buffer->memFlags());
+    } else if (vkBuffer) {
+      // bc250 (BD-373): a GPU-only buffer on runtime memory. No map pointer: the shell's buffer has none.
+      DxvkBufferImportInfo importInfo;
+      importInfo.buffer = vkBuffer;
+
+      m_buffer = m_parent->GetDXVKDevice()->importBuffer(info, importInfo, GetMemoryFlags());
+      m_cookie = m_buffer->cookie();
+      m_mapPtr = nullptr;
+      m_mapMode = D3D11_COMMON_BUFFER_MAP_MODE_NONE;
+    } else if (!(pDesc->MiscFlags & D3D11_RESOURCE_MISC_TILE_POOL)) {
+      VkMemoryPropertyFlags memoryFlags = GetMemoryFlags();
+      m_mapMode = DetermineMapMode(memoryFlags);
+
+      // bc250 (BD-309): large staging storage is one kernel allocation that OfferResources can give back
+      uint32_t dedicatedSize = m_parent->GetOptions()->offerDedicatedStagingSize;
+      info.dedicatedStorage = pDesc->Usage == D3D11_USAGE_STAGING && dedicatedSize && info.size >= dedicatedSize;
+
+      // Create the buffer and set the entire buffer slice as mapped,
+      // so that we only have to update it when invalidating the buffer
+      m_buffer = m_parent->GetDXVKDevice()->createBuffer(info, memoryFlags);
+      m_cookie = m_buffer->cookie();
+      m_mapPtr = m_buffer->mapPtr(0);
+    } else {
+      m_sparseAllocator = m_parent->GetDXVKDevice()->createSparsePageAllocator();
+      m_sparseAllocator->setCapacity(info.size / SparseMemoryPageSize);
+
+      m_cookie = 0u;
+      m_mapPtr = nullptr;
+      m_mapMode = D3D11_COMMON_BUFFER_MAP_MODE_NONE;
+    }
+
+    // For Stream Output buffers we need a counter
+    if (pDesc->BindFlags & D3D11_BIND_STREAM_OUTPUT)
+      m_soCounter = CreateSoCounterBuffer();
+  }
+
+
+  DxvkBufferCreateInfo D3D11Buffer::DescribeBuffer(
+          D3D11Device*                pDevice,
+    const D3D11_BUFFER_DESC*          pDesc) {
     DxvkBufferCreateInfo info;
     info.flags  = 0;
     info.size   = pDesc->ByteWidth;
@@ -38,14 +95,14 @@ namespace dxvk {
     
     if (pDesc->BindFlags & D3D11_BIND_CONSTANT_BUFFER) {
       info.usage  |= VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
-      info.stages |= m_parent->GetEnabledShaderStages();
+      info.stages |= pDevice->GetEnabledShaderStages();
       info.access |= VK_ACCESS_UNIFORM_READ_BIT;
     }
     
     if (pDesc->BindFlags & D3D11_BIND_SHADER_RESOURCE) {
       info.usage  |= VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT
                   |  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-      info.stages |= m_parent->GetEnabledShaderStages();
+      info.stages |= pDevice->GetEnabledShaderStages();
       info.access |= VK_ACCESS_SHADER_READ_BIT;
     }
     
@@ -58,7 +115,7 @@ namespace dxvk {
     if (pDesc->BindFlags & D3D11_BIND_UNORDERED_ACCESS) {
       info.usage  |= VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT
                   |  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-      info.stages |= m_parent->GetEnabledShaderStages();
+      info.stages |= pDevice->GetEnabledShaderStages();
       info.access |= VK_ACCESS_SHADER_READ_BIT
                   |  VK_ACCESS_SHADER_WRITE_BIT;
     }
@@ -85,45 +142,7 @@ namespace dxvk {
         info.access |= VK_ACCESS_HOST_WRITE_BIT;
     }
 
-    if (p11on12Info) {
-      m_11on12 = *p11on12Info;
-
-      DxvkBufferImportInfo importInfo;
-      importInfo.buffer = VkBuffer(m_11on12.VulkanHandle);
-      importInfo.offset = m_11on12.VulkanOffset;
-
-      if (m_desc.CPUAccessFlags)
-        m_11on12.Resource->Map(0, nullptr, &importInfo.mapPtr);
-
-      m_buffer = m_parent->GetDXVKDevice()->importBuffer(info, importInfo, GetMemoryFlags());
-      m_cookie = m_buffer->cookie();
-      m_mapPtr = m_buffer->mapPtr(0);
-      m_mapMode = DetermineMapMode(m_buffer->memFlags());
-    } else if (!(pDesc->MiscFlags & D3D11_RESOURCE_MISC_TILE_POOL)) {
-      VkMemoryPropertyFlags memoryFlags = GetMemoryFlags();
-      m_mapMode = DetermineMapMode(memoryFlags);
-
-      // bc250 (BD-309): large staging storage is one kernel allocation that OfferResources can give back
-      uint32_t dedicatedSize = m_parent->GetOptions()->offerDedicatedStagingSize;
-      info.dedicatedStorage = pDesc->Usage == D3D11_USAGE_STAGING && dedicatedSize && info.size >= dedicatedSize;
-
-      // Create the buffer and set the entire buffer slice as mapped,
-      // so that we only have to update it when invalidating the buffer
-      m_buffer = m_parent->GetDXVKDevice()->createBuffer(info, memoryFlags);
-      m_cookie = m_buffer->cookie();
-      m_mapPtr = m_buffer->mapPtr(0);
-    } else {
-      m_sparseAllocator = m_parent->GetDXVKDevice()->createSparsePageAllocator();
-      m_sparseAllocator->setCapacity(info.size / SparseMemoryPageSize);
-
-      m_cookie = 0u;
-      m_mapPtr = nullptr;
-      m_mapMode = D3D11_COMMON_BUFFER_MAP_MODE_NONE;
-    }
-
-    // For Stream Output buffers we need a counter
-    if (pDesc->BindFlags & D3D11_BIND_STREAM_OUTPUT)
-      m_soCounter = CreateSoCounterBuffer();
+    return info;
   }
   
   

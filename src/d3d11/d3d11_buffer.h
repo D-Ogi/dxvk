@@ -40,10 +40,25 @@ namespace dxvk {
     static constexpr VkDeviceSize BufferSliceAlignment = 64;
   public:
     
+    // bc250 (BD-373): vkBuffer is a buffer that the DDI shell created and bound to memory the runtime owns (a
+    // shared buffer). The buffer is imported as it is, with the usage of DescribeBuffer, and never renamed.
     D3D11Buffer(
             D3D11Device*                pDevice,
       const D3D11_BUFFER_DESC*          pDesc,
-      const D3D11_ON_12_RESOURCE_INFO*  p11on12Info);
+      const D3D11_ON_12_RESOURCE_INFO*  p11on12Info,
+            VkBuffer                    vkBuffer = VK_NULL_HANDLE);
+
+    /**
+     * \brief Buffer create info for a description
+     *
+     * The flags, size, usage, stages and access of the DXVK
+     * buffer that the constructor creates for \c pDesc.
+     * \param [in] pDevice The device
+     * \param [in] pDesc Normalized buffer description
+     */
+    static DxvkBufferCreateInfo DescribeBuffer(
+            D3D11Device*                pDevice,
+      const D3D11_BUFFER_DESC*          pDesc);
 
     ~D3D11Buffer();
     
