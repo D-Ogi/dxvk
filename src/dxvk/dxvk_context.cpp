@@ -1309,69 +1309,6 @@ namespace dxvk {
   }
 
 
-  void DxvkContext::relocateToDedicatedMemory(
-    const Rc<DxvkBuffer>*           buffers,
-          size_t                    bufferCount,
-    const Rc<DxvkImage>*            images,
-          size_t                    imageCount) {
-    DxvkAllocationModes mode(DxvkAllocationMode::Dedicated);
-
-    std::vector<DxvkRelocateBufferInfo> bufferInfos;
-    std::vector<DxvkRelocateImageInfo> imageInfos;
-
-    for (size_t i = 0u; i < bufferCount; i++) {
-      if (buffers[i]->storage()->isDedicatedMemory())
-        continue;
-
-      if (auto storage = buffers[i]->relocateStorage(mode)) {
-        auto& e = bufferInfos.emplace_back();
-        e.buffer = buffers[i];
-        e.storage = std::move(storage);
-      }
-    }
-
-    for (size_t i = 0u; i < imageCount; i++) {
-      if (images[i]->storage()->isDedicatedMemory())
-        continue;
-
-      if (auto storage = images[i]->relocateStorage(mode)) {
-        auto& e = imageInfos.emplace_back();
-        e.image = images[i];
-        e.storage = std::move(storage);
-      }
-    }
-
-    if (bufferInfos.empty() && imageInfos.empty())
-      return;
-
-    // The resources do not come back to their chunks: free each chunk
-    // as soon as its last allocation goes (BD-372). Otherwise the pool
-    // keeps the memory that the moves free as its unused allowance.
-    for (const auto& e : bufferInfos)
-      m_common->memoryManager().releaseChunkWhenEmpty(*e.buffer->storage());
-
-    for (const auto& e : imageInfos)
-      m_common->memoryManager().releaseChunkWhenEmpty(*e.image->storage());
-
-    // As for image rotation: apply deferred clears and return every
-    // resource to its default layout before its storage moves.
-    for (const auto& e : bufferInfos)
-      releaseExternalResource(Rc<DxvkPagedResource>(e.buffer), VK_IMAGE_LAYOUT_UNDEFINED);
-
-    for (const auto& e : imageInfos)
-      releaseExternalResource(Rc<DxvkPagedResource>(e.image), e.image->info().layout);
-
-    relocateResources(bufferInfos.size(), bufferInfos.data(),
-      imageInfos.size(), imageInfos.data());
-
-    for (const auto& e : bufferInfos)
-      m_common->memoryManager().lockResourceGpuAddress(e.buffer->storage());
-
-    for (const auto& e : imageInfos)
-      m_common->memoryManager().lockResourceGpuAddress(e.image->storage());
-  }
-
-
   void DxvkContext::rotateImageStorage(
     const Rc<DxvkImage>*            images,
           size_t                    count) {

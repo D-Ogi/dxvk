@@ -45,9 +45,8 @@ namespace dxvk {
       m_mapMode = DetermineMapMode(memoryFlags);
 
       // bc250 (BD-309): large staging storage is one kernel allocation that OfferResources can give back.
-      // BD-373: large GPU-only storage too, from its creation: a move at the offer would give it a new kernel
-      // allocation that the UMD logging of its creation does not name. Dynamic storage renames; it stays
-      // suballocated.
+      // BD-373: large GPU-only storage too, from its creation: an offer never moves storage, and the UMD logging
+      // of the creation names the allocation that the offer gives. Dynamic storage renames; it stays suballocated.
       const D3D11Options* options = m_parent->GetOptions();
       uint32_t dedicatedSize = 0u;
 

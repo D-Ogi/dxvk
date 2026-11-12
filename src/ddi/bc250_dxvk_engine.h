@@ -494,25 +494,21 @@ struct BC250_DXVK_OFFER_MEMORY {
 /* ABI 1.6. The same object as IBc250DxvkDevice; QueryInterface on it, E_NOINTERFACE from an older engine. */
 MIDL_INTERFACE("41dc4ca2-d34d-4b23-8ebe-c764be11ea8a")
 IBc250DxvkDevice5 : public IBc250DxvkDevice4 {
-    /* DXGI OfferResources for an engine resource (not one of E5). The shell offers kernel allocations; the
-     * engine suballocates its memory, so this call first makes the memory of the resource allocations of its
-     * own. It submits pending work as Flush does (E3). GPU-only storage of at least d3d11.offerDedicatedSize
-     * bytes (default 1 MiB, BD-373) has a VkDeviceMemory of its own from its creation and does not move, so the
-     * UMD logging of its creation names the allocation that the offer gives. Smaller GPU-only storage moves, at
-     * its first offer, to a VkDeviceMemory of its own, in command order with a GPU copy, and is submitted again
-     * before the call returns (the kernel defers the offer until that copy completed); the logging then reports
-     * an UNMAP of the old range and a MAP of the new memory. CPU-mapped storage does not move: it
-     * qualifies when it was created on memory of its own, which the engine does for staging storage of at
-     * least d3d11.offerDedicatedStagingSize bytes (default 1 MiB; for a staging texture of at most 32
-     * subresources, their sum, and one memory object per subresource). The engine then releases the persistent CPU
-     * map of every such memory (vkUnmapMemory) so that no allocation is CPU-locked at the offer; a Map of the
-     * resource is undefined until EndOffer.
+    /* DXGI OfferResources for an engine resource (not one of E5). The shell offers kernel allocations, so only
+     * storage that owns its memory can be offered. The call never moves storage (BD-373): the UMD logging of the
+     * creation of the resource names the allocation that the offer gives. Storage owns its memory when the engine
+     * created it so: GPU-only storage (DEFAULT or IMMUTABLE, not shared) of at least d3d11.offerDedicatedSize bytes
+     * (default 1 MiB), staging storage of at least d3d11.offerDedicatedStagingSize bytes (default 1 MiB; for a
+     * staging texture of at most 32 subresources, their sum, and one memory object per subresource), or storage
+     * that the allocator made dedicated. Smaller storage is suballocated (packed): it has no allocation of its
+     * own, and its offer is a hint. The call submits pending work as Flush does (E3), then releases the
+     * persistent CPU map of every memory it gives (vkUnmapMemory) so that no allocation is CPU-locked at the
+     * offer; a Map of the resource is undefined until EndOffer.
      * S_OK: every memory object of the resource is in pMemory (*pCount entries, at most Capacity); the shell
      * gets their kernel allocations from the ICD, offers them, and calls EndOffer after the reclaim, or at once
      * when its offer fails. S_FALSE: the resource cannot be offered (shared, tiled, imported, mapped by the
-     * application, smaller CPU-mapped storage, more than Capacity memory objects, or no memory of its own could
-     * be allocated); nothing is unmapped, *pCount is 0, and the offer is a hint. E_INVALIDARG for NULL
-     * arguments; a device-loss code as in E6. */
+     * application, suballocated, or more than Capacity memory objects); nothing is unmapped, *pCount is 0, and
+     * the offer is a hint. E_INVALIDARG for NULL arguments; a device-loss code as in E6. */
     virtual HRESULT STDMETHODCALLTYPE PrepareOffer(ID3D11Resource *resource, UINT capacity,
                                                    BC250_DXVK_OFFER_MEMORY *memory, UINT *count) = 0;
 

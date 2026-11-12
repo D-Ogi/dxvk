@@ -2886,9 +2886,9 @@ int main(int argc, char** argv) {
         Check(mapsAgain, "the small staging texture still maps after the refused offer");
       }
 
-      // 3. GPU-only textures on memory of their own: from their creation at 4 MiB (d3d11.offerDedicatedSize, BD-373),
-      //    smaller ones after a move at the first offer (the ABI 1.8 block below). One keeps its content (EndOffer
-      //    without DISCARDED), the other starts again from zero (DISCARDED); each is the control of the other.
+      // 3. GPU-only textures on memory of their own from their creation (4 MiB, at least d3d11.offerDedicatedSize,
+      //    BD-373); smaller ones are suballocated and not offerable (the ABI 1.8 block below). One keeps its content
+      //    (EndOffer without DISCARDED), the other starts again from zero (DISCARDED); each is the control of the other.
       D3D11_TEXTURE2D_DESC defaultDesc = { Side, Side, 1u, 1u, DXGI_FORMAT_R8G8B8A8_UNORM, { 1u, 0u },
         D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET };
       Microsoft::WRL::ComPtr<ID3D11Texture2D> kept, discarded;
@@ -3023,8 +3023,9 @@ int main(int argc, char** argv) {
     //   commit after <= snapshot - decommitted + 32 MiB.
     // The trim is a kernel pass: the UMD gets no Trim call. The decommit takes away exactly the memory that
     // PrepareOffer reported, so the rule is the same as: the Vulkan memory that the process holds after the
-    // offers (offered memory included) is not more than 32 MiB above the snapshot. Memory that an offer moved
-    // a resource out of must go back to the kernel without a Trim call. Here the driver's heap usage
+    // offers (offered memory included) is not more than 32 MiB above the snapshot. Since BD-373 an offer never
+    // moves storage: the textures have memory of their own from their creation (d3d11.offerDedicatedSize, the
+    // staging rule), so the offers leave no memory behind. This model is the guard of that. Here the driver's heap usage
     // (VK_EXT_memory_budget) is the commit, and the kernel half is not needed: nothing is offered to a kernel.
     Microsoft::WRL::ComPtr<IBc250DxvkDevice5> engine5;
     bool haveBudget = false;
@@ -3250,7 +3251,7 @@ int main(int argc, char** argv) {
         ctx->Flush();
       };
 
-      constexpr UINT64 BufferCookie = 0x10010u, TextureCookie = 0x10020u, MoveCookie = 0x10030u, OwnCookie = 0x10040u,
+      constexpr UINT64 BufferCookie = 0x10010u, TextureCookie = 0x10020u, PackedCookie = 0x10030u, OwnCookie = 0x10040u,
                        OwnBufferCookie = 0x10050u;
 
       D3D11_BUFFER_DESC dynDesc = { };
@@ -3268,14 +3269,14 @@ int main(int argc, char** argv) {
       dynTexDesc.BindFlags      = D3D11_BIND_SHADER_RESOURCE;
       dynTexDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
 
-      // A 256 KiB default texture is below the default d3d11.offerDedicatedSize (1 MiB): suballocated, it moves at
-      // its first offer. A default texture and a default buffer of exactly 1 MiB have memory of their own from
-      // their creation (BD-373) and do not move.
-      D3D11_TEXTURE2D_DESC moveDesc = dynTexDesc;
-      moveDesc.Usage          = D3D11_USAGE_DEFAULT;
-      moveDesc.CPUAccessFlags = 0u;
+      // A 256 KiB default texture is below the default d3d11.offerDedicatedSize (1 MiB): suballocated (packed), it
+      // is not offerable. A default texture and a default buffer of exactly 1 MiB have memory of their own from
+      // their creation (BD-373) and are offered with it.
+      D3D11_TEXTURE2D_DESC packedDesc = dynTexDesc;
+      packedDesc.Usage          = D3D11_USAGE_DEFAULT;
+      packedDesc.CPUAccessFlags = 0u;
 
-      D3D11_TEXTURE2D_DESC ownDesc = moveDesc;
+      D3D11_TEXTURE2D_DESC ownDesc = packedDesc;
       ownDesc.Width = ownDesc.Height = 512u;
 
       D3D11_BUFFER_DESC ownBufDesc = { };
@@ -3284,11 +3285,11 @@ int main(int argc, char** argv) {
       ownBufDesc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
 
       Microsoft::WRL::ComPtr<ID3D11Buffer> dyn, plain, ownBuf;
-      Microsoft::WRL::ComPtr<ID3D11Texture2D> dynTex, moving, own;
+      Microsoft::WRL::ComPtr<ID3D11Texture2D> dynTex, packed, own;
       bool made = CheckHr(d3d->CreateBuffer(&dynDesc, nullptr, &dyn), "1.8: dynamic buffer")
                && CheckHr(d3d->CreateBuffer(&dynDesc, nullptr, &plain), "1.8: untracked dynamic buffer")
                && CheckHr(d3d->CreateTexture2D(&dynTexDesc, nullptr, &dynTex), "1.8: dynamic texture")
-               && CheckHr(d3d->CreateTexture2D(&moveDesc, nullptr, &moving), "1.8: 256 KiB default texture")
+               && CheckHr(d3d->CreateTexture2D(&packedDesc, nullptr, &packed), "1.8: 256 KiB default texture")
                && CheckHr(d3d->CreateTexture2D(&ownDesc, nullptr, &own), "1.8: 1 MiB default texture")
                && CheckHr(d3d->CreateBuffer(&ownBufDesc, nullptr, &ownBuf), "1.8: 1 MiB default buffer");
 
@@ -3298,7 +3299,7 @@ int main(int argc, char** argv) {
         Check(engine6->TrackResourceMemory(dyn.Get(), BufferCookie) == S_OK, "TrackResourceMemory: a dynamic buffer");
         Check(engine6->TrackResourceMemory(dyn.Get(), BufferCookie) == S_FALSE, "a second TrackResourceMemory of it is S_FALSE");
         Check(engine6->TrackResourceMemory(dynTex.Get(), TextureCookie) == S_OK, "TrackResourceMemory: a dynamic texture");
-        Check(engine6->TrackResourceMemory(moving.Get(), MoveCookie) == S_OK, "TrackResourceMemory: a default texture");
+        Check(engine6->TrackResourceMemory(packed.Get(), PackedCookie) == S_OK, "TrackResourceMemory: a default texture");
         Check(engine6->TrackResourceMemory(own.Get(), OwnCookie) == S_OK, "TrackResourceMemory: a 1 MiB default texture");
         Check(engine6->TrackResourceMemory(ownBuf.Get(), OwnBufferCookie) == S_OK, "TrackResourceMemory: a 1 MiB default buffer");
         Check(engine6->TrackResourceMemory(plain.Get(), 0u) == S_FALSE, "TrackResourceMemory(0) of an untracked resource is S_FALSE");
@@ -3314,7 +3315,7 @@ int main(int argc, char** argv) {
         std::vector<Event> rundown = shell.TakeMemoryEvents();
         bool rundownKinds = std::all_of(rundown.begin(), rundown.end(),
           [] (const Event& e) { return e.Kind == BC250_DXVK_MEMORY_EVENT_RUNDOWN; });
-        Check(rundownKinds && apply(rundown) && live[BufferCookie].size() == 1u && live[MoveCookie].size() == 1u
+        Check(rundownKinds && apply(rundown) && live[BufferCookie].size() == 1u && live[PackedCookie].size() == 1u
            && live[OwnCookie].size() == 1u && live[OwnBufferCookie].size() == 1u
            && live[BufferCookie][0].Size >= dynDesc.ByteWidth,
           "ReportMemory on another thread: RUNDOWN of the buffer and of the default textures, with their cookies");
@@ -3337,15 +3338,19 @@ int main(int argc, char** argv) {
         BC250_DXVK_OFFER_MEMORY offer[4] = { };
         UINT offerCount = 0u;
 
-        if (SUCCEEDED(engine->QueryInterface(IID_PPV_ARGS(&engine5)))
-         && engine5->PrepareOffer(moving.Get(), 4u, offer, &offerCount) == S_OK) {
-          std::vector<Event> move = shell.TakeMemoryEvents();
-          Check(only(move, MoveCookie) && apply(move) && live[MoveCookie].size() == 1u
-             && live[MoveCookie][0].Offset == 0u && (VkDeviceMemory)(live[MoveCookie][0].Allocation) == offer[0].Memory,
-            "PrepareOffer moves the 256 KiB default texture: UNMAP of its old range, MAP of its own memory");
-          Check(engine5->EndOffer(moving.Get(), 0u) == S_OK, "1.8: EndOffer");
-        } else {
-          std::printf("SKIP  move to memory of its own: PrepareOffer of the default texture was not S_OK\n");
+        // BD-373: suballocated (packed) storage is not offered and does not move: S_FALSE, no event, and the
+        // logging keeps the range of the RUNDOWN
+        Check(SUCCEEDED(engine->QueryInterface(IID_PPV_ARGS(&engine5))), "1.8: QueryInterface IBc250DxvkDevice5");
+
+        if (engine5) {
+          Event packedBefore = live[PackedCookie].empty() ? Event() : live[PackedCookie][0];
+          offerCount = 7u;
+          HRESULT hr = engine5->PrepareOffer(packed.Get(), 4u, offer, &offerCount);
+          std::vector<Event> stay = shell.TakeMemoryEvents();
+          Check(hr == S_FALSE && offerCount == 0u && stay.empty() && live[PackedCookie].size() == 1u
+             && same(live[PackedCookie][0], packedBefore),
+            "PrepareOffer of the 256 KiB default texture: S_FALSE, no move, no event, the packed range stays");
+          Check(engine5->EndOffer(packed.Get(), 0u) == S_OK, "1.8: EndOffer without an offer");
         }
 
         // BD-373: the HLK OfferReclaimPending test maps the D3D resource to the allocation that the logging names
@@ -3387,11 +3392,11 @@ int main(int argc, char** argv) {
 
         Check(engine6->TrackResourceMemory(dyn.Get(), 0u) == S_OK
            && engine6->TrackResourceMemory(dynTex.Get(), 0u) == S_OK
-           && engine6->TrackResourceMemory(moving.Get(), 0u) == S_OK
+           && engine6->TrackResourceMemory(packed.Get(), 0u) == S_OK
            && engine6->TrackResourceMemory(own.Get(), 0u) == S_OK
            && engine6->TrackResourceMemory(ownBuf.Get(), 0u) == S_OK, "TrackResourceMemory(0) ends tracking");
         std::vector<Event> ends = shell.TakeMemoryEvents();
-        Check(apply(ends) && live[BufferCookie].empty() && live[TextureCookie].empty() && live[MoveCookie].empty()
+        Check(apply(ends) && live[BufferCookie].empty() && live[TextureCookie].empty() && live[PackedCookie].empty()
            && live[OwnCookie].empty() && live[OwnBufferCookie].empty(),
           "end of tracking while on: an UNMAP of each live range");
 

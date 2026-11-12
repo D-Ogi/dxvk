@@ -1255,50 +1255,11 @@ namespace dxvk::ddi {
       if (!total || total > Capacity)
         return S_FALSE;
 
-      // Pending work that reads CPU-mapped storage must have run before its map goes (E3)
-      m_context->Flush();
-
-      // Mapped storage cannot move (DxvkBuffer::canRelocate): it qualifies only when it was created on
-      // memory of its own. GPU-only storage moves now, at its first offer.
-      std::vector<Rc<DxvkBuffer>> moveBuffers;
-      std::vector<Rc<DxvkImage>> moveImages;
-
-      for (const auto& buffer : targets.buffers) {
-        auto storage = buffer->storage();
-
-        if (storage->isDedicatedMemory())
-          continue;
-
-        if (storage->mapPtr())
-          return S_FALSE;
-
-        moveBuffers.push_back(buffer);
-      }
-
-      for (const auto& image : targets.images) {
-        if (!image->storage()->isDedicatedMemory())
-          moveImages.push_back(image);
-      }
-
-      if (!moveBuffers.empty() || !moveImages.empty()) {
-        m_context->RelocateToDedicatedMemory(moveBuffers.data(), moveBuffers.size(),
-          moveImages.data(), moveImages.size());
-        m_context->Flush();
-
-        // The command list of the move holds the old storage until it retires. Without a wait, the last moves
-        // retire only at a later submission, and an application that offers and then idles keeps that memory
-        // committed (BD-372: the HLK Lower Commit test reads the commit after a kernel trim, with no further
-        // call into the driver). The wait comes once per resource, at its first offer: a resource that is on
-        // memory of its own does not move again.
-        for (const auto& buffer : moveBuffers)
-          m_dxvkDevice->waitForResource(*buffer, DxvkAccess::Move);
-
-        for (const auto& image : moveImages)
-          m_dxvkDevice->waitForResource(*image, DxvkAccess::Move);
-      }
-
-      // The context executed the relocation; a resource that did not move (no memory, or not movable) is
-      // not offerable, and nothing was unmapped yet
+      // BD-373: only storage that owns its memory is offered (created so by d3d11.offerDedicatedSize, by
+      // d3d11.offerDedicatedStagingSize, or dedicated by the allocator). Suballocated storage is packed: it
+      // has no kernel allocation of its own, and the offer is a hint. PrepareOffer does not move storage, so
+      // nothing is unmapped and the memory logging keeps its mapping (the HLK OfferReclaim tests find the
+      // resource by the allocation that the logging named at its creation).
       for (const auto& buffer : targets.buffers) {
         if (!buffer->storage()->isDedicatedMemory())
           return S_FALSE;
@@ -1308,6 +1269,9 @@ namespace dxvk::ddi {
         if (!image->storage()->isDedicatedMemory())
           return S_FALSE;
       }
+
+      // Pending work that reads CPU-mapped storage must have run before its map goes (E3)
+      m_context->Flush();
 
       UINT count = 0u;
 

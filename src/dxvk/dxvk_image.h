@@ -80,7 +80,7 @@ namespace dxvk {
 
     /// bc250 (BD-373): try to give every storage of the image a VkDeviceMemory
     /// of its own (DxvkAllocationMode::Dedicated), and suballocate only if that
-    /// fails. The driver can then offer the image to the OS without a move.
+    /// fails. Only an image on memory of its own can be offered to the OS.
     bool dedicatedStorage = false;
   };
 

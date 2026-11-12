@@ -164,19 +164,6 @@ namespace dxvk {
             size_t                      Count);
 
     /**
-     * \brief bc250 (BD-309): moves resources to memory of their own
-     *
-     * Used by a user-mode driver engine (amdgpu_wddm_dxvk) before it
-     * offers the resources to the OS, in command order
-     * (DxvkContext::relocateToDedicatedMemory).
-     */
-    void RelocateToDedicatedMemory(
-      const Rc<DxvkBuffer>*             pBuffers,
-            size_t                      BufferCount,
-      const Rc<DxvkImage>*              pImages,
-            size_t                      ImageCount);
-
-    /**
      * \brief bc250 (BD-309): starts images again whose content the OS discarded
      *
      * Used by a user-mode driver engine (amdgpu_wddm_dxvk) after a reclaim

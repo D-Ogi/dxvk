@@ -969,25 +969,6 @@ namespace dxvk {
   }
 
 
-  void D3D11ImmediateContext::RelocateToDedicatedMemory(
-    const Rc<DxvkBuffer>*                   pBuffers,
-          size_t                            BufferCount,
-    const Rc<DxvkImage>*                    pImages,
-          size_t                            ImageCount) {
-    D3D10DeviceLock lock = LockContext();
-
-    std::vector<Rc<DxvkBuffer>> buffers(pBuffers, pBuffers + BufferCount);
-    std::vector<Rc<DxvkImage>> images(pImages, pImages + ImageCount);
-
-    EmitCs([
-      cBuffers = std::move(buffers),
-      cImages  = std::move(images)
-    ] (DxvkContext* ctx) {
-      ctx->relocateToDedicatedMemory(cBuffers.data(), cBuffers.size(), cImages.data(), cImages.size());
-    });
-  }
-
-
   void D3D11ImmediateContext::InitDiscardedImages(
     const Rc<DxvkImage>*                    pImages,
           size_t                            Count) {

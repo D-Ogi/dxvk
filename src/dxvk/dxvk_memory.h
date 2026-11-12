@@ -108,10 +108,6 @@ namespace dxvk {
     /// Whether defragmentation can be performed on this chunk.
     /// Only relevant for chunks in non-mappable device memory.
     VkBool32 canMove = true;
-    /// bc250 (BD-372): a resource left this chunk for good. When the
-    /// chunk is empty, it goes back to the driver at once, without the
-    /// unused-memory allowance and the idle timer of the pool.
-    VkBool32 releaseWhenEmpty = false;
 
     void addAllocation(DxvkResourceAllocation* allocation);
     void removeAllocation(DxvkResourceAllocation* allocation);
@@ -1452,21 +1448,6 @@ namespace dxvk {
      */
     void lockResourceGpuAddress(
       const Rc<DxvkResourceAllocation>& allocation);
-
-    /**
-     * \brief Releases the chunk of an allocation when it is empty
-     *
-     * bc250 (BD-372): for storage that a resource leaves for good,
-     * such as the old storage of a move to memory of its own before
-     * an offer to the OS. When no allocation uses the chunk any more,
-     * the chunk is freed at once: a pool otherwise keeps up to one
-     * maximum-size chunk of empty memory, and frees the rest after an
-     * idle time. Dedicated and sparse allocations have no chunk; the
-     * call does nothing for them.
-     * \param [in] allocation Allocation in the chunk
-     */
-    void releaseChunkWhenEmpty(
-      const DxvkResourceAllocation&     allocation);
 
     /**
      * \brief bc250 (BD-309): releases the persistent map of a dedicated allocation

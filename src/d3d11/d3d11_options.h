@@ -90,9 +90,12 @@ namespace dxvk {
 
     /// bc250 (BD-373): GPU-only storage (DEFAULT and IMMUTABLE, not shared)
     /// of at least this many bytes gets a VkDeviceMemory of its own when it
-    /// is created, so that an offer does not move it to new memory. The
-    /// UMD logging then names the allocation that the offer gives to the
-    /// OS. Smaller storage moves at its first offer. 0 disables it.
+    /// is created: one kernel allocation that the driver can offer to the
+    /// OS (DXGI OfferResources), and that the UMD logging names at the
+    /// creation. Smaller storage is suballocated, and its offer is a hint
+    /// (an offer never moves storage). 0 disables the rule: then no
+    /// GPU-only storage can be offered, except storage that the allocator
+    /// made dedicated.
     uint32_t offerDedicatedSize = 1u << 20;
 
     /// Always lock immediate context on every API call. May be

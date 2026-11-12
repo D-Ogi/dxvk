@@ -277,9 +277,9 @@ namespace dxvk {
     if (m_11on12.Resource != nullptr)
       vkImage = VkImage(m_11on12.VulkanHandle);
 
-    // bc250 (BD-373): a large GPU-only texture gets memory of its own when it is created, so that an offer does
-    // not move it (d3d11.offerDedicatedSize). The UMD logging of its creation then names the kernel allocation
-    // that OfferResources gives to the OS. The size is that of the texel blocks, without the padding of the tiling.
+    // bc250 (BD-373): a large GPU-only texture gets memory of its own when it is created (d3d11.offerDedicatedSize),
+    // so that it can be offered: an offer never moves storage. The UMD logging of its creation then names the kernel
+    // allocation that OfferResources gives to the OS. The size is that of the texel blocks, without the padding of the tiling.
     uint32_t dedicatedSize = m_device->GetOptions()->offerDedicatedSize;
 
     if (dedicatedSize && !vkImage && m_mapMode == D3D11_COMMON_TEXTURE_MAP_MODE_NONE
