@@ -4,7 +4,7 @@
  * UserModeDriverName DLL) and its DXVK engine ("engine", amdgpu_wddm_dxvk.dll, DXVK fork branch
  * amdgpu-wddm/ddi-engine).
  *
- * Revision r12, ABI 1.7. This file in the DXVK fork is the only copy; the shell includes it from the DXVK
+ * Revision r13, ABI 1.8. This file in the DXVK fork is the only copy; the shell includes it from the DXVK
  * source checkout it builds against, like its other DXVK-facing headers.
  *
  * Versions. A minor version adds and never changes: an engine of minor n serves a shell built for any minor
@@ -38,6 +38,10 @@
  *        starts and ends, so that the shell can admit the driver-internal memory calls of hosted RADV on it. The
  *        member is at the end of the structure: the engine reads it only when Services->Size includes it, and it
  *        accepts the shorter structure of a shell before 1.7. An engine before 1.7 ignores the member.
+ *   1.8  r13: IBc250DxvkDevice6 (TrackResourceMemory, SetMemoryReporting, ReportMemory) and the Services members
+ *        ResolveMemory and MemoryEvents (BD-373): the kernel allocation of each engine resource for the UMD
+ *        logging provider of WDDM 1.2. The members are at the end of the structure; the engine tracks no resource
+ *        when Services->Size does not include both, so a shell before 1.8 sees no change.
  *
  * WDK-free by construction. DXVK's util_gdi.h declares private extern-C D3DKMT prototypes that collide with
  * the WDK's in one translation unit, so nothing here needs d3d10umddi.h or a DXVK header: windows.h, the SDK's
@@ -134,7 +138,7 @@
 #include <vulkan/vulkan.h>
 
 #define BC250_DXVK_ENGINE_ABI_MAJOR 1u
-#define BC250_DXVK_ENGINE_ABI_MINOR 7u
+#define BC250_DXVK_ENGINE_ABI_MINOR 8u
 #define BC250_DXVK_ENGINE_ABI_VERSION ((BC250_DXVK_ENGINE_ABI_MAJOR << 16) | BC250_DXVK_ENGINE_ABI_MINOR)
 
 /* The Vulkan objects the shell owns (E1). */
@@ -168,6 +172,8 @@ struct BC250_DXVK_VULKAN_DEVICE {
     const VkPhysicalDeviceFeatures2 *Features;     /* exactly as enabled at vkCreateDevice */
 };
 
+struct BC250_DXVK_MEMORY_EVENT;
+
 /* Services the shell provides to one engine device. Any member may be NULL. */
 struct BC250_DXVK_SHELL_SERVICES {
     UINT32 Size;
@@ -187,10 +193,36 @@ struct BC250_DXVK_SHELL_SERVICES {
      * a worker that started returns before the engine device's final Release returns. The shell must not call
      * the engine from it. */
     void (APIENTRY *WorkerScope)(void *shell, BOOL enter);
+    /* 1.8 (BD-373): the kernel allocation (D3DKMT_HANDLE) of a VkDeviceMemory of this device, and its size in
+     * *bytes; 0 when the memory is not one kernel allocation (imported, sparse) or the shell cannot tell. Called
+     * inside an engine call, on its thread, for memory that is alive; it must not lock, call the kernel or call
+     * the engine. */
+    UINT64 (APIENTRY *ResolveMemory)(void *shell, VkDeviceMemory memory, UINT64 *bytes);
+    /* 1.8 (BD-373): allocation events of tracked resources (IBc250DxvkDevice6), count >= 1. Called inside an
+     * engine call while reporting is on, or inside ReportMemory, with an engine lock held: the shell writes the
+     * events and must not call the engine. */
+    void (APIENTRY *MemoryEvents)(void *shell, const BC250_DXVK_MEMORY_EVENT *events, UINT32 count);
 };
 
 /* The size of BC250_DXVK_SHELL_SERVICES before 1.7: the smallest Services->Size an engine accepts. */
 #define BC250_DXVK_SHELL_SERVICES_SIZE_1_0 (offsetof(BC250_DXVK_SHELL_SERVICES, WorkerScope))
+/* The size of BC250_DXVK_SHELL_SERVICES in 1.7. */
+#define BC250_DXVK_SHELL_SERVICES_SIZE_1_7 (offsetof(BC250_DXVK_SHELL_SERVICES, ResolveMemory))
+
+/* ABI 1.8 (BD-373): one allocation event of a tracked resource, in the terms of the UMD logging provider. */
+#define BC250_DXVK_MEMORY_EVENT_MAP     1u         /* the resource got this memory */
+#define BC250_DXVK_MEMORY_EVENT_UNMAP   2u         /* the resource lost this memory; the values of its map */
+#define BC250_DXVK_MEMORY_EVENT_RUNDOWN 3u         /* the resource has this memory (ReportMemory) */
+#define BC250_DXVK_MEMORY_RENAMED       0x1u       /* storage of a Map with DISCARD, or of a dynamic texture's Map */
+struct BC250_DXVK_MEMORY_EVENT {
+    UINT32 Kind;
+    UINT32 Flags;
+    UINT64 Resource;                               /* the cookie of TrackResourceMemory */
+    UINT64 Allocation;                             /* ResolveMemory of the memory */
+    UINT64 Offset;                                 /* byte range in the kernel allocation */
+    UINT64 Size;
+    UINT64 AllocationSize;                         /* *bytes of ResolveMemory */
+};
 
 #define BC250_DXVK_THREADING_INLINE 0u
 
@@ -486,6 +518,32 @@ IBc250DxvkDevice5 : public IBc250DxvkDevice4 {
      * as it is. S_OK; E_OUTOFMEMORY when vkMapMemory failed (the resource then stays unmapped, and the shell
      * reports the device lost); a device-loss code as in E6. */
     virtual HRESULT STDMETHODCALLTYPE EndOffer(ID3D11Resource *resource, UINT flags) = 0;
+};
+
+/* ABI 1.8 (BD-373). The same object as IBc250DxvkDevice; QueryInterface on it, E_NOINTERFACE from an older engine.
+ * The shell holds a reference for the calls from other threads and makes none of them after it starts the final
+ * Release of the device. The engine keeps the current memory of each tracked resource and tells the shell through Services.MemoryEvents
+ * only while reporting is on (lazy): a storage change of a tracked resource costs no lock, no kernel call and no
+ * shell call when it is off. Events of one resource come in the order of its changes. A change that happens during
+ * a ReportMemory can be in its RUNDOWN events and also in an UNMAP and MAP after them; it is never missing. */
+MIDL_INTERFACE("bb949564-bf28-4b99-ae85-2eb63275d8e0")
+IBc250DxvkDevice6 : public IBc250DxvkDevice5 {
+    /* Inside an engine call. cookie != 0 starts tracking of a resource of this device that the engine created
+     * (not one of E5) and, while reporting is on, writes a MAP event of each memory it has; the events carry
+     * cookie. A dynamic texture's buffer of a mapped subresource is tracked from its Map to its Unmap. cookie 0
+     * ends tracking and, while reporting is on, writes an UNMAP event of each memory; the shell calls it before
+     * its last Release of the resource. S_OK; S_FALSE when the engine does not track the resource (Services
+     * without ResolveMemory and MemoryEvents, a device that runs DXVK's own threads, a resource the engine did
+     * not create, or one that is tracked already); E_OUTOFMEMORY; E_INVALIDARG for NULL. */
+    virtual HRESULT STDMETHODCALLTYPE TrackResourceMemory(ID3D11Resource *resource, UINT64 cookie) = 0;
+
+    /* Any thread, also outside an engine call. Turns event reporting of storage changes on or off. Makes no
+     * Vulkan call and waits for no engine call. Off at device creation. */
+    virtual void STDMETHODCALLTYPE SetMemoryReporting(BOOL enabled) = 0;
+
+    /* Any thread, also outside an engine call. A RUNDOWN event of each memory of each tracked resource, through
+     * Services.MemoryEvents on this thread, before it returns. Makes no Vulkan call. */
+    virtual void STDMETHODCALLTYPE ReportMemory() = 0;
 };
 
 struct BC250_DXVK_ENGINE_FUNCS {

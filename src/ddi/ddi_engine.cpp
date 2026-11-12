@@ -318,6 +318,13 @@ namespace dxvk::ddi {
           };
         }
 
+        // 1.8 (BD-373): the memory reporter needs every storage change on the thread of the engine call (E2).
+        // DXVK's own threads change storage on the CS thread, so a measurement device tracks no resource.
+        if (workerThreads) {
+          services.ResolveMemory = nullptr;
+          services.MemoryEvents  = nullptr;
+        }
+
         Rc<DxvkDevice> device = adapter->importDevice(deviceInfo);
 
         D3D_FEATURE_LEVEL maxLevel = D3D11Device::GetMaxFeatureLevel(*device);

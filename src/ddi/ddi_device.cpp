@@ -40,7 +40,8 @@ namespace dxvk::ddi {
           D3D11DXGIDevice*                  pContainer,
     const BC250_DXVK_SHELL_SERVICES&        Services,
           std::unique_ptr<ShellLogSink>&&   LogSink)
-  : m_container(pContainer), m_services(Services), m_logSink(std::move(LogSink)) {
+  : m_container(pContainer), m_services(Services), m_logSink(std::move(LogSink)),
+    m_memoryReporter(std::make_unique<MemoryReporter>(Services)) {
     Com<ID3D11Device5> device;
     m_container->QueryInterface(__uuidof(ID3D11Device5), reinterpret_cast<void**>(&device));
 
@@ -81,7 +82,8 @@ namespace dxvk::ddi {
      || riid == __uuidof(IBc250DxvkDevice2)
      || riid == __uuidof(IBc250DxvkDevice3)
      || riid == __uuidof(IBc250DxvkDevice4)
-     || riid == __uuidof(IBc250DxvkDevice5)) {
+     || riid == __uuidof(IBc250DxvkDevice5)
+     || riid == __uuidof(IBc250DxvkDevice6)) {
       *ppvObject = ref(this);
       return S_OK;
     }
@@ -115,6 +117,10 @@ namespace dxvk::ddi {
     }
 
     LogShaderStats();
+
+    // The reporter's references to DXVK objects go while the DXVK device still exists (1.8). The reporter
+    // itself stays until the destructor, for a SetMemoryReporting or ReportMemory on another thread.
+    m_memoryReporter->Clear();
 
     m_device  = nullptr;
     m_context = nullptr;
@@ -1040,6 +1046,33 @@ namespace dxvk::ddi {
       case DxvkDeferredError::OutOfMemory: return E_OUTOFMEMORY;
       default:                             return E_FAIL;
     }
+  }
+
+
+  HRESULT STDMETHODCALLTYPE Bc250DxvkDevice::TrackResourceMemory(
+          ID3D11Resource*                   pResource,
+          UINT64                            Cookie) {
+    if (!pResource)
+      return E_INVALIDARG;
+
+    try {
+      return Cookie
+        ? m_memoryReporter->Track(pResource, Cookie)
+        : m_memoryReporter->Untrack(pResource);
+    } catch (const std::bad_alloc&) {
+      return E_OUTOFMEMORY;
+    }
+  }
+
+
+  void STDMETHODCALLTYPE Bc250DxvkDevice::SetMemoryReporting(
+          BOOL                              Enabled) {
+    m_memoryReporter->SetReporting(Enabled != FALSE);
+  }
+
+
+  void STDMETHODCALLTYPE Bc250DxvkDevice::ReportMemory() {
+    m_memoryReporter->Report();
   }
 
 

@@ -18,6 +18,7 @@
 #include "../dxvk/hud/dxvk_hud.h"
 
 #include "bc250_dxvk_engine.h"
+#include "ddi_memory_report.h"
 
 namespace dxvk::ddi {
 
@@ -46,7 +47,7 @@ namespace dxvk::ddi {
   };
 
 
-  class Bc250DxvkDevice : public ComObject<IBc250DxvkDevice5> {
+  class Bc250DxvkDevice : public ComObject<IBc250DxvkDevice6> {
 
   public:
 
@@ -142,6 +143,15 @@ namespace dxvk::ddi {
             ID3D11Resource*                   pResource,
             UINT                              Flags) final;
 
+    HRESULT STDMETHODCALLTYPE TrackResourceMemory(
+            ID3D11Resource*                   pResource,
+            UINT64                            Cookie) final;
+
+    void STDMETHODCALLTYPE SetMemoryReporting(
+            BOOL                              Enabled) final;
+
+    void STDMETHODCALLTYPE ReportMemory() final;
+
   private:
 
     // The DXVK resources whose memory an offer of a D3D11 resource gives to the OS (BD-309)
@@ -168,6 +178,9 @@ namespace dxvk::ddi {
     Rc<DxvkDevice>              m_dxvkDevice;
     BC250_DXVK_SHELL_SERVICES   m_services = { };
     std::unique_ptr<ShellLogSink> m_logSink;
+
+    // UMD allocation logging of the engine's resources (1.8, BD-373); cleared at final release before the device
+    std::unique_ptr<MemoryReporter> m_memoryReporter;
 
     // The HUD of dxvk.hud (DXVK_HUD), drawn into each presented surface; null when no item is enabled
     Rc<hud::Hud>                m_hud;

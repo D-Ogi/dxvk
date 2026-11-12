@@ -8,6 +8,7 @@ ddi_src = [
   'ddi_engine.cpp',
   'shader_cache_policy.cpp',
   'ddi_device.cpp',
+  'ddi_memory_report.cpp',
   'ddi_shader.cpp',
 ]
 
