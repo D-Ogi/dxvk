@@ -269,6 +269,14 @@ namespace dxvk::ddi {
   }
 
 
+  bool MemoryReporter::Slot::keepsStorage() const {
+    // A discard or a move gives a new allocation to a resource that the API did not rename. The test of the UMD
+    // logging (OfferReclaim) removes every key of the resource at UNMAP and restores the key of the D3D resource
+    // at MAP only for a rename. Off, nothing reads the logging: DXVK keeps all of its discards and moves.
+    return !record->renames && record->reporter->m_enabled.load(std::memory_order_relaxed);
+  }
+
+
   void MemoryReporter::Slot::Attach(DxvkPagedResource* object, DxvkResourceAllocation* storage, bool renamed) {
     this->object = object;
     this->memory = VK_NULL_HANDLE;

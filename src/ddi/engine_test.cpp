@@ -3374,6 +3374,62 @@ int main(int argc, char** argv) {
         offerInPlace(own.Get(), OwnCookie, "1 MiB default texture");
         offerInPlace(ownBuf.Get(), OwnBufferCookie, "1 MiB default buffer");
 
+        // BD-373: the HLK OfferReclaimCreateDestroy fill of a default buffer: CopyResource of the full buffer from a
+        // staging buffer with initial data, right after the creation. DXVK discards a full write of a buffer in use
+        // (an SDMA upload has no size limit). With reporting on, a default buffer keeps its storage: a new one gave
+        // UNMAP and MAP without RENAMED, and the test lost its key for the D3D resource ("Can't find allocation").
+        {
+          constexpr UINT64 FillCookie = 0x10060u;
+          const UINT sizes[] = { 16u, 70000u, 1234567u };
+          bool kept = true;
+
+          for (UINT n = 0u; n < 3u; n++) {
+            std::vector<uint8_t> data(sizes[n], uint8_t(0x5au + n));
+            D3D11_SUBRESOURCE_DATA init = { data.data(), sizes[n], sizes[n] };
+
+            D3D11_BUFFER_DESC fillDesc = { };
+            fillDesc.ByteWidth = sizes[n];
+            fillDesc.Usage     = D3D11_USAGE_DEFAULT;
+            fillDesc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+
+            D3D11_BUFFER_DESC stageDesc = fillDesc;
+            stageDesc.Usage          = D3D11_USAGE_STAGING;
+            stageDesc.BindFlags      = 0u;
+            stageDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE;
+
+            Microsoft::WRL::ComPtr<ID3D11Buffer> target, stage;
+
+            if (!CheckHr(d3d->CreateBuffer(&fillDesc, nullptr, &target), "1.8: default buffer to fill")
+             || !CheckHr(d3d->CreateBuffer(&stageDesc, &init, &stage), "1.8: staging buffer with initial data")) {
+              kept = false;
+              continue;
+            }
+
+            UINT64 cookie = FillCookie + n;
+            Check(engine6->TrackResourceMemory(target.Get(), cookie) == S_OK, "TrackResourceMemory: a default buffer to fill");
+            std::vector<Event> map = shell.TakeMemoryEvents();
+            bool mapped = map.size() == 1u && map[0].Kind == BC250_DXVK_MEMORY_EVENT_MAP && only(map, cookie) && apply(map);
+
+            // Two fills in one submission: the second one writes a buffer that the first one uses
+            ctx->CopyResource(target.Get(), stage.Get());
+            ctx->CopyResource(target.Get(), stage.Get());
+            ctx->Flush();
+            std::vector<Event> fill = shell.TakeMemoryEvents();
+
+            char what[128];
+            std::snprintf(what, sizeof(what), "fill of a %u-byte default buffer while on: no new storage, no event "
+              "(%zu events)", sizes[n], fill.size());
+            Check(mapped && fill.empty(), what);
+            kept = kept && mapped && fill.empty();
+
+            Check(engine6->TrackResourceMemory(target.Get(), 0u) == S_OK, "TrackResourceMemory(0) of the filled buffer");
+            std::vector<Event> end = shell.TakeMemoryEvents();
+            Check(apply(end) && live[cookie].empty(), "end of tracking of the filled buffer: UNMAP of its range");
+          }
+
+          std::printf("      CreateDestroy fill model: %s\n", kept ? "storage kept" : "FAIL");
+        }
+
         // Off again: nothing more, and the next rundown still knows the current ranges
         engine6->SetMemoryReporting(FALSE);
         discard(dyn.Get(), 8u);

@@ -226,7 +226,7 @@ namespace dxvk {
 
   Rc<DxvkResourceAllocation> DxvkImage::relocateStorage(
           DxvkAllocationModes         mode) {
-    if (!canRelocate())
+    if (!canRelocate() || storageIsKept())
       return nullptr;
 
     return allocateStorageWithUsage(DxvkImageUsageInfo(), mode);

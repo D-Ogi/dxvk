@@ -94,6 +94,10 @@ namespace dxvk::ddi {
               uint32_t                  index,
               DxvkPagedResource*        helper) override;
 
+      // While reporting is on, a resource that does not rename keeps its storage. The logging reports a storage
+      // change as UNMAP and MAP without Renamed usage, and the HLK test then loses its key for the D3D resource.
+      bool keepsStorage() const override;
+
       // Device thread
       void Attach(DxvkPagedResource* object, DxvkResourceAllocation* storage, bool renamed);
 

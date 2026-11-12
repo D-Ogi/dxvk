@@ -470,6 +470,17 @@ namespace dxvk {
             uint32_t                  index,
             DxvkPagedResource*        helper) = 0;
 
+    /**
+     * \brief The resource must keep its storage
+     *
+     * \c true while a storage change that the API did not ask for would make
+     * the logging lose the resource: a discard that the backend does for a
+     * write of the full resource, or a move by defragmentation. The backend
+     * then keeps the storage and orders the write. Called on the thread that
+     * changes the storage.
+     */
+    virtual bool keepsStorage() const = 0;
+
   protected:
 
     ~DxvkStorageObserver() = default;
@@ -765,6 +776,18 @@ namespace dxvk {
      */
     DxvkStorageObserver* storageObserver() const {
       return m_storageObserver;
+    }
+
+    /**
+     * \brief Whether the storage must stay
+     *
+     * bc250 (BD-373): the observer keeps the storage. The backend then does
+     * not discard or move the storage on its own initiative. This does not
+     * change \c canRelocate: a stable GPU address must not depend on it.
+     * \returns \c true if the observer keeps the storage
+     */
+    bool storageIsKept() const {
+      return unlikely(m_storageObserver != nullptr) && m_storageObserver->keepsStorage();
     }
 
   protected:

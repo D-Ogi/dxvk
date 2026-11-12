@@ -2524,7 +2524,8 @@ namespace dxvk {
       if (needsNewBackingStorage) {
         auto imageSubresource = dstImage->getAvailableSubresources();
 
-        if (dstSubresource != imageSubresource || !isFullWrite || !dstImage->canRelocate())
+        if (dstSubresource != imageSubresource || !isFullWrite || !dstImage->canRelocate()
+         || dstImage->storageIsKept())
           continue;
 
         // On desktop there's no real point in allocating extra memory, just do
@@ -10643,8 +10644,10 @@ namespace dxvk {
     // Otherwise, our only option is to discard, which we can only do if we're
     // writing the full buffer. Therefore, the resource being read should always
     // be checked first so that unnecessary discards are avoided.
+    // bc250 (BD-373): no discard of storage that the UMD allocation logging keeps
     bool canDiscard = access == DxvkAccess::Write && !offset
-      && size == buffer.info().size && buffer.canRelocate();
+      && size == buffer.info().size && buffer.canRelocate()
+      && !buffer.storageIsKept();
 
     if (!canDiscard && cmdBuffer == DxvkCmdBuffer::SdmaBuffer)
       cmdBuffer = DxvkCmdBuffer::InitBuffer;

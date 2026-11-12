@@ -94,7 +94,7 @@ namespace dxvk {
           DxvkAllocationModes         mode) {
     // The resource may become non-relocatable even after we allocate new
     // backing storage, but if it already is then don't waste memory.
-    if (!canRelocate())
+    if (!canRelocate() || storageIsKept())
       return nullptr;
 
     DxvkAllocationInfo allocationInfo = { };
