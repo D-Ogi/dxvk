@@ -1728,6 +1728,12 @@ namespace dxvk {
 
   void DxvkMemoryAllocator::freeAllocation(
           DxvkResourceAllocation* allocation) {
+    if (unlikely(allocation->m_flags.test(DxvkAllocationFlag::OfferDedicated))) {
+      std::lock_guard lock(m_mutex);
+      m_offerDedicated.live -= 1u;
+      m_offerDedicated.liveBytes -= allocation->m_size;
+    }
+
     if (allocation->m_flags.test(DxvkAllocationFlag::ClearOnFree)) {
       if (allocation->m_mapPtr)
         bit::bclear(allocation->m_mapPtr, allocation->m_size);
@@ -2321,6 +2327,24 @@ namespace dxvk {
 
     result.memoryBudget = m_memHeaps[heap].memoryBudget;
     return result;
+  }
+
+
+  void DxvkMemoryAllocator::markOfferDedicated(
+          DxvkResourceAllocation*     allocation) {
+    std::lock_guard lock(m_mutex);
+    allocation->m_flags.set(DxvkAllocationFlag::OfferDedicated);
+
+    m_offerDedicated.live += 1u;
+    m_offerDedicated.total += 1u;
+    m_offerDedicated.liveBytes += allocation->m_size;
+    m_offerDedicated.peak = std::max(m_offerDedicated.peak, m_offerDedicated.live);
+  }
+
+
+  DxvkOfferDedicatedStats DxvkMemoryAllocator::getOfferDedicatedStats() {
+    std::lock_guard lock(m_mutex);
+    return m_offerDedicated;
   }
 
 

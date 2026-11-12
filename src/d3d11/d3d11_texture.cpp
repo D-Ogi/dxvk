@@ -7,7 +7,25 @@
 #include "../util/util_win32_compat.h"
 
 namespace dxvk {
-  
+
+  namespace {
+
+    // bc250 (BD-373): the bytes of the texel blocks of all subresources, the lower bound of what the image's memory
+    // holds. Single-plane formats only.
+    VkDeviceSize ComputeImageBytes(const DxvkImageCreateInfo& info) {
+      const DxvkFormatInfo* format = lookupFormatInfo(info.format);
+      VkDeviceSize bytes = 0u;
+
+      for (uint32_t i = 0u; i < info.mipLevels; i++) {
+        VkExtent3D blocks = util::computeBlockCount(util::computeMipLevelExtent(info.extent, i), format->blockSize);
+        bytes += VkDeviceSize(blocks.width) * blocks.height * blocks.depth * format->elementSize;
+      }
+
+      return bytes * info.numLayers * std::max(uint32_t(info.sampleCount), 1u);
+    }
+
+  }
+
   D3D11CommonTexture::D3D11CommonTexture(
           ID3D11Resource*             pInterface,
           D3D11Device*                pDevice,
@@ -258,6 +276,17 @@ namespace dxvk {
 
     if (m_11on12.Resource != nullptr)
       vkImage = VkImage(m_11on12.VulkanHandle);
+
+    // bc250 (BD-373): a large GPU-only texture gets memory of its own when it is created, so that an offer does
+    // not move it (d3d11.offerDedicatedSize). The UMD logging of its creation then names the kernel allocation
+    // that OfferResources gives to the OS. The size is that of the texel blocks, without the padding of the tiling.
+    uint32_t dedicatedSize = m_device->GetOptions()->offerDedicatedSize;
+
+    if (dedicatedSize && !vkImage && m_mapMode == D3D11_COMMON_TEXTURE_MAP_MODE_NONE
+     && (pDesc->Usage == D3D11_USAGE_DEFAULT || pDesc->Usage == D3D11_USAGE_IMMUTABLE)
+     && !imageInfo.shared && imageInfo.sharing.mode == DxvkSharedHandleMode::None
+     && !(imageInfo.flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT) && !isMultiPlane)
+      imageInfo.dedicatedStorage = ComputeImageBytes(imageInfo) >= dedicatedSize;
 
     if (!vkImage)
       m_image = m_device->GetDXVKDevice()->createImage(imageInfo, memoryProperties);

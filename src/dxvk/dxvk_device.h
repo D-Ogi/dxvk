@@ -646,6 +646,12 @@ namespace dxvk {
     DxvkMemoryStats getMemoryStats(uint32_t heap);
 
     /**
+     * \brief bc250 (BD-373): queries the counts of the offer rule
+     * \returns Allocations made by the dedicatedStorage rule
+     */
+    DxvkOfferDedicatedStats getOfferDedicatedStats();
+
+    /**
      * \brief Queries detailed memory allocation statistics
      *
      * Expensive, should be used with caution.

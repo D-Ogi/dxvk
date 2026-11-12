@@ -118,6 +118,7 @@ namespace dxvk::ddi {
     }
 
     LogShaderStats();
+    LogMemoryStats();
 
     // The reporter's references to DXVK objects go while the DXVK device still exists (1.8). The reporter
     // itself stays until the destructor, for a SetMemoryReporting or ReportMemory on another thread.
@@ -1137,7 +1138,7 @@ namespace dxvk::ddi {
       VkDeviceSize after = allocated();
 
       Logger::info(str::format("amdgpu_wddm_dxvk: TrimMemory: device memory ", before >> 20u, " MiB -> ",
-        after >> 20u, " MiB"));
+        after >> 20u, " MiB, offer_dedicated_live=", m_dxvkDevice->getOfferDedicatedStats().live));
     } catch (const DxvkError& e) {
       Logger::err(str::format("amdgpu_wddm_dxvk: TrimMemory: ", e.message()));
       return GetErrorResult(e, E_FAIL);
@@ -1463,6 +1464,21 @@ namespace dxvk::ddi {
       " optimized_held=", deferred.optimizedHeld, " libraries_on_workers=", deferred.librariesOnWorkers,
       " optimized_on_workers=", deferred.optimizedOnWorkers, " worker_failures=", deferred.workerFailures,
       " errors=", deferred.compileErrors));
+  }
+
+
+  void Bc250DxvkDevice::LogMemoryStats() {
+    if (Logger::logLevel() > LogLevel::Info)
+      return;
+
+    // BD-373: the cost of d3d11.offerDedicatedSize and d3d11.offerDedicatedStagingSize. Each allocation of the
+    // rule is one VkDeviceMemory object, which is one kernel allocation. At the final release most resources are
+    // gone, so peak and total are the values to compare between two settings of the option.
+    DxvkOfferDedicatedStats offer = m_dxvkDevice->getOfferDedicatedStats();
+
+    Logger::logToSink(m_logSink.get(), LogLevel::Info, str::format("amdgpu_wddm_dxvk: Memory stats:",
+      " offer_dedicated_total=", offer.total, " offer_dedicated_peak=", offer.peak,
+      " offer_dedicated_live=", offer.live, " offer_dedicated_live_mib=", offer.liveBytes >> 20u));
   }
 
 

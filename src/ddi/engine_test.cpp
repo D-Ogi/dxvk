@@ -2886,7 +2886,8 @@ int main(int argc, char** argv) {
         Check(mapsAgain, "the small staging texture still maps after the refused offer");
       }
 
-      // 3. GPU-only textures move to memory of their own at the first offer. One keeps its content (EndOffer
+      // 3. GPU-only textures on memory of their own: from their creation at 4 MiB (d3d11.offerDedicatedSize, BD-373),
+      //    smaller ones after a move at the first offer (the ABI 1.8 block below). One keeps its content (EndOffer
       //    without DISCARDED), the other starts again from zero (DISCARDED); each is the control of the other.
       D3D11_TEXTURE2D_DESC defaultDesc = { Side, Side, 1u, 1u, DXGI_FORMAT_R8G8B8A8_UNORM, { 1u, 0u },
         D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET };
@@ -2917,21 +2918,21 @@ int main(int argc, char** argv) {
         std::vector<uint32_t> keptData = readBack(kept.Get());
         std::vector<uint32_t> discardedData = readBack(discarded.Get());
 
-        Check(keptData == keptPattern, "after EndOffer: the kept texture holds its content (the move copied it)");
+        Check(keptData == keptPattern, "after EndOffer: the kept texture holds its content");
         Check(!discardedData.empty() && std::all_of(discardedData.begin(), discardedData.end(),
           [] (uint32_t v) { return v == 0u; }), "after EndOffer(DISCARDED): the texture reads zero");
 
         Prepared again = prepare(kept.Get());
         Check(again.hr == S_OK && again.count == 1u && again.memory[0].Memory == pk.memory[0].Memory,
-          "PrepareOffer again: the moved texture keeps its memory");
+          "PrepareOffer again: the texture keeps its memory");
         Check(engine5->EndOffer(kept.Get(), 0u) == S_OK, "EndOffer (second offer of the default texture)");
 
-        // The view follows the moved storage: a copy through a draw is out of scope here, a read through
-        // CopyResource after the second offer is the check
+        // A read through CopyResource after the second offer is the check; a copy through a draw is out of scope
         Check(readBack(kept.Get()) == keptPattern, "after the second offer: the kept texture still holds its content");
       }
 
-      // 4. A default buffer moves and keeps its content; a dynamic buffer is suballocated and mapped: S_FALSE
+      // 4. A 4 MiB default buffer (memory of its own since its creation) keeps its content; a dynamic buffer is
+      //    suballocated and mapped: S_FALSE
       D3D11_BUFFER_DESC defBufDesc = { Bytes, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE };
       D3D11_BUFFER_DESC dynBufDesc = { 1u << 16, D3D11_USAGE_DYNAMIC, D3D11_BIND_VERTEX_BUFFER, D3D11_CPU_ACCESS_WRITE };
       Microsoft::WRL::ComPtr<ID3D11Buffer> defBuf, dynBuf;
@@ -3249,7 +3250,8 @@ int main(int argc, char** argv) {
         ctx->Flush();
       };
 
-      constexpr UINT64 BufferCookie = 0x10010u, TextureCookie = 0x10020u, MoveCookie = 0x10030u;
+      constexpr UINT64 BufferCookie = 0x10010u, TextureCookie = 0x10020u, MoveCookie = 0x10030u, OwnCookie = 0x10040u,
+                       OwnBufferCookie = 0x10050u;
 
       D3D11_BUFFER_DESC dynDesc = { };
       dynDesc.ByteWidth      = 64u << 10;
@@ -3266,17 +3268,29 @@ int main(int argc, char** argv) {
       dynTexDesc.BindFlags      = D3D11_BIND_SHADER_RESOURCE;
       dynTexDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
 
+      // A 256 KiB default texture is below the default d3d11.offerDedicatedSize (1 MiB): suballocated, it moves at
+      // its first offer. A default texture and a default buffer of exactly 1 MiB have memory of their own from
+      // their creation (BD-373) and do not move.
       D3D11_TEXTURE2D_DESC moveDesc = dynTexDesc;
-      moveDesc.Width = moveDesc.Height = 1024u;
       moveDesc.Usage          = D3D11_USAGE_DEFAULT;
       moveDesc.CPUAccessFlags = 0u;
 
-      Microsoft::WRL::ComPtr<ID3D11Buffer> dyn, plain;
-      Microsoft::WRL::ComPtr<ID3D11Texture2D> dynTex, moving;
+      D3D11_TEXTURE2D_DESC ownDesc = moveDesc;
+      ownDesc.Width = ownDesc.Height = 512u;
+
+      D3D11_BUFFER_DESC ownBufDesc = { };
+      ownBufDesc.ByteWidth = 1u << 20;
+      ownBufDesc.Usage     = D3D11_USAGE_DEFAULT;
+      ownBufDesc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+
+      Microsoft::WRL::ComPtr<ID3D11Buffer> dyn, plain, ownBuf;
+      Microsoft::WRL::ComPtr<ID3D11Texture2D> dynTex, moving, own;
       bool made = CheckHr(d3d->CreateBuffer(&dynDesc, nullptr, &dyn), "1.8: dynamic buffer")
                && CheckHr(d3d->CreateBuffer(&dynDesc, nullptr, &plain), "1.8: untracked dynamic buffer")
                && CheckHr(d3d->CreateTexture2D(&dynTexDesc, nullptr, &dynTex), "1.8: dynamic texture")
-               && CheckHr(d3d->CreateTexture2D(&moveDesc, nullptr, &moving), "1.8: default texture");
+               && CheckHr(d3d->CreateTexture2D(&moveDesc, nullptr, &moving), "1.8: 256 KiB default texture")
+               && CheckHr(d3d->CreateTexture2D(&ownDesc, nullptr, &own), "1.8: 1 MiB default texture")
+               && CheckHr(d3d->CreateBuffer(&ownBufDesc, nullptr, &ownBuf), "1.8: 1 MiB default buffer");
 
       if (made) {
         shell.TakeMemoryEvents();
@@ -3285,6 +3299,8 @@ int main(int argc, char** argv) {
         Check(engine6->TrackResourceMemory(dyn.Get(), BufferCookie) == S_FALSE, "a second TrackResourceMemory of it is S_FALSE");
         Check(engine6->TrackResourceMemory(dynTex.Get(), TextureCookie) == S_OK, "TrackResourceMemory: a dynamic texture");
         Check(engine6->TrackResourceMemory(moving.Get(), MoveCookie) == S_OK, "TrackResourceMemory: a default texture");
+        Check(engine6->TrackResourceMemory(own.Get(), OwnCookie) == S_OK, "TrackResourceMemory: a 1 MiB default texture");
+        Check(engine6->TrackResourceMemory(ownBuf.Get(), OwnBufferCookie) == S_OK, "TrackResourceMemory: a 1 MiB default buffer");
         Check(engine6->TrackResourceMemory(plain.Get(), 0u) == S_FALSE, "TrackResourceMemory(0) of an untracked resource is S_FALSE");
 
         uint32_t resolves = shell.resolveCalls.load();
@@ -3299,8 +3315,9 @@ int main(int argc, char** argv) {
         bool rundownKinds = std::all_of(rundown.begin(), rundown.end(),
           [] (const Event& e) { return e.Kind == BC250_DXVK_MEMORY_EVENT_RUNDOWN; });
         Check(rundownKinds && apply(rundown) && live[BufferCookie].size() == 1u && live[MoveCookie].size() == 1u
+           && live[OwnCookie].size() == 1u && live[OwnBufferCookie].size() == 1u
            && live[BufferCookie][0].Size >= dynDesc.ByteWidth,
-          "ReportMemory on another thread: RUNDOWN of the buffer and of the default texture, with their cookies");
+          "ReportMemory on another thread: RUNDOWN of the buffer and of the default textures, with their cookies");
 
         Event before = live[BufferCookie].empty() ? Event() : live[BufferCookie][0];
         discard(dyn.Get(), 1u);
@@ -3325,11 +3342,32 @@ int main(int argc, char** argv) {
           std::vector<Event> move = shell.TakeMemoryEvents();
           Check(only(move, MoveCookie) && apply(move) && live[MoveCookie].size() == 1u
              && live[MoveCookie][0].Offset == 0u && (VkDeviceMemory)(live[MoveCookie][0].Allocation) == offer[0].Memory,
-            "PrepareOffer moves the default texture: UNMAP of its old range, MAP of its own memory");
+            "PrepareOffer moves the 256 KiB default texture: UNMAP of its old range, MAP of its own memory");
           Check(engine5->EndOffer(moving.Get(), 0u) == S_OK, "1.8: EndOffer");
         } else {
           std::printf("SKIP  move to memory of its own: PrepareOffer of the default texture was not S_OK\n");
         }
+
+        // BD-373: the HLK OfferReclaimPending test maps the D3D resource to the allocation that the logging names
+        // at its creation and counts the offer events of that allocation. A resource at the threshold does not
+        // move: the offer names the memory of its RUNDOWN, and no event changes it.
+        auto offerInPlace = [&] (ID3D11Resource* resource, UINT64 cookie, const std::string& what) {
+          Event ownBefore = live[cookie].empty() ? Event() : live[cookie][0];
+          offerCount = 0u;
+
+          if (engine5 && engine5->PrepareOffer(resource, 4u, offer, &offerCount) == S_OK) {
+            std::vector<Event> stay = shell.TakeMemoryEvents();
+            Check(stay.empty() && offerCount == 1u && ownBefore.Offset == 0u
+               && (VkDeviceMemory)(ownBefore.Allocation) == offer[0].Memory,
+              ("PrepareOffer of the " + what + ": memory of its own since its creation, no move, no event").c_str());
+            Check(engine5->EndOffer(resource, 0u) == S_OK, ("1.8: EndOffer (" + what + ")").c_str());
+          } else {
+            Check(false, ("PrepareOffer of the " + what + " is S_OK").c_str());
+          }
+        };
+
+        offerInPlace(own.Get(), OwnCookie, "1 MiB default texture");
+        offerInPlace(ownBuf.Get(), OwnBufferCookie, "1 MiB default buffer");
 
         // Off again: nothing more, and the next rundown still knows the current ranges
         engine6->SetMemoryReporting(FALSE);
@@ -3349,9 +3387,12 @@ int main(int argc, char** argv) {
 
         Check(engine6->TrackResourceMemory(dyn.Get(), 0u) == S_OK
            && engine6->TrackResourceMemory(dynTex.Get(), 0u) == S_OK
-           && engine6->TrackResourceMemory(moving.Get(), 0u) == S_OK, "TrackResourceMemory(0) ends tracking");
+           && engine6->TrackResourceMemory(moving.Get(), 0u) == S_OK
+           && engine6->TrackResourceMemory(own.Get(), 0u) == S_OK
+           && engine6->TrackResourceMemory(ownBuf.Get(), 0u) == S_OK, "TrackResourceMemory(0) ends tracking");
         std::vector<Event> ends = shell.TakeMemoryEvents();
-        Check(apply(ends) && live[BufferCookie].empty() && live[TextureCookie].empty() && live[MoveCookie].empty(),
+        Check(apply(ends) && live[BufferCookie].empty() && live[TextureCookie].empty() && live[MoveCookie].empty()
+           && live[OwnCookie].empty() && live[OwnBufferCookie].empty(),
           "end of tracking while on: an UNMAP of each live range");
 
         engine6->ReportMemory();
@@ -5599,6 +5640,36 @@ int main(int argc, char** argv) {
   };
 
   printShaderLines(shell);
+
+  // BD-373: the final release logs the counts of the offer rule. The test made resources at the threshold
+  // (d3d11.offerDedicatedSize, 1 MiB by default) and large staging buffers. Objects that the context state or
+  // the memory reporter still holds at the line can stay live, so the check does not require live 0.
+  {
+    const std::string* memoryLine = nullptr;
+
+    for (const auto& line : shell.lines) {
+      if (line.find("amdgpu_wddm_dxvk: Memory stats:") != std::string::npos)
+        memoryLine = &line;
+    }
+
+    if (!memoryLine) {
+      const char* levelEnv = std::getenv("DXVK_LOG_LEVEL");
+      Check(levelEnv && *levelEnv && std::string(levelEnv) != "info" && std::string(levelEnv) != "debug"
+         && std::string(levelEnv) != "trace", "the final release logs the memory stats line at log level info");
+    } else {
+      std::printf("      %s\n", memoryLine->c_str());
+      auto field = [&] (const char* name) {
+        size_t at = memoryLine->find(name);
+        return at == std::string::npos ? -1ll : std::atoll(memoryLine->c_str() + at + std::strlen(name));
+      };
+
+      Check(field(" offer_dedicated_total=") > 0 && field(" offer_dedicated_peak=") > 0
+         && field(" offer_dedicated_peak=") <= field(" offer_dedicated_total=")
+         && field(" offer_dedicated_live=") >= 0 && field(" offer_dedicated_live=") <= field(" offer_dedicated_peak=")
+         && field(" offer_dedicated_live_mib=") >= 0,
+        "memory stats line: the allocations of the offer rule are counted (total, peak, live)");
+    }
+  }
 
   // Translation on workers logs its stats line at the final release, with or without the r9 shader cache
   const bool workers = HasLine(shell.lines, "amdgpu_wddm_dxvk: Shader stats:");

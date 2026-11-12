@@ -44,9 +44,21 @@ namespace dxvk {
       VkMemoryPropertyFlags memoryFlags = GetMemoryFlags();
       m_mapMode = DetermineMapMode(memoryFlags);
 
-      // bc250 (BD-309): large staging storage is one kernel allocation that OfferResources can give back
-      uint32_t dedicatedSize = m_parent->GetOptions()->offerDedicatedStagingSize;
-      info.dedicatedStorage = pDesc->Usage == D3D11_USAGE_STAGING && dedicatedSize && info.size >= dedicatedSize;
+      // bc250 (BD-309): large staging storage is one kernel allocation that OfferResources can give back.
+      // BD-373: large GPU-only storage too, from its creation: a move at the offer would give it a new kernel
+      // allocation that the UMD logging of its creation does not name. Dynamic storage renames; it stays
+      // suballocated.
+      const D3D11Options* options = m_parent->GetOptions();
+      uint32_t dedicatedSize = 0u;
+
+      if (pDesc->Usage == D3D11_USAGE_STAGING)
+        dedicatedSize = options->offerDedicatedStagingSize;
+      else if (pDesc->Usage == D3D11_USAGE_DEFAULT || pDesc->Usage == D3D11_USAGE_IMMUTABLE)
+        dedicatedSize = options->offerDedicatedSize;
+
+      info.dedicatedStorage = dedicatedSize && info.size >= dedicatedSize
+        && !(pDesc->MiscFlags & (D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX
+          | D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_TILED));
 
       // Create the buffer and set the entire buffer slice as mapped,
       // so that we only have to update it when invalidating the buffer

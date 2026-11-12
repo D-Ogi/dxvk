@@ -20,6 +20,7 @@ namespace dxvk {
     this->maxTessFactor         = config.getOption<int32_t>("d3d11.maxTessFactor", 0);
     this->samplerAnisotropy     = config.getOption<int32_t>("d3d11.samplerAnisotropy", -1);
     this->offerDedicatedStagingSize = uint32_t(std::max(0, config.getOption<int32_t>("d3d11.offerDedicatedStagingSize", 1 << 20)));
+    this->offerDedicatedSize    = uint32_t(std::max(0, config.getOption<int32_t>("d3d11.offerDedicatedSize", 1 << 20)));
     this->samplerLodBias        = config.getOption<float>("d3d11.samplerLodBias", 0.0f);
     this->clampNegativeLodBias  = config.getOption<bool>("d3d11.clampNegativeLodBias", false);
     this->forceSampleRateShading = config.getOption<bool>("d3d11.forceSampleRateShading", false);

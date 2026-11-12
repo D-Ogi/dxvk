@@ -296,8 +296,10 @@ namespace dxvk {
         DxvkAllocationInfo dedicatedInfo = allocationInfo;
         dedicatedInfo.mode.set(DxvkAllocationMode::Dedicated);
 
-        if (auto storage = m_allocator->createBufferResource(info, dedicatedInfo, nullptr))
+        if (auto storage = m_allocator->createBufferResource(info, dedicatedInfo, nullptr)) {
+          m_allocator->markOfferDedicated(storage.ptr());
           return storage;
+        }
       }
 
       return m_allocator->createBufferResource(info, allocationInfo, cache);

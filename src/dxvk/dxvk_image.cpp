@@ -339,6 +339,18 @@ namespace dxvk {
     if (m_info.transient)
       allocationInfo.mode.set(DxvkAllocationMode::NoDedicated);
 
+    // bc250 (BD-373): a new storage of the image (creation, a usage change) takes memory of its own first. A
+    // relocation with a mode (defragmentation, eviction) keeps the rules of that mode.
+    if (unlikely(m_info.dedicatedStorage) && allocationInfo.mode.isClear()) {
+      DxvkAllocationInfo dedicatedInfo = allocationInfo;
+      dedicatedInfo.mode.set(DxvkAllocationMode::Dedicated);
+
+      if (auto storage = m_allocator->createImageResource(imageInfo, dedicatedInfo, sharedMemoryInfo)) {
+        m_allocator->markOfferDedicated(storage.ptr());
+        return storage;
+      }
+    }
+
     return m_allocator->createImageResource(imageInfo,
       allocationInfo, sharedMemoryInfo);
   }

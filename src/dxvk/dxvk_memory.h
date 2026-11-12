@@ -33,6 +33,26 @@ namespace dxvk {
   };
 
 
+  /**
+   * \brief bc250 (BD-373): counts of the offer rule
+   *
+   * Allocations that a buffer or an image got as memory of its own because
+   * of DxvkBufferCreateInfo::dedicatedStorage or DxvkImageCreateInfo::dedicatedStorage
+   * (d3d11.offerDedicatedSize, d3d11.offerDedicatedStagingSize). Each one is one
+   * VkDeviceMemory object, which is one kernel allocation.
+   */
+  struct DxvkOfferDedicatedStats {
+    /// Allocations that exist now
+    uint64_t     live      = 0u;
+    /// Largest value of live since the device was made
+    uint64_t     peak      = 0u;
+    /// Allocations made since the device was made
+    uint64_t     total     = 0u;
+    /// Size of the allocations that exist now, in bytes
+    VkDeviceSize liveBytes = 0u;
+  };
+
+
   enum class DxvkSharedHandleMode {
       None,
       Import,
@@ -523,6 +543,9 @@ namespace dxvk {
     /// Memory must be cleared to zero when the allocation
     /// is freed. Only used to work around app bugs.
     ClearOnFree = 6,
+    /// bc250 (BD-373): memory of its own because of the offer
+    /// rule. Counted in DxvkOfferDedicatedStats.
+    OfferDedicated = 7,
   };
 
   using DxvkAllocationFlags = Flags<DxvkAllocationFlag>;
@@ -1329,6 +1352,23 @@ namespace dxvk {
     DxvkMemoryStats getMemoryStats(uint32_t heap) const;
 
     /**
+     * \brief bc250 (BD-373): counts an allocation of the offer rule
+     *
+     * The caller made the allocation with DxvkAllocationMode::Dedicated
+     * because of its dedicatedStorage create info. The allocation is
+     * counted until it is freed.
+     * \param [in] allocation The new allocation
+     */
+    void markOfferDedicated(
+            DxvkResourceAllocation*     allocation);
+
+    /**
+     * \brief bc250 (BD-373): queries the counts of the offer rule
+     * \returns Counts of the allocations made by the rule
+     */
+    DxvkOfferDedicatedStats getOfferDedicatedStats();
+
+    /**
      * \brief Retrieves detailed memory statistics
      *
      * Queries statistics for each memory type and each allocated chunk.
@@ -1500,6 +1540,9 @@ namespace dxvk {
     DxvkResourceAllocationPool  m_allocationPool;
 
     uint64_t            m_nextCookie = 0u;
+
+    // bc250 (BD-373): protected by m_mutex
+    DxvkOfferDedicatedStats m_offerDedicated = { };
 
     alignas(CACHE_LINE_SIZE)
     high_resolution_clock::time_point m_taskDeadline = { };

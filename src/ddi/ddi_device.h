@@ -221,6 +221,9 @@ namespace dxvk::ddi {
     // Info line with translation and deferred compile counts, at final release
     void LogShaderStats();
 
+    // BD-373: info line with the counts of the offer rule (DxvkOfferDedicatedStats), at final release
+    void LogMemoryStats();
+
     // Blt and Blt1; the whole source subresource without pSourceRect
     HRESULT BltRegion(
             ID3D11Resource*                   pDestination,

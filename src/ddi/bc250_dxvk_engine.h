@@ -496,9 +496,12 @@ MIDL_INTERFACE("41dc4ca2-d34d-4b23-8ebe-c764be11ea8a")
 IBc250DxvkDevice5 : public IBc250DxvkDevice4 {
     /* DXGI OfferResources for an engine resource (not one of E5). The shell offers kernel allocations; the
      * engine suballocates its memory, so this call first makes the memory of the resource allocations of its
-     * own. It submits pending work as Flush does (E3). A GPU-only resource then moves, at its first offer, to
-     * a VkDeviceMemory of its own, in command order with a GPU copy, and is submitted again before the call
-     * returns (the kernel defers the offer until that copy completed). CPU-mapped storage does not move: it
+     * own. It submits pending work as Flush does (E3). GPU-only storage of at least d3d11.offerDedicatedSize
+     * bytes (default 1 MiB, BD-373) has a VkDeviceMemory of its own from its creation and does not move, so the
+     * UMD logging of its creation names the allocation that the offer gives. Smaller GPU-only storage moves, at
+     * its first offer, to a VkDeviceMemory of its own, in command order with a GPU copy, and is submitted again
+     * before the call returns (the kernel defers the offer until that copy completed); the logging then reports
+     * an UNMAP of the old range and a MAP of the new memory. CPU-mapped storage does not move: it
      * qualifies when it was created on memory of its own, which the engine does for staging storage of at
      * least d3d11.offerDedicatedStagingSize bytes (default 1 MiB; for a staging texture of at most 32
      * subresources, their sum, and one memory object per subresource). The engine then releases the persistent CPU

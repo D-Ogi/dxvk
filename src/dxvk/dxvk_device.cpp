@@ -578,6 +578,11 @@ namespace dxvk {
   }
 
 
+  DxvkOfferDedicatedStats DxvkDevice::getOfferDedicatedStats() {
+    return m_objects.memoryManager().getOfferDedicatedStats();
+  }
+
+
   DxvkSharedAllocationCacheStats DxvkDevice::getMemoryAllocationStats(DxvkMemoryAllocationStats& stats) {
     m_objects.memoryManager().getAllocationStats(stats);
     return m_objects.memoryManager().getAllocationCacheStats();

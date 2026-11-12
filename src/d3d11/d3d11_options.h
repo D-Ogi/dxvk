@@ -88,6 +88,13 @@ namespace dxvk {
     /// can offer to the OS (DXGI OfferResources). 0 disables it.
     uint32_t offerDedicatedStagingSize = 1u << 20;
 
+    /// bc250 (BD-373): GPU-only storage (DEFAULT and IMMUTABLE, not shared)
+    /// of at least this many bytes gets a VkDeviceMemory of its own when it
+    /// is created, so that an offer does not move it to new memory. The
+    /// UMD logging then names the allocation that the offer gives to the
+    /// OS. Smaller storage moves at its first offer. 0 disables it.
+    uint32_t offerDedicatedSize = 1u << 20;
+
     /// Always lock immediate context on every API call. May be
     /// useful for debugging purposes or when applications have
     /// race conditions.

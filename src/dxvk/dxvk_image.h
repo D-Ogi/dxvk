@@ -77,9 +77,14 @@ namespace dxvk {
 
     // Debug name
     const char* debugName = nullptr;
+
+    /// bc250 (BD-373): try to give every storage of the image a VkDeviceMemory
+    /// of its own (DxvkAllocationMode::Dedicated), and suballocate only if that
+    /// fails. The driver can then offer the image to the OS without a move.
+    bool dedicatedStorage = false;
   };
-  
-  
+
+
   /**
    * \brief Extra image usage info
    *
