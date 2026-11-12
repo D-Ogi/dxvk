@@ -1176,6 +1176,17 @@ namespace dxvk::ddi {
         m_context->RelocateToDedicatedMemory(moveBuffers.data(), moveBuffers.size(),
           moveImages.data(), moveImages.size());
         m_context->Flush();
+
+        // The command list of the move holds the old storage until it retires. Without a wait, the last moves
+        // retire only at a later submission, and an application that offers and then idles keeps that memory
+        // committed (BD-372: the HLK Lower Commit test reads the commit after a kernel trim, with no further
+        // call into the driver). The wait comes once per resource, at its first offer: a resource that is on
+        // memory of its own does not move again.
+        for (const auto& buffer : moveBuffers)
+          m_dxvkDevice->waitForResource(*buffer, DxvkAccess::Move);
+
+        for (const auto& image : moveImages)
+          m_dxvkDevice->waitForResource(*image, DxvkAccess::Move);
       }
 
       // The context executed the relocation; a resource that did not move (no memory, or not movable) is
