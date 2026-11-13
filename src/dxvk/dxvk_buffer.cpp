@@ -30,6 +30,11 @@ namespace dxvk {
     // Unconditionally enable BDA usage
     m_info.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
 
+    // bc250 (BD-379): kept storages exist only for storages of their own
+    m_info.retainedStorages = m_info.dedicatedStorage
+      ? std::min(m_info.retainedStorages, MaxRetainedStorages) : 0u;
+    m_retained.reserve(m_info.retainedStorages);
+
     // Create and assign actual buffer resource
     assignStorage(allocateStorage());
   }
@@ -49,6 +54,10 @@ namespace dxvk {
     m_info          (createInfo),
     m_stableAddress (true) {
     m_allocator->registerResource(this);
+
+    // bc250 (BD-379): imported memory is not the buffer's to keep
+    m_info.dedicatedStorage = false;
+    m_info.retainedStorages = 0u;
 
     DxvkAllocationInfo allocationInfo = { };
     allocationInfo.resourceCookie = cookie();
@@ -82,6 +91,51 @@ namespace dxvk {
       std::make_tuple(info), std::make_tuple(this, info));
 
     return &entry.first->second;
+  }
+
+
+  Rc<DxvkResourceAllocation> DxvkBuffer::allocateRetainedStorage(
+    const VkBufferCreateInfo&         info,
+    const DxvkAllocationInfo&         allocationInfo,
+          DxvkLocalAllocationCache*   cache) {
+    std::lock_guard lock(m_retainedMutex);
+
+    // A kept storage with no other reference is free: the buffer holds a reference to its current storage, and a
+    // command list holds one to each storage that it tracks until the GPU completes it. Only this list can give a
+    // new reference to a kept storage, and its lock is held.
+    for (const auto& storage : m_retained) {
+      if (storage->hasSingleReference())
+        return storage;
+    }
+
+    if (m_retained.size() < m_info.retainedStorages) {
+      DxvkAllocationInfo dedicatedInfo = allocationInfo;
+      dedicatedInfo.mode.set(DxvkAllocationMode::Dedicated);
+
+      if (auto storage = m_allocator->createBufferResource(info, dedicatedInfo, nullptr)) {
+        m_allocator->markOfferDedicated(storage.ptr());
+        m_retained.push_back(storage);
+        return storage;
+      }
+    }
+
+    // Every kept storage is in use: suballocate, as without the rule. No kernel allocation for this discard.
+    return m_allocator->createBufferResource(info, allocationInfo, cache);
+  }
+
+
+  bool DxvkBuffer::retainsStorage(const DxvkResourceAllocation* storage) {
+    if (!m_info.retainedStorages || !storage)
+      return false;
+
+    std::lock_guard lock(m_retainedMutex);
+
+    for (const auto& entry : m_retained) {
+      if (entry.ptr() == storage)
+        return true;
+    }
+
+    return false;
   }
 
 

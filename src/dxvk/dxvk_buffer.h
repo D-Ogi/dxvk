@@ -43,6 +43,13 @@ namespace dxvk {
     /// of its own (DxvkAllocationMode::Dedicated), and suballocate only if that
     /// fails. For CPU-mapped buffers the driver may offer to the OS.
     bool dedicatedStorage = false;
+
+    /// bc250 (BD-379): with dedicatedStorage, the number of storages of their
+    /// own that the buffer keeps, at most DxvkBuffer::MaxRetainedStorages.
+    /// allocateStorage gives back a kept storage that nothing else uses,
+    /// makes a new one while there is room, and else suballocates. A buffer
+    /// that discards often then makes no new allocation in the steady state.
+    uint32_t retainedStorages = 0u;
   };
 
 
@@ -143,7 +150,10 @@ namespace dxvk {
     constexpr static VkDeviceSize MinMappedAllocationSize = DxvkPageAllocator::PageSize / 32u;
     constexpr static VkDeviceSize MinMappedSlicesPerAllocation = 3u;
   public:
-    
+
+    /// bc250 (BD-379): upper limit of DxvkBufferCreateInfo::retainedStorages
+    constexpr static uint32_t MaxRetainedStorages = 8u;
+
     DxvkBuffer(
             DxvkDevice*           device,
       const DxvkBufferCreateInfo& createInfo,
@@ -293,6 +303,9 @@ namespace dxvk {
       m_sharingMode.fill(info);
 
       if (unlikely(m_info.dedicatedStorage)) {
+        if (m_info.retainedStorages)
+          return allocateRetainedStorage(info, allocationInfo, cache);
+
         DxvkAllocationInfo dedicatedInfo = allocationInfo;
         dedicatedInfo.mode.set(DxvkAllocationMode::Dedicated);
 
@@ -304,6 +317,16 @@ namespace dxvk {
 
       return m_allocator->createBufferResource(info, allocationInfo, cache);
     }
+
+    /**
+     * \brief bc250 (BD-379): whether the buffer keeps this storage for reuse
+     *
+     * A storage that allocateStorage put in the set of kept storages
+     * (DxvkBufferCreateInfo::retainedStorages) stays there until the
+     * buffer is destroyed, so the answer for one storage does not change.
+     * \param [in] storage A storage of this buffer
+     */
+    bool retainsStorage(const DxvkResourceAllocation* storage);
 
     /**
      * \brief bc250 (BD-309): releases the persistent map of the current storage
@@ -465,6 +488,16 @@ namespace dxvk {
       DxvkBufferView, DxvkHash, DxvkEq> m_views;
 
     std::string                 m_debugName;
+
+    // bc250 (BD-379): the kept storages; allocateStorage runs on more than one
+    // thread (deferred contexts), so the lock is necessary
+    dxvk::mutex                 m_retainedMutex;
+    std::vector<Rc<DxvkResourceAllocation>> m_retained;
+
+    Rc<DxvkResourceAllocation> allocateRetainedStorage(
+      const VkBufferCreateInfo&         info,
+      const DxvkAllocationInfo&         allocationInfo,
+            DxvkLocalAllocationCache*   cache);
 
     void updateDebugName();
 

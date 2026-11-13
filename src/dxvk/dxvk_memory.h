@@ -38,7 +38,8 @@ namespace dxvk {
    *
    * Allocations that a buffer or an image got as memory of its own because
    * of DxvkBufferCreateInfo::dedicatedStorage or DxvkImageCreateInfo::dedicatedStorage
-   * (d3d11.offerDedicatedSize, d3d11.offerDedicatedStagingSize). Each one is one
+   * (d3d11.offerDedicatedSize, d3d11.offerDedicatedStagingSize,
+   * d3d11.renameDedicatedSize). Each one is one
    * VkDeviceMemory object, which is one kernel allocation.
    */
   struct DxvkOfferDedicatedStats {
@@ -583,6 +584,18 @@ namespace dxvk {
     force_inline void decRef() {
       if (unlikely(m_useCount.fetch_sub(1u) == 1u))
         free();
+    }
+
+    /**
+     * \brief bc250 (BD-379): whether the caller holds the only reference
+     *
+     * Valid only when no other party can get a new reference from the
+     * caller's, for example for a storage that only one owner keeps.
+     * Then \c true means that every other user, the command lists that
+     * track the storage included, has released it.
+     */
+    bool hasSingleReference() const {
+      return m_useCount.load(std::memory_order_acquire) == 1u;
     }
 
     /**
