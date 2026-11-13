@@ -3323,10 +3323,159 @@ int main(int argc, char** argv) {
         Event before = live[BufferCookie].empty() ? Event() : live[BufferCookie][0];
         discard(dyn.Get(), 1u);
         std::vector<Event> rename = shell.TakeMemoryEvents();
-        Check(rename.size() == 2u && rename[0].Kind == BC250_DXVK_MEMORY_EVENT_UNMAP && same(rename[0], before)
-           && rename[1].Kind == BC250_DXVK_MEMORY_EVENT_MAP && (rename[1].Flags & BC250_DXVK_MEMORY_RENAMED)
+        Check(rename.size() == 2u && rename[0].Kind == BC250_DXVK_MEMORY_EVENT_MAP
+           && (rename[0].Flags & BC250_DXVK_MEMORY_RENAMED) && rename[1].Kind == BC250_DXVK_MEMORY_EVENT_UNMAP
+           && same(rename[1], before) && (rename[1].Flags & BC250_DXVK_MEMORY_RENAMED)
            && only(rename, BufferCookie) && apply(rename),
-          "Map DISCARD while on: UNMAP of the old range, then MAP of the new one with RENAMED");
+          "Map DISCARD of a 64 KiB dynamic buffer while on: MAP of the new range, then UNMAP of the old one, both RENAMED");
+
+        // BD-379: the HLK UMDLoggingRenamedSurface model. A DYNAMIC buffer of at least d3d11.renameDedicatedSize
+        // (512 KiB by default) has memory of its own for each storage: each renamed instance is one allocation, at
+        // offset 0, and gets MAP with RENAMED while the previous instance stays mapped. The buffer keeps these
+        // storages and uses a free one again, so a discard after the GPU is idle makes no allocation and no event.
+        // When DXVK_CONFIG sets d3d11.renameDedicatedSize to 0 or above 512 KiB, the buffer is suballocated like the
+        // 64 KiB one.
+        {
+          constexpr UINT64 RenameCookie = 0x10070u;
+          constexpr size_t MaxKept = 8u;
+          bool ruleOff = false;
+          char config[1024] = { };
+
+          if (GetEnvironmentVariableA("DXVK_CONFIG", config, sizeof(config))) {
+            std::string text = config;
+            text.erase(std::remove(text.begin(), text.end(), ' '), text.end());
+            std::transform(text.begin(), text.end(), text.begin(), [] (char c) { return char(std::tolower(c)); });
+
+            const std::string key = "d3d11.renamededicatedsize=";
+            size_t at = text.find(key);
+
+            if (at != std::string::npos) {
+              long long threshold = std::atoll(text.c_str() + at + key.size());
+              ruleOff = threshold <= 0 || threshold > (512 << 10);
+            }
+          }
+
+          D3D11_BUFFER_DESC bigDesc = dynDesc;
+          bigDesc.ByteWidth = 512u << 10;
+
+          D3D11_QUERY_DESC idleDesc = { D3D11_QUERY_EVENT, 0u };
+          Microsoft::WRL::ComPtr<ID3D11Buffer> big;
+          Microsoft::WRL::ComPtr<ID3D11Query> idle;
+
+          // Submits, waits for the GPU, then gives the queue thread time to release what the command lists held
+          auto waitIdle = [&] {
+            ctx->End(idle.Get());
+            ctx->Flush();
+
+            ULONGLONG deadline = GetTickCount64() + 2000u;
+            BOOL done = FALSE;
+
+            while (ctx->GetData(idle.Get(), &done, sizeof(done), 0u) == S_FALSE && GetTickCount64() < deadline)
+              Sleep(1u);
+
+            Sleep(5u);
+          };
+
+          auto allocations = [&] (UINT64 cookie) {
+            std::vector<UINT64> result;
+
+            for (const Event& e : live[cookie])
+              result.push_back(e.Allocation);
+
+            std::sort(result.begin(), result.end());
+            result.erase(std::unique(result.begin(), result.end()), result.end());
+            return result.size();
+          };
+
+          if (CheckHr(d3d->CreateBuffer(&bigDesc, nullptr, &big), "1.8: 512 KiB dynamic buffer")
+           && CheckHr(d3d->CreateQuery(&idleDesc, &idle), "1.8: CreateQuery (event)")) {
+            Check(engine6->TrackResourceMemory(big.Get(), RenameCookie) == S_OK, "TrackResourceMemory: a 512 KiB dynamic buffer");
+            std::vector<Event> first = shell.TakeMemoryEvents();
+            Check(first.size() == 1u && first[0].Kind == BC250_DXVK_MEMORY_EVENT_MAP
+               && (first[0].Flags & BC250_DXVK_MEMORY_RENAMED) && first[0].Size >= bigDesc.ByteWidth
+               && only(first, RenameCookie) && apply(first),
+              "track of a 512 KiB dynamic buffer while on: MAP with RENAMED (each storage of a dynamic resource)");
+
+            // Four discards in one submission, as the HLK test does for one resource
+            discard(big.Get(), 4u);
+            std::vector<Event> renames = shell.TakeMemoryEvents();
+            bool renamesApply = apply(renames);
+            size_t maps = std::count_if(renames.begin(), renames.end(),
+              [] (const Event& e) { return e.Kind == BC250_DXVK_MEMORY_EVENT_MAP; });
+            bool allRenamed = std::all_of(renames.begin(), renames.end(),
+              [] (const Event& e) { return (e.Flags & BC250_DXVK_MEMORY_RENAMED) != 0u; });
+            bool ownMemory = std::all_of(live[RenameCookie].begin(), live[RenameCookie].end(),
+              [] (const Event& e) { return e.Offset == 0u; });
+
+            if (!ruleOff) {
+              Check(renamesApply && allRenamed && only(renames, RenameCookie) && maps == 4u && renames.size() == 4u
+                 && live[RenameCookie].size() == 5u && allocations(RenameCookie) == 5u && ownMemory,
+                "4 discards of the 512 KiB dynamic buffer: 4 MAP with RENAMED and no UNMAP; 5 mapped instances, each "
+                "an allocation of its own at offset 0");
+            } else {
+              Check(renamesApply && allRenamed && only(renames, RenameCookie) && maps == 4u && renames.size() == 8u
+                 && live[RenameCookie].size() == 1u,
+                "d3d11.renameDedicatedSize 0 or above 512 KiB: 4 discards of the 512 KiB dynamic buffer give MAP and "
+                "UNMAP each");
+            }
+
+            // Rundown: each mapped instance
+            engine6->ReportMemory();
+            std::vector<Event> instances = shell.TakeMemoryEvents();
+            size_t rundowns = std::count_if(instances.begin(), instances.end(), [&] (const Event& e) {
+              return e.Resource == RenameCookie && e.Kind == BC250_DXVK_MEMORY_EVENT_RUNDOWN
+                  && std::any_of(live[RenameCookie].begin(), live[RenameCookie].end(),
+                       [&] (const Event& m) { return same(m, e); });
+            });
+            Check(rundowns == live[RenameCookie].size(), "ReportMemory: a RUNDOWN of each mapped instance of the 512 KiB buffer");
+
+            // A buffer with kept storages is not offered: its kept storages stay mapped
+            Microsoft::WRL::ComPtr<IBc250DxvkDevice5> offerer;
+
+            if (SUCCEEDED(engine->QueryInterface(IID_PPV_ARGS(&offerer)))) {
+              BC250_DXVK_OFFER_MEMORY none[4] = { };
+              UINT noneCount = 7u;
+              HRESULT hr = offerer->PrepareOffer(big.Get(), 4u, none, &noneCount);
+              Check(hr == S_FALSE && noneCount == 0u && shell.TakeMemoryEvents().empty(),
+                "PrepareOffer of the 512 KiB dynamic buffer: S_FALSE, no event");
+              Check(offerer->EndOffer(big.Get(), 0u) == S_OK, "1.8: EndOffer of the 512 KiB dynamic buffer");
+            }
+
+            // Steady state: one discard per idle GPU, 32 times
+            uint32_t resolves = shell.resolveCalls.load();
+            size_t steadyMaps = 0u, steadyUnmaps = 0u;
+            bool steadyApply = true;
+
+            for (UINT round = 0u; round < 32u; round++) {
+              waitIdle();
+              discard(big.Get(), 1u);
+
+              std::vector<Event> step = shell.TakeMemoryEvents();
+              steadyApply = steadyApply && apply(step);
+
+              for (const Event& e : step) {
+                steadyMaps   += e.Kind == BC250_DXVK_MEMORY_EVENT_MAP ? 1u : 0u;
+                steadyUnmaps += e.Kind == BC250_DXVK_MEMORY_EVENT_UNMAP ? 1u : 0u;
+              }
+            }
+
+            std::printf("      512 KiB dynamic buffer, 32 discards on an idle GPU: %zu MAP, %zu UNMAP, %u ResolveMemory "
+              "calls, %zu mapped instances\n", steadyMaps, steadyUnmaps, shell.resolveCalls.load() - resolves,
+              live[RenameCookie].size());
+
+            if (!ruleOff) {
+              Check(steadyApply && steadyUnmaps == 0u && live[RenameCookie].size() <= MaxKept,
+                "steady state: a discard on an idle GPU uses a kept storage again (no UNMAP, at most 8 instances)");
+            }
+
+            Check(engine6->TrackResourceMemory(big.Get(), 0u) == S_OK, "TrackResourceMemory(0) of the 512 KiB buffer");
+            std::vector<Event> end = shell.TakeMemoryEvents();
+            size_t unmaps = end.size();
+            size_t mapped = live[RenameCookie].size();
+            Check(apply(end) && live[RenameCookie].empty() && unmaps == mapped,
+              "end of tracking of the 512 KiB buffer: an UNMAP of each mapped instance");
+          }
+        }
 
         discard(dynTex.Get(), 2u);
         std::vector<Event> texEvents = shell.TakeMemoryEvents();
@@ -3442,8 +3591,8 @@ int main(int argc, char** argv) {
         live.clear();
         engine6->ReportMemory();
         std::vector<Event> again = shell.TakeMemoryEvents();
-        Check(next.size() == 2u && next[1].Kind == BC250_DXVK_MEMORY_EVENT_MAP && apply(again)
-           && live[BufferCookie].size() == 1u && same(live[BufferCookie][0], next[1]),
+        Check(next.size() == 2u && next[0].Kind == BC250_DXVK_MEMORY_EVENT_MAP && apply(again)
+           && live[BufferCookie].size() == 1u && same(live[BufferCookie][0], next[0]),
           "after changes made while off: a rename and a rundown name the current range");
 
         Check(engine6->TrackResourceMemory(dyn.Get(), 0u) == S_OK

@@ -54,6 +54,7 @@ namespace dxvk::ddi {
     // The DXVK objects whose memory the resource owns: the buffer, or the image and the mapped buffers
     Rc<DxvkPagedResource> primary;
     DxvkResourceAllocation* primaryStorage = nullptr;
+    DxvkBuffer* keeper = nullptr;
     D3D11CommonTexture* texture = nullptr;
     bool renames = false;
 
@@ -70,6 +71,7 @@ namespace dxvk::ddi {
 
       renames = buffer->Desc()->Usage == D3D11_USAGE_DYNAMIC;
       primaryStorage = object->storage().ptr();
+      keeper = object->info().retainedStorages ? object.ptr() : nullptr;
       primary = object;
     } else {
       texture = GetCommonTexture(pResource);
@@ -97,8 +99,10 @@ namespace dxvk::ddi {
       ? texture->CountSubresources() : 0u);
     record->slots    = std::make_unique<Slot[]>(record->count);
 
-    for (UINT32 i = 0u; i < record->count; i++)
+    for (UINT32 i = 0u; i < record->count; i++) {
       record->slots[i].record = record.get();
+      record->slots[i].Reserve(i ? nullptr : keeper);
+    }
 
     std::lock_guard lock(m_registryMutex);
 
@@ -153,8 +157,13 @@ namespace dxvk::ddi {
     for (UINT32 i = 0u; i < record.count; i++) {
       Slot& slot = record.slots[i];
 
-      if (emit && slot.current.allocation)
-        Emit(BC250_DXVK_MEMORY_EVENT_UNMAP, record, slot.current);
+      if (emit) {
+        if (slot.current.allocation)
+          Emit(BC250_DXVK_MEMORY_EVENT_UNMAP, record, slot.current);
+
+        for (uint32_t k = 0u; k < slot.keptCount; k++)
+          Emit(BC250_DXVK_MEMORY_EVENT_UNMAP, record, slot.kept[k].mapping);
+      }
 
       slot.Detach();
     }
@@ -180,18 +189,12 @@ namespace dxvk::ddi {
       const Record& record = *entry.second;
 
       for (UINT32 i = 0u; i < record.count; i++) {
-        Mapping mapping = record.slots[i].Read();
+        Mapping mappings[MaxMappings];
+        uint32_t count = record.slots[i].Read(mappings);
 
-        if (mapping.allocation) {
-          BC250_DXVK_MEMORY_EVENT event = { };
-          event.Kind           = BC250_DXVK_MEMORY_EVENT_RUNDOWN;
-          event.Flags          = mapping.flags;
-          event.Resource       = record.cookie;
-          event.Allocation     = mapping.allocation;
-          event.Offset         = mapping.offset;
-          event.Size           = mapping.size;
-          event.AllocationSize = mapping.bytes;
-          m_events(m_shell, &event, 1u);
+        for (uint32_t m = 0u; m < count; m++) {
+          if (mappings[m].allocation)
+            Emit(BC250_DXVK_MEMORY_EVENT_RUNDOWN, record, mappings[m]);
         }
       }
     }
@@ -204,19 +207,20 @@ namespace dxvk::ddi {
   }
 
 
-  void MemoryReporter::Changed(const Record& record, const Mapping& old, const Mapping& now) {
+  void MemoryReporter::Changed(const Record& record, const Mapping& unmapped, const Mapping& mapped) {
     LightFence();
 
-    if (likely(!m_enabled.load(std::memory_order_relaxed)) || old == now)
+    if (likely(!m_enabled.load(std::memory_order_relaxed)) || unmapped == mapped)
       return;
 
     std::lock_guard lock(m_reportMutex);
 
-    if (old.allocation)
-      Emit(BC250_DXVK_MEMORY_EVENT_UNMAP, record, old);
+    // MAP first: the HLK test links a renamed instance to a previous instance that is still mapped
+    if (mapped.allocation)
+      Emit(BC250_DXVK_MEMORY_EVENT_MAP, record, mapped);
 
-    if (now.allocation)
-      Emit(BC250_DXVK_MEMORY_EVENT_MAP, record, now);
+    if (unmapped.allocation)
+      Emit(BC250_DXVK_MEMORY_EVENT_UNMAP, record, unmapped);
   }
 
 
@@ -236,15 +240,44 @@ namespace dxvk::ddi {
   void MemoryReporter::Slot::storageChanged(
           DxvkPagedResource&        resource,
           DxvkResourceAllocation*   storage) {
-    Mapping old = current;
+    if (storage == currentStorage)
+      return;
 
-    // A change after the first storage of a dynamic resource is a rename (Map with DISCARD)
-    changes += 1u;
-    Mapping now = Resolve(storage, record->renames);
+    Instance old = { currentStorage, memory, current };
 
-    current = now;
-    Publish(now);
-    record->reporter->Changed(*record, old, now);
+    // A kept storage that is mapped already gets no MAP: its instance stays as it is
+    Mapping mapped = { };
+    uint32_t found = keptCount;
+
+    for (uint32_t k = 0u; k < keptCount; k++) {
+      if (kept[k].storage == storage)
+        found = k;
+    }
+
+    if (found < keptCount) {
+      current          = kept[found].mapping;
+      memory           = kept[found].memory;
+      memoryAllocation = current.allocation;
+      memoryBytes      = current.bytes;
+      kept[found]      = kept[--keptCount];
+    } else {
+      current = Resolve(storage, record->renames);
+      mapped  = current;
+    }
+
+    currentStorage = storage;
+
+    // A retired kept storage stays mapped: the buffer can use it again, and the test of the logging counts the
+    // instances of a rename only while more than one is mapped. Any other retired storage gets UNMAP.
+    Mapping unmapped = old.mapping;
+
+    if (old.mapping.allocation && keeper && keptCount < keptCapacity && keeper->retainsStorage(old.storage)) {
+      kept[keptCount++] = old;
+      unmapped = Mapping();
+    }
+
+    Publish();
+    record->reporter->Changed(*record, unmapped, mapped);
   }
 
 
@@ -277,13 +310,22 @@ namespace dxvk::ddi {
   }
 
 
+  void MemoryReporter::Slot::Reserve(DxvkBuffer* keeper) {
+    this->keeper = keeper;
+    keptCapacity = keeper ? keeper->info().retainedStorages : 0u;
+    kept = keptCapacity ? std::make_unique<Instance[]>(keptCapacity) : nullptr;
+    m_shared = std::make_unique<SharedMapping[]>(1u + keptCapacity);
+  }
+
+
   void MemoryReporter::Slot::Attach(DxvkPagedResource* object, DxvkResourceAllocation* storage, bool renamed) {
     this->object = object;
     this->memory = VK_NULL_HANDLE;
-    this->changes = 0u;
+    this->keptCount = 0u;
 
     current = Resolve(storage, renamed);
-    Publish(current);
+    currentStorage = storage;
+    Publish();
 
     object->setStorageObserver(this);
   }
@@ -299,7 +341,9 @@ namespace dxvk::ddi {
     memoryAllocation = 0u;
     memoryBytes = 0u;
     current = Mapping();
-    Publish(current);
+    currentStorage = nullptr;
+    keptCount = 0u;
+    Publish();
   }
 
 
@@ -337,30 +381,39 @@ namespace dxvk::ddi {
 
     result.offset = info.offset;
     result.size   = info.size;
-    result.flags  = renamed || (record->renames && changes) ? BC250_DXVK_MEMORY_RENAMED : 0u;
+    // BD-379: each storage of a dynamic resource is a rename instance, the first one too. The test of the logging
+    // compares the usage of the UNMAP of the first instance with the usage of the renamed instances.
+    result.flags  = renamed || record->renames ? BC250_DXVK_MEMORY_RENAMED : 0u;
     return result;
   }
 
 
-  void MemoryReporter::Slot::Publish(const Mapping& mapping) {
+  void MemoryReporter::Slot::Publish() {
     // Seqlock: one writer (the device thread), readers in Report retry until they see an even, unchanged count
     uint32_t seq = m_seq.load(std::memory_order_relaxed);
     m_seq.store(seq + 1u, std::memory_order_relaxed);
     std::atomic_thread_fence(std::memory_order_release);
 
-    m_allocation.store(mapping.allocation, std::memory_order_relaxed);
-    m_offset.store(mapping.offset, std::memory_order_relaxed);
-    m_size.store(mapping.size, std::memory_order_relaxed);
-    m_bytes.store(mapping.bytes, std::memory_order_relaxed);
-    m_flags.store(mapping.flags, std::memory_order_relaxed);
+    uint32_t count = 1u + keptCount;
+    m_count.store(count, std::memory_order_relaxed);
+
+    for (uint32_t i = 0u; i < count; i++) {
+      const Mapping& mapping = i ? kept[i - 1u].mapping : current;
+      SharedMapping& shared = m_shared[i];
+
+      shared.allocation.store(mapping.allocation, std::memory_order_relaxed);
+      shared.offset.store(mapping.offset, std::memory_order_relaxed);
+      shared.size.store(mapping.size, std::memory_order_relaxed);
+      shared.bytes.store(mapping.bytes, std::memory_order_relaxed);
+      shared.flags.store(mapping.flags, std::memory_order_relaxed);
+    }
 
     m_seq.store(seq + 2u, std::memory_order_release);
   }
 
 
-  MemoryReporter::Mapping MemoryReporter::Slot::Read() const {
-    Mapping result;
-    uint32_t before, after;
+  uint32_t MemoryReporter::Slot::Read(Mapping* mappings) const {
+    uint32_t before, after, count;
 
     do {
       before = m_seq.load(std::memory_order_acquire);
@@ -370,17 +423,24 @@ namespace dxvk::ddi {
         before = m_seq.load(std::memory_order_acquire);
       }
 
-      result.allocation = m_allocation.load(std::memory_order_relaxed);
-      result.offset     = m_offset.load(std::memory_order_relaxed);
-      result.size       = m_size.load(std::memory_order_relaxed);
-      result.bytes      = m_bytes.load(std::memory_order_relaxed);
-      result.flags      = m_flags.load(std::memory_order_relaxed);
+      // A slot that never published (no storage at Track) has its count 0
+      count = std::min(m_count.load(std::memory_order_relaxed), MaxMappings);
+
+      for (uint32_t i = 0u; i < count; i++) {
+        const SharedMapping& shared = m_shared[i];
+
+        mappings[i].allocation = shared.allocation.load(std::memory_order_relaxed);
+        mappings[i].offset     = shared.offset.load(std::memory_order_relaxed);
+        mappings[i].size       = shared.size.load(std::memory_order_relaxed);
+        mappings[i].bytes      = shared.bytes.load(std::memory_order_relaxed);
+        mappings[i].flags      = shared.flags.load(std::memory_order_relaxed);
+      }
 
       std::atomic_thread_fence(std::memory_order_acquire);
       after = m_seq.load(std::memory_order_relaxed);
     } while (before != after);
 
-    return result;
+    return count;
   }
 
 }

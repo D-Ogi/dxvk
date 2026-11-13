@@ -1260,8 +1260,10 @@ namespace dxvk::ddi {
       // has no kernel allocation of its own, and the offer is a hint. PrepareOffer does not move storage, so
       // nothing is unmapped and the memory logging keeps its mapping (the HLK OfferReclaim tests find the
       // resource by the allocation that the logging named at its creation).
+      // BD-379: a buffer that keeps storages for its renames (d3d11.renameDedicatedSize) has more than one memory
+      // object, and its kept storages stay mapped; it is not offered, as before the rule.
       for (const auto& buffer : targets.buffers) {
-        if (!buffer->storage()->isDedicatedMemory())
+        if (!buffer->storage()->isDedicatedMemory() || buffer->info().retainedStorages)
           return S_FALSE;
       }
 
@@ -1435,7 +1437,8 @@ namespace dxvk::ddi {
     if (Logger::logLevel() > LogLevel::Info)
       return;
 
-    // BD-373: the cost of d3d11.offerDedicatedSize and d3d11.offerDedicatedStagingSize. Each allocation of the
+    // BD-373: the cost of d3d11.offerDedicatedSize and d3d11.offerDedicatedStagingSize, and (BD-379) of
+    // d3d11.renameDedicatedSize. Each allocation of the
     // rule is one VkDeviceMemory object, which is one kernel allocation. At the final release most resources are
     // gone, so peak and total are the values to compare between two settings of the option.
     DxvkOfferDedicatedStats offer = m_dxvkDevice->getOfferDedicatedStats();
