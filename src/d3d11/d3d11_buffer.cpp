@@ -46,7 +46,10 @@ namespace dxvk {
 
       // bc250 (BD-309): large staging storage is one kernel allocation that OfferResources can give back.
       // BD-373: large GPU-only storage too, from its creation: an offer never moves storage, and the UMD logging
-      // of the creation names the allocation that the offer gives. Dynamic storage renames; it stays suballocated.
+      // of the creation names the allocation that the offer gives.
+      // BD-379: large dynamic storage too, for each rename: the UMD logging names one kernel allocation for each
+      // storage, which holds only this buffer. The buffer keeps these storages and uses them again (no allocation
+      // per discard in the steady state). Smaller dynamic storage stays suballocated.
       const D3D11Options* options = m_parent->GetOptions();
       uint32_t dedicatedSize = 0u;
 
@@ -54,10 +57,15 @@ namespace dxvk {
         dedicatedSize = options->offerDedicatedStagingSize;
       else if (pDesc->Usage == D3D11_USAGE_DEFAULT || pDesc->Usage == D3D11_USAGE_IMMUTABLE)
         dedicatedSize = options->offerDedicatedSize;
+      else if (pDesc->Usage == D3D11_USAGE_DYNAMIC)
+        dedicatedSize = options->renameDedicatedSize;
 
       info.dedicatedStorage = dedicatedSize && info.size >= dedicatedSize
         && !(pDesc->MiscFlags & (D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX
           | D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_TILED));
+
+      if (info.dedicatedStorage && pDesc->Usage == D3D11_USAGE_DYNAMIC)
+        info.retainedStorages = DxvkBuffer::MaxRetainedStorages;
 
       // Create the buffer and set the entire buffer slice as mapped,
       // so that we only have to update it when invalidating the buffer

@@ -98,6 +98,15 @@ namespace dxvk {
     /// made dedicated.
     uint32_t offerDedicatedSize = 1u << 20;
 
+    /// bc250 (BD-379): a DYNAMIC buffer (not shared, not tiled) of at least
+    /// this many bytes gets a VkDeviceMemory of its own for each storage,
+    /// one kernel allocation that the UMD logging names at each rename
+    /// (Map with DISCARD). The buffer keeps up to 8 of these storages and
+    /// uses a free one again at a later discard, so the steady state makes
+    /// no new allocation. Smaller dynamic storage is suballocated. 0
+    /// disables the rule.
+    uint32_t renameDedicatedSize = 512u << 10;
+
     /// Always lock immediate context on every API call. May be
     /// useful for debugging purposes or when applications have
     /// race conditions.
